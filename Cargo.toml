@@ -1,0 +1,133 @@
+[package]
+name = "smb-server"
+version = "0.9.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/paltaio/rust-smb-server"
+description = "SMB2/3 file-sharing server library with pluggable storage backends."
+
+[package.metadata.docs.rs]
+all-features = true
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "examples/minimal",
+]
+
+[workspace.package]
+version = "0.9.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/paltaio/rust-smb-server"
+
+[workspace.dependencies]
+smb-server = { path = ".", version = "0.9.1" }
+
+tokio = { version = "1.40", features = ["full"] }
+binrw = "0.15"
+bytes = "1.7"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "1"
+uuid = { version = "1.10", features = ["v4"] }
+cap-std = "3"
+cap-primitives = "~3.4"
+
+# RustCrypto family
+hmac  = "0.12"
+sha2  = "0.10"
+md-5  = "0.10"
+md4   = "0.10"
+aes   = "0.8"
+cmac  = "0.7"
+rc4   = "0.2"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+ccm   = { version = "0.5", default-features = false }
+
+[dependencies]
+tokio = { workspace = true }
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+binrw = { workspace = true }
+getrandom = "0.4"
+cap-std = { workspace = true, optional = true }
+hmac.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+md4.workspace = true
+aes.workspace = true
+cmac.workspace = true
+rc4.workspace = true
+aes-gcm.workspace = true
+ccm.workspace = true
+socket2 = "0.6"
+if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
+
+[target.'cfg(windows)'.dependencies]
+cap-primitives = { workspace = true, optional = true }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"], optional = true }
+libc = "0.2"
+quick-xml = { version = "0.42", optional = true }
+
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+mdns-sd = { version = "0.21.6", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.2", default-features = false, features = ["tokio"], optional = true }
+
+[features]
+default = ["localfs"]
+localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+discovery = [
+    "dep:mdns-sd",
+    "dep:zbus",
+    "dep:if-addrs",
+    "dep:quick-xml",
+    "socket2/all",
+    "uuid/v8",
+    "windows-sys/Win32_Foundation",
+    "windows-sys/Win32_NetworkManagement_Dns",
+    "windows-sys/Win32_System_SystemInformation",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = "0.3"
+tempfile = "3"
+hex = "0.4"
+des = "0.9"
+
+[[test]]
+name = "integration_localfs"
+path = "tests/integration_localfs.rs"
+required-features = ["localfs"]
+
+[[test]]
+name = "integration_localfs_write"
+path = "tests/integration_localfs_write.rs"
+required-features = ["localfs"]
+
+[[test]]
+name = "integration_negotiate"
+path = "tests/integration_negotiate.rs"
+required-features = ["localfs"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

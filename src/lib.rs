@@ -1,0 +1,776 @@
+//! SMB2/3 file-sharing server with pluggable storage backends.
+//!
+//! Example:
+//!
+//! ```no_run
+//! use smb_server::{SmbServer, Share, Access, ShareBackend};
+//! # async fn run<B: ShareBackend>(backend: B) -> Result<(), Box<dyn std::error::Error>> {
+//! SmbServer::builder()
+//!     .listen("0.0.0.0:4445".parse()?)
+//!     .user("alice", "password")
+//!     .share(Share::new("home", backend).user("alice", Access::ReadWrite))
+//!     .build()?
+//!     .serve()
+//!     .await?;
+//! # Ok(()) }
+//! ```
+//!
+#![cfg_attr(
+    feature = "discovery",
+    doc = r#"
+# Network discovery
+
+With the `discovery` feature, [`SmbServerBuilder::discovery`] announces
+the server on the local network while [`SmbServer::serve`] runs, and
+withdraws it before `serve` returns. Nothing is announced unless it is
+called, and the listen address must not be a loopback address.
+
+The Finder, GNOME Files and Dolphin find the server over mDNS and DNS-SD.
+Listen on `[::]:445`, as below: Windows may connect over IPv6 alone, so
+it cannot open a server that listens on IPv4 only. [`Discovery`] has the
+options and what each platform does.
+
+```no_run
+use smb_server::{Discovery, Share, ShareBackend, SmbServer};
+# async fn run<B: ShareBackend>(backend: B) -> Result<(), Box<dyn std::error::Error>> {
+SmbServer::builder()
+    .listen("[::]:445".parse()?)
+    .share(Share::new("public", backend).public_read_only())
+    .discovery(Discovery::new())
+    .build()?
+    .serve()
+    .await?;
+# Ok(()) }
+```
+"#
+)]
+//!
+//! # Writing a backend
+//!
+//! A share serves any [`ShareBackend`]. Each CREATE calls
+//! [`ShareBackend::open`], which returns a [`Handle`] and the
+//! [`OpenAction`] it took; CREATE reports the action to the client. The
+//! handle serves READ, WRITE, FLUSH, QUERY_INFO, QUERY_DIRECTORY and
+//! SET_INFO on that open until the open is closed. `LocalFsBackend`
+//! (feature `localfs`) is the reference implementation; its documentation
+//! says where it keeps named streams and extended attributes on each host.
+//!
+//! What the protocol layer does around the backend calls:
+//!
+//! - Paths arrive as [`SmbPath`], relative to the share root. `.` components
+//!   are dropped; `..`, empty components, `<>:"|?*` and control characters
+//!   are rejected before the backend sees them. A name ending in `::$DATA`
+//!   opens the file with [`OpenOptions::non_directory`] set, and one ending
+//!   in `::$INDEX_ALLOCATION` the directory with [`OpenOptions::directory`]
+//!   set. The empty path is the share root.
+//! - A named stream (`file.txt:name`) arrives as a [`StreamName`] beside
+//!   the file's path, on shares whose backend reports
+//!   [`BackendCapabilities::named_streams`] unless [`Share::named_streams`]
+//!   turns them off: CREATE opens the file with `open`, creating it when
+//!   the disposition allows, then the stream with
+//!   [`ShareBackend::open_stream`], which gets the file's handle. An
+//!   overwrite of the file removes its named streams through
+//!   [`ShareBackend::remove_stream`], each once no open is on it. A rename
+//!   to `:name` or `::$DATA` goes to [`ShareBackend::rename_stream`]. An
+//!   open of a named stream reports the file's times and attributes with
+//!   the stream's sizes, without FILE_ATTRIBUTE_DIRECTORY on a directory's
+//!   stream. Elsewhere named streams are rejected before the backend sees
+//!   them.
+//! - Extended attributes, on shares whose backend reports
+//!   [`BackendCapabilities::extended_attributes`] unless
+//!   [`Share::extended_attributes`] turns them off: FileFullEaInformation
+//!   queries call [`Handle::eas`], sets [`Handle::set_eas`], and an `ExtA`
+//!   create context gives a new file its attributes. The protocol layer
+//!   checks the names and the 65531-byte limit before the backend is
+//!   called, matches names without regard to ASCII case, keeps each open's
+//!   position in the attribute list across queries, replaces a file's
+//!   attributes with those of a CREATE that overwrites or supersedes it,
+//!   and refuses an open with FILE_NO_EA_KNOWLEDGE of a file that has one
+//!   flagged FILE_NEED_EA. EaSize in FileEaInformation, FileAllInformation
+//!   and directory listings is [`FileInfo::ea_size`]. A set breaks no
+//!   lease and is reported, under EA and ATTRIBUTES, when the open that
+//!   made it closes. A named stream has none of its own.
+//! - Apple's extensions: unless [`SmbServerBuilder::apple_extensions`]
+//!   turns them off, a CREATE that carries the `AAPL` server query, as
+//!   macOS clients send when they mount a share, gets a reply with the
+//!   model string of [`SmbServerBuilder::apple_model`], UNIX_BASED on Unix
+//!   hosts and the case sensitivity the backend reports. A client that
+//!   asks for READ_DIR_ATTR on a share with named streams gets it for its
+//!   connection. FileIdBothDirectoryInformation listings on that
+//!   connection then carry Finder data in place of EaSize and the short
+//!   name: the access the client may ask for, the low 16 bits of
+//!   [`FileInfo::unix_mode`], and, on shares with named streams, the
+//!   Finder info of each entry's `AFP_AfpInfo` stream and the size of its
+//!   `AFP_Resource` stream, read through one [`Handle::peek_streams`] call
+//!   per response.
+//! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
+//!   way to the path is missing, and with [`SmbError::NotFound`] when only
+//!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
+//!   STATUS_OBJECT_NAME_NOT_FOUND.
+//! - Share permissions and the access the client asked for are checked
+//!   before `open`. [`OpenOptions`] carries the result: `read`, `write` and
+//!   `write_attributes` reflect the access granted to the open. READ and
+//!   WRITE on a handle without the matching access fail before the handle
+//!   is called. When [`BackendCapabilities::is_read_only`] is set, trees on
+//!   the share get read access only, so opens that ask for write access,
+//!   and dispositions that create or truncate, fail before `open`.
+//! - Share modes, byte-range locks and the delete-pending flag are kept by
+//!   the protocol layer per share, across every connection, keyed by
+//!   [`FileInfo::file_index`], or by path when it is 0. Two shares over
+//!   the same directory do not see each other's opens. Each named stream
+//!   of a file has its own share modes, byte-range locks and
+//!   delete-pending flag, and the last close of a stream marked for
+//!   deletion calls [`ShareBackend::remove_stream`]. A CREATE that would
+//!   truncate first opens the file without truncating it, for reading or,
+//!   when reading is refused, with the access the CREATE was granted. It
+//!   runs the checks, enters the open in the table and waits for lease
+//!   breaks, so the sharing mode holds and clients caching writes have
+//!   written back before `open` truncates. When that first open finds no
+//!   file, the CREATE calls `open` with [`OpenIntent::Create`] instead and
+//!   starts over if the file appeared meanwhile. Any other CREATE refused
+//!   by the share-mode check has already called `open` and closes the new
+//!   handle again.
+//! - [`Handle::close`] runs on every path that ends an open: CLOSE,
+//!   TREE_DISCONNECT, LOGOFF, the end of a session or connection, and
+//!   [`ConfigHandle`] changes that end sessions or trees. A durable open,
+//!   described below, outlives LOGOFF and the end of its connection or
+//!   session for a while. Before `close`, [`Handle::set_times`] puts back
+//!   access and write times that FileBasicInformation froze or set through
+//!   that open.
+//! - Delete-on-close: [`OpenOptions::delete_on_close`] and
+//!   FileDispositionInformation make the file delete-pending. When its last
+//!   open ends, on any of the paths above, the protocol layer calls
+//!   [`Handle::close`] and then [`ShareBackend::unlink`] on the file's
+//!   current path. `open` doesn't delete anything itself. Read-only files
+//!   are refused before that point, and so, for SET_INFO, are directories
+//!   that [`Handle::dir_is_empty`] reports as not empty. `unlink` returns
+//!   [`SmbError::NotEmpty`] for a directory that has entries; the directory
+//!   then stays.
+//! - A rename through SET_INFO of a directory with a file or directory open
+//!   below it first asks the clients caching handles to those files to
+//!   close them, and waits until they answer or the break times out; files
+//!   kept open for a client to reconnect are closed. If an open below
+//!   remains, the rename fails with STATUS_ACCESS_DENIED, and so does a
+//!   rename of the share root. Otherwise the rename calls
+//!   [`ShareBackend::rename`] and then moves the path of every open of the
+//!   old name. Renames on one share run
+//!   one at a time, and a CREATE or a delete waits for a rename in
+//!   progress. The backend keeps those handles working on the renamed file.
+//! - A CREATE that makes or overwrites a file passes the attributes it asks
+//!   for to [`Handle::set_attributes`] when they differ from what
+//!   [`Handle::stat`] reports. If that returns [`SmbError::NotSupported`],
+//!   it retries with READONLY alone when that was asked for; the CREATE
+//!   succeeds either way.
+//! - FileBasicInformation passes [`Handle::set_attributes`] and
+//!   [`Handle::set_times`] only the values that differ from what
+//!   [`Handle::stat`] reports. After a write or truncate, `set_times` also
+//!   puts back the times FileBasicInformation froze or set.
+//!   [`Handle::truncate`] is never called on a directory.
+//! - QUERY_DIRECTORY calls [`Handle::list_dir`] with the search pattern on
+//!   the first query and on a restart, then pages through the returned
+//!   entries itself. It adds `.` and `..` when the pattern matches them,
+//!   and opens the parent directory to describe `..`; at the share root,
+//!   `..` describes the root itself, with file id 0.
+//! - FileStandardInformation and FileAllInformation report
+//!   [`Handle::link_count`] as NumberOfLinks, and DeletePending when the
+//!   file is delete-pending or has no links left. The filesystem
+//!   QUERY_INFO classes, and the VolumeId of the on-disk id CREATE context,
+//!   come from [`ShareBackend::volume_info`].
+//! - Leases: on every share unless [`Share::leases`] turns them off, files
+//!   get read, handle and write caching leases. A client holding one
+//!   caches what it reads, keeps files open after its applications close
+//!   them, and caches writes while every other open of the file holds the
+//!   same lease or is attribute-only. An open, write, size change,
+//!   byte-range lock, rename or delete made through an open that does not
+//!   hold the lease breaks it when it needs what the lease caches, whether
+//!   that open belongs to another client or to the same client under
+//!   another lease key or none; attribute-only opens and opens holding the
+//!   same lease break nothing. Each named stream of a file or directory has
+//!   leases of its own, which only opens of that stream grant and break,
+//!   except that an overwrite of the file breaks their handle caching; a
+//!   lease key held on one stream fails with STATUS_INVALID_PARAMETER on
+//!   another stream or file. An open or rename that needs the client to
+//!   write back or close first waits until the client acknowledges the
+//!   break or closes, or until the break times out 35 seconds after the
+//!   server sent it; meanwhile its backend handle stays open, except for
+//!   one that truncates, which calls `open` after the wait. A byte-range
+//!   lock asked for while another lease still caches writes is refused
+//!   with STATUS_LOCK_NOT_GRANTED until that client has written back.
+//!   Changes made outside the server, including through another share over
+//!   the same directory, break nothing: clients keep serving stale cached
+//!   data. Turn leases off on such shares.
+//! - Durable handles: on a share with leases, unless
+//!   [`Share::durable_handles`] turns them off, a file opened with a
+//!   durable handle request (DHnQ, or DH2Q on SMB 3.x) and a lease that
+//!   caches handles stays open when the client's connection drops, when it
+//!   logs off, when its session's reauthentication fails, or when a new
+//!   session names its session as the previous one. A request without such
+//!   a lease gets an open that is not durable and no durable context in the
+//!   response. The backend handle stays open, and the file keeps its share
+//!   mode, byte-range locks and lease, for
+//!   [`SmbServerBuilder::durable_handle_timeout`], or for the time a DH2Q
+//!   asked for, up to that timeout or 5 minutes, whichever is longer; the
+//!   DH2Q response carries the time granted. The PERSISTENT flag is
+//!   ignored. A file whose lease is being broken, or that holds byte-range
+//!   locks under a lease that does not cache writes, closes with its
+//!   session instead. Meanwhile the same user, from the same client, takes
+//!   the file back with a durable handle reconnect (DHnC, or DH2C naming
+//!   the CreateGuid of a DH2Q open) on a tree of the same share that names
+//!   the file, or its named stream, and its lease; the backend handle,
+//!   share mode, byte-range locks and lease carry on, and later lease
+//!   breaks go to the new connection. A reconnect fails with
+//!   STATUS_ACCESS_DENIED from another user, STATUS_INVALID_PARAMETER for a
+//!   DHnC naming another file, and STATUS_INSUFFICIENT_RESOURCES past the
+//!   connection's open limit; from another client, on another share, naming
+//!   another lease, lease version or CreateGuid, a DH2C naming another
+//!   file, or for a file that is not kept, with
+//!   STATUS_OBJECT_NAME_NOT_FOUND. The file stays kept after a failed
+//!   reconnect. One that comes while the connection holding the file is
+//!   still closing waits up to 5 seconds for it. A file whose rights exceed
+//!   what the user's tree on the share grants now is closed instead of
+//!   reconnected. [`Handle::close`] runs when the time runs out; at once
+//!   when an open, write, size change, byte-range lock, rename or delete
+//!   through an open that does not hold the lease needs what the lease
+//!   caches, or when the lease stops caching handles; for an open of a
+//!   named stream, also when its file is renamed, or deleted while no
+//!   connected open holds the same lease; on [`ConfigHandle`] changes that
+//!   end the user's sessions or the share's trees; and at
+//!   shutdown. At most [`SmbServerBuilder::max_disconnected_opens`] files
+//!   are kept at once, and a quarter of that, rounded up, for one user;
+//!   past that, files close with their session. Anonymous sessions and
+//!   clients that send a nil ClientGuid get no durable handle. A DH2Q that
+//!   repeats the CreateGuid of a live version 2 open of the same client,
+//!   with access to its data or to delete it, fails with
+//!   STATUS_DUPLICATE_OBJECTID unless it is marked as a replay; one marked
+//!   as a replay opens the file anew rather than answering with that
+//!   open.
+//! - Change notifications: on every share unless [`Share::change_notify`]
+//!   turns them off, a CHANGE_NOTIFY on a directory waits until a file or
+//!   directory in it, or below it when the client asks for the whole tree,
+//!   changes through any connection to the share:
+//!   - A create or delete is reported as an addition or a removal.
+//!   - A rename within one directory is reported as its old and new name
+//!     together, a move to another directory as a removal from one and an
+//!     addition to the other. Either is followed by a modification, under
+//!     LAST_WRITE, of the directory the entry is in afterwards, unless that
+//!     is the share root. An entry the rename replaces,
+//!     or the renamed entry itself when only the case of its name changes,
+//!     is first reported removed under its name as stored. A watched
+//!     directory can be renamed, and its watches follow it.
+//!   - Attributes and times set through FileBasicInformation are reported
+//!     at once as a modification, under ATTRIBUTES and the bit of each time
+//!     changed but the change time. What changed is what [`Handle::stat`]
+//!     shows differently afterwards, so a value the backend does not keep
+//!     reports nothing.
+//!   - New contents are reported as a modification under SIZE, LAST_WRITE
+//!     and ATTRIBUTES: a write once, when the open that wrote closes, unless
+//!     that close deletes the file; a change of size through
+//!     FileEndOfFileInformation, a truncation through
+//!     FileAllocationInformation, and an overwrite or supersede by CREATE,
+//!     at once.
+//!   - Changes of a named stream are named `file:stream`, under the
+//!     STREAM_* bits: a new stream as an added stream; a write, a size
+//!     change, an overwrite, a rename (under both names) and a deletion as
+//!     a modified stream, after a modification of the file under
+//!     LAST_WRITE and LAST_ACCESS for all but the deletion; and the named
+//!     streams an overwrite of the file removes as removed streams. A write
+//!     is reported when the open that wrote closes; an overwrite or a size
+//!     change of a stream at once, and the stream again when that open
+//!     closes. A deletion of the file reports the file alone. Changes of a
+//!     stream whose name has a `"` are not reported: clients refuse a
+//!     response that names one.
+//!
+//!   A watched directory marked for deletion, through
+//!   FileDispositionInformation or by the close of an open that asked for
+//!   delete-on-close while other opens of it remain, ends every watch of
+//!   it: the requests waiting on them, and any request on an open of the
+//!   directory while it stays delete-pending, get STATUS_DELETE_PENDING. An
+//!   open that marked the directory, and any open made with delete-on-close,
+//!   always gets STATUS_DELETE_PENDING; once the mark is cleared, other
+//!   opens watch again. Watches of the directories above it stay, and hear
+//!   the removal once the directory is deleted.
+//!
+//!   Changes are buffered on the directory handle between requests, up to
+//!   the buffer size of its first request and at most 64 KiB; when more
+//!   arrive, or they do not fit the request being answered, the answer is
+//!   STATUS_NOTIFY_ENUM_DIR. Watches follow paths: a change made through a
+//!   symlink inside the share reaches the watchers of the path it was made
+//!   through, and on Linux, as a change on disk, those of the directory
+//!   the symlink leads to. Names are spelled as the client that made the
+//!   change spelled them, but for the stored names above.
+//!
+//!   Changes made outside the server, or through another share over the
+//!   same directory, are reported when the backend's [`Handle::watch`]
+//!   reports them. `LocalFsBackend` does on Linux, through inotify, unless
+//!   its `watch_host_changes` turns it off: additions, removals, renames
+//!   within the directory, new contents when a writer closes the file
+//!   (under SIZE, LAST_WRITE and ATTRIBUTES) and attribute or time changes
+//!   (under ATTRIBUTES) of the entries directly in a watched directory,
+//!   also for a client that asks for the whole tree. A move out of or into
+//!   the directory is a removal or an addition, and so is a rename from or
+//!   to a name the server cannot use. A lost kernel queue, and a watched
+//!   directory renamed or moved outside the server, are answered
+//!   STATUS_NOTIFY_ENUM_DIR; such a directory stays watched under its old
+//!   name. A watched directory deleted outside the server, or replaced by a
+//!   rename, ends its watches with STATUS_DELETE_PENDING, and every later
+//!   CHANGE_NOTIFY on its handles gets the same. The parent of each watched
+//!   directory is watched too, the share root's parent included, only to
+//!   see the directory go. A change in a parent is reported only to the
+//!   watchers of that parent, so a change in the share root's parent is
+//!   reported to no one. One backend holds at most 4096 kernel watches,
+//!   parents included. A directory past that, or one the kernel will not
+//!   watch, past `fs.inotify.max_user_watches` or
+//!   `fs.inotify.max_user_instances` or without `/proc`, gets only the
+//!   changes made through the server, with a warning logged once. Other
+//!   backends and platforms report only changes made through the server.
+//!
+//!   The server leaves out the backend's reports of its own changes. Each
+//!   addition, removal or rename it made in the last 5 seconds drops one
+//!   matching backend report. A modification or attribute change is
+//!   dropped while an open through the server that may write the entry's
+//!   data or attributes has it open, for 5 seconds after the server
+//!   reported a change to it or closed an open that wrote it or restored
+//!   times fixed through it, and once after it closed an open that could
+//!   write it, or created or overwrote it, and wrote nothing. A backend
+//!   report waits up to 200 milliseconds for that comparison, and goes out
+//!   before any change the server reports after it arrived in the same
+//!   directory, or below it to a watch of the whole tree.
+//!
+//!   The backend is called for these reports in four cases:
+//!   [`Handle::watch`], through an open of a watched directory, on the
+//!   first request on that directory and on the next request after the
+//!   backend's reports stopped; a
+//!   FileBasicInformation that passed something to the backend calls
+//!   [`Handle::stat`] once more; a size change on a share with watches
+//!   calls `stat` before and after; and a rename into a watched directory
+//!   that may replace an entry or changes the case of a name calls, on a
+//!   case-sensitive backend, [`ShareBackend::open`] of the target and
+//!   `stat`, otherwise `open` of the target's directory and
+//!   [`Handle::list_dir`] with the target's name.
+//! - Share listing: unless [`SmbServerBuilder::share_listing`] turns it
+//!   off, IPC$ serves the `srvsvc` pipe, so clients can list the server's
+//!   shares. A session sees the shares it may connect to, in the order
+//!   they were added, and IPC$; for an anonymous session that is the
+//!   public shares, and a session that cannot encrypt does not see shares
+//!   whose traffic is encrypted. [`Share::listed`] leaves a share out of
+//!   the list without hiding it from lookups by name, and
+//!   [`Share::remark`] sets the comment shown next to it. Backends are not
+//!   called. Other pipe names fail with STATUS_OBJECT_NAME_NOT_FOUND,
+//!   DCE/RPC binds that carry authentication are refused, and one
+//!   connection may hold 16 pipes at once.
+//! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
+//! - Each [`SmbError`] maps to one NTSTATUS for the client; see
+//!   [`SmbError::to_nt_status`].
+//!
+//! A handle is dropped without [`Handle::close`] when the task serving its
+//! connection panics or is cancelled, and when a [`ConfigHandle`] call that
+//! ends its session or tree is cancelled, so release resources in `Drop` as
+//! well.
+//!
+//! Later releases may add methods with default bodies, fields to
+//! [`FileInfo`], [`BackendCapabilities`], [`VolumeInfo`] and [`DirChange`],
+//! and variants to [`OpenIntent`] and [`DirChangeKind`]. A backend that
+//! implements the required methods, builds those types through
+//! [`FileInfo::new`], [`DirChange::new`] and the `Default` impls, and
+//! matches `OpenIntent` and `DirChangeKind` with a wildcard arm keeps
+//! compiling.
+
+mod access_mask;
+mod auth_policy;
+mod backend;
+mod builder;
+pub(crate) mod conn;
+#[cfg(feature = "discovery")]
+mod discovery;
+mod dispatch;
+mod ea;
+mod error;
+mod files;
+#[cfg(feature = "localfs")]
+mod fs;
+mod handlers;
+pub(crate) mod info_class;
+pub mod ntstatus;
+mod path;
+mod proto;
+mod rpc;
+mod server;
+mod stream;
+#[cfg(test)]
+mod tests {
+    mod aapl;
+    mod async_requests;
+    #[cfg(feature = "discovery")]
+    mod discovery;
+    mod durable;
+    mod dynamic_config;
+    mod eas;
+    pub(crate) mod memfs;
+    mod notify;
+    pub(crate) mod peer;
+    mod pipes;
+    mod stream_leases;
+    mod streams;
+}
+mod utils;
+mod wildcard;
+
+pub use backend::{
+    BackendCapabilities, DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle,
+    OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
+};
+pub use builder::{Access, BuildError, Share, SmbServerBuilder};
+pub use bytes::Bytes;
+#[cfg(feature = "discovery")]
+pub use discovery::Discovery;
+pub use ea::Ea;
+pub use error::{SmbError, SmbResult};
+pub use files::{
+    DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,
+    DEFAULT_MAX_OPENS_PER_CONNECTION,
+};
+#[cfg(feature = "localfs")]
+pub use fs::LocalFsBackend;
+pub use path::SmbPath;
+pub use proto::auth::ntlm::Identity;
+pub use server::{ConfigError, ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+pub use stream::{StreamInfo, StreamName};
+
+pub mod wire {
+    pub use crate::proto::header;
+    pub use crate::proto::messages;
+}
+
+/// Entry points for the cargo-fuzz targets in `fuzz/`. Built only with
+/// `--cfg fuzzing`, which `cargo fuzz` sets.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    use std::sync::Arc;
+
+    use crate::conn::state::Connection;
+    use crate::proto::auth::{ntlm, spnego};
+    use crate::proto::framing;
+    use crate::proto::header::Smb2Header;
+
+    /// Decodes the start of `data` as a transport frame header.
+    pub fn frame(data: &[u8]) {
+        if let Some(hdr) = data.first_chunk::<{ framing::FRAME_HEADER_LEN }>() {
+            let _ = framing::decode_frame_header(hdr);
+        }
+    }
+
+    /// Parses `data` as an SMB2 header.
+    pub fn header(data: &[u8]) {
+        let _ = Smb2Header::parse(data);
+    }
+
+    /// Decodes `data` as a SPNEGO NegTokenInit and as a NegTokenResp.
+    pub fn spnego(data: &[u8]) {
+        let _ = spnego::decode_init_token(data);
+        let _ = spnego::decode_resp_token(data);
+    }
+
+    /// Parses `data` as each NTLM message the server receives.
+    pub fn ntlm(data: &[u8]) {
+        let _ = ntlm::NtlmNegotiate::parse(data);
+        let _ = ntlm::NtlmAuthenticate::parse(data);
+    }
+
+    /// Parses `data` as the data of a lease create context.
+    pub fn lease_context(data: &[u8]) {
+        let _ = crate::proto::messages::LeaseContext::parse(data);
+    }
+
+    /// Parses `data` as a UTF-16LE CREATE name and checks the result. A
+    /// name without `:` parses as `SmbPath::from_utf16` does. In a name
+    /// with one, the text before the first `:` parses as the path, a suffix
+    /// that selects no named stream is `::$DATA`, `::$INDEX_ALLOCATION` or
+    /// `:$I30:$INDEX_ALLOCATION`, and the path and stream put back together
+    /// parse to the same result. A data stream that a stream rename target
+    /// names is the one CREATE opens for `f` followed by the target.
+    pub fn create_name(data: &[u8]) {
+        use crate::stream::{StreamPart, StreamType, parse_create_name, parse_stream_target};
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if let Ok(target) = parse_stream_target(&units) {
+            let part = match (target.stream, target.kind) {
+                (Some(stream), None | Some(StreamType::Data)) => Some(StreamPart::Named(stream)),
+                (None, Some(StreamType::Data)) => Some(StreamPart::Data),
+                _ => None,
+            };
+            if let Some(part) = part {
+                let mut file: Vec<u16> = "f".encode_utf16().collect();
+                file.extend_from_slice(&units);
+                let expected = ("f".parse().expect("a valid path"), part);
+                assert_eq!(parse_create_name(&file).ok(), Some(expected));
+            }
+        }
+        let parsed = parse_create_name(&units);
+        let Ok(name) = String::from_utf16(&units) else {
+            assert!(parsed.is_err());
+            return;
+        };
+        let Some((file, suffix)) = name.split_once(':') else {
+            let path = parsed.ok().map(|(path, stream)| {
+                assert_eq!(stream, StreamPart::None);
+                path
+            });
+            assert_eq!(path, crate::SmbPath::from_utf16(&units).ok());
+            return;
+        };
+        let Ok((path, stream)) = parsed else {
+            return;
+        };
+        assert_eq!(file.parse::<crate::SmbPath>().ok(), Some(path.clone()));
+        let suffix = suffix.to_ascii_uppercase();
+        let rebuilt = match &stream {
+            StreamPart::None => panic!("a name with `:` parsed without a stream part"),
+            StreamPart::Data => {
+                assert_eq!(suffix, ":$DATA");
+                format!("{}::$DATA", path.display_backslash())
+            }
+            StreamPart::Directory => {
+                assert!(matches!(
+                    suffix.as_str(),
+                    ":$INDEX_ALLOCATION" | "$I30:$INDEX_ALLOCATION"
+                ));
+                format!("{}::$INDEX_ALLOCATION", path.display_backslash())
+            }
+            StreamPart::Named(stream) => {
+                format!("{}:{}", path.display_backslash(), stream.as_str())
+            }
+            StreamPart::NamedDirectory(stream) => format!(
+                "{}:{}:$INDEX_ALLOCATION",
+                path.display_backslash(),
+                stream.as_str()
+            ),
+        };
+        let units: Vec<u16> = rebuilt.encode_utf16().collect();
+        assert_eq!(parse_create_name(&units).ok(), Some((path, stream)));
+    }
+
+    /// Parses `data` as the data of an `AAPL` create context. It parses
+    /// exactly when it is 24 bytes with CommandCode 1, into the bitmap and
+    /// client caps at offsets 8 and 16. The reply to it holds the parts its
+    /// bitmap asks for, each at the offset the bits before it leave.
+    pub fn aapl_context(data: &[u8]) {
+        use crate::proto::messages::aapl::{AAPL_MODEL_INFO, AAPL_SERVER_CAPS, AAPL_VOLUME_CAPS};
+        use crate::proto::messages::{AaplQuery, AaplReply};
+        let parsed = AaplQuery::parse(data);
+        assert_eq!(
+            parsed.is_ok(),
+            data.len() == 24 && data[..4] == [1, 0, 0, 0]
+        );
+        let Ok(query) = parsed else {
+            return;
+        };
+        assert_eq!(query.bitmap.to_le_bytes(), data[8..16]);
+        assert_eq!(query.client_caps.to_le_bytes(), data[16..24]);
+        let (server_caps, volume_caps) = (query.client_caps, !query.client_caps);
+        let model = "smb-server";
+        let reply = AaplReply {
+            bitmap: query.bitmap,
+            server_caps,
+            volume_caps,
+            model,
+        }
+        .encode();
+        let bitmap = query.bitmap & (AAPL_SERVER_CAPS | AAPL_VOLUME_CAPS | AAPL_MODEL_INFO);
+        assert_eq!(reply[..8], [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(reply[8..16], bitmap.to_le_bytes());
+        let mut at = 16;
+        for (bit, caps) in [
+            (AAPL_SERVER_CAPS, server_caps),
+            (AAPL_VOLUME_CAPS, volume_caps),
+        ] {
+            if bitmap & bit != 0 {
+                assert_eq!(reply[at..at + 8], caps.to_le_bytes());
+                at += 8;
+            }
+        }
+        if bitmap & AAPL_MODEL_INFO != 0 {
+            let units = crate::utils::utf16le(model);
+            assert_eq!(reply[at..at + 4], [0, 0, 0, 0]);
+            assert_eq!(reply[at + 4..at + 8], (units.len() as u32).to_le_bytes());
+            assert_eq!(reply[at + 8..], units);
+            at += 8 + units.len();
+        }
+        assert_eq!(reply.len(), at);
+    }
+
+    /// Parses `data` as a FILE_FULL_EA_INFORMATION list and as a
+    /// FILE_GET_EA_INFORMATION list. Every attribute read has a valid name
+    /// and reads back the same from the list it encodes to; every name read
+    /// is valid and listed once.
+    pub fn ea_list(data: &[u8]) {
+        use crate::ea::{encode_full_list, parse_full_list, parse_get_list, valid_name};
+        if let Ok(eas) = parse_full_list(data) {
+            assert!(!eas.is_empty());
+            assert!(eas.iter().all(|ea| valid_name(ea.name.as_bytes())));
+            assert_eq!(parse_full_list(&encode_full_list(&eas)), Ok(eas));
+        }
+        if let Ok(names) = parse_get_list(data) {
+            for (at, name) in names.iter().enumerate() {
+                assert!(valid_name(name.as_bytes()));
+                assert!(
+                    !names[..at]
+                        .iter()
+                        .any(|before| before.eq_ignore_ascii_case(name))
+                );
+            }
+        }
+    }
+
+    /// Parses `data` as a lease break acknowledgment.
+    pub fn lease_ack(data: &[u8]) {
+        let _ = crate::proto::messages::LeaseBreakAck::parse(data);
+    }
+
+    /// Parses `data` as the data of each durable handle create context.
+    pub fn durable_context(data: &[u8]) {
+        use crate::proto::messages::{
+            DurableReconnect, DurableReconnectV2, DurableRequest, DurableRequestV2,
+        };
+        let _ = DurableRequest::parse(data);
+        let _ = DurableReconnect::parse(data);
+        let _ = DurableRequestV2::parse(data);
+        let _ = DurableReconnectV2::parse(data);
+    }
+
+    /// Parses `data` as a create context chain and reads its durable handle
+    /// contexts on each dialect.
+    pub fn durable_ask(data: &[u8]) {
+        use crate::proto::messages::{CreateContext, Dialect};
+        let Ok(contexts) = CreateContext::parse_chain(data) else {
+            return;
+        };
+        for dialect in [
+            None,
+            Some(Dialect::Smb202),
+            Some(Dialect::Smb210),
+            Some(Dialect::Smb300),
+            Some(Dialect::Smb302),
+            Some(Dialect::Smb311),
+            Some(Dialect::Smb2Wildcard),
+        ] {
+            let _ = crate::handlers::create::durable_ask(&contexts, dialect);
+        }
+    }
+
+    /// Parses `data` as a DCE/RPC PDU a client sends.
+    pub fn rpc_pdu(data: &[u8]) {
+        let _ = crate::rpc::pdu::parse(data);
+    }
+
+    /// Writes `data` to an association in chunks whose size the first
+    /// byte picks, answering every call with a fault and with its stub as
+    /// a response. Every PDU sent back parses, a response fits in the size
+    /// the bind negotiated, and what the association holds stays bounded.
+    pub fn rpc_association(data: &[u8]) {
+        use crate::rpc::association::{Association, Fault, Step};
+        use crate::rpc::pdu::{
+            self, MAX_FRAG, NCA_OP_RNG_ERROR, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND_ACK,
+            PTYPE_RESPONSE,
+        };
+
+        let Some((&chunk, data)) = data.split_first() else {
+            return;
+        };
+        let chunk = usize::from(chunk).max(1);
+        let mut assoc = Association::default();
+        let mut max_frag = MAX_FRAG;
+        for mut piece in data.chunks(chunk) {
+            while let Some(step) = assoc.next_step(&mut piece) {
+                let sent = match step {
+                    Step::Send(pdu) => vec![pdu],
+                    Step::Call(call) => {
+                        let fault = Fault {
+                            status: NCA_OP_RNG_ERROR,
+                            did_not_execute: true,
+                        };
+                        let mut replies = assoc.reply(&call, Err(fault));
+                        replies.extend(assoc.reply(&call, Ok(call.stub.clone())));
+                        replies
+                    }
+                };
+                for pdu in sent {
+                    assert!(pdu::parse(&pdu).is_some());
+                    match pdu[2] {
+                        PTYPE_BIND_ACK => max_frag = u16::from_le_bytes([pdu[16], pdu[17]]),
+                        PTYPE_RESPONSE => assert!(pdu.len() <= usize::from(max_frag)),
+                        PTYPE_ALTER_CONTEXT_RESP => {}
+                        _ => assert!(pdu.len() <= usize::from(MAX_FRAG)),
+                    }
+                }
+                assert!(assoc.held() <= (64 << 10) + usize::from(u16::MAX));
+            }
+        }
+    }
+
+    /// Runs `data` as a srvsvc request stub. The first byte picks the
+    /// operation: NetrShareEnum, NetrShareGetInfo, NetrServerGetInfo or,
+    /// with the second byte, any opnum. The caller sees three shares.
+    pub fn srvsvc_request(data: &[u8]) {
+        use crate::rpc::srvsvc::{self, ListedShare, ShareView};
+
+        let Some((&pick, stub)) = data.split_first() else {
+            return;
+        };
+        let (opnum, stub) = match pick % 4 {
+            0 => (srvsvc::OPNUM_SHARE_ENUM, stub),
+            1 => (srvsvc::OPNUM_SHARE_GET_INFO, stub),
+            2 => (srvsvc::OPNUM_SERVER_GET_INFO, stub),
+            _ => match stub.split_first() {
+                Some((&opnum, stub)) => (u16::from(opnum), stub),
+                None => return,
+            },
+        };
+        let share = |name: &str, kind, remark: &str| ListedShare {
+            name: name.to_string(),
+            kind,
+            remark: remark.to_string(),
+        };
+        let view = ShareView {
+            server_name: "FUZZ".to_string(),
+            shares: vec![
+                share("public", 0, ""),
+                share("d\u{f6}cs$", 0, "\u{1F9A4} remark"),
+                share("IPC$", 0x8000_0003, "Remote IPC"),
+            ],
+        };
+        let _ = srvsvc::call(opnum, stub, &view);
+    }
+
+    /// Runs `data` through the WS-Discovery target service: the first byte
+    /// picks the family of the sender, the next 4 or 16 bytes its address
+    /// and 2 its port, and the rest is the datagram. A reply goes only to a
+    /// sender on the link, and is a well-formed envelope that fits a
+    /// datagram.
+    #[cfg(all(feature = "discovery", unix))]
+    pub fn wsd_datagram(data: &[u8]) {
+        crate::discovery::wsd::fuzz_datagram(data);
+    }
+
+    /// Answers `data` as a whole request to the WS-Discovery metadata
+    /// endpoint.
+    #[cfg(all(feature = "discovery", unix))]
+    pub fn wsd_http(data: &[u8]) {
+        crate::discovery::wsd::fuzz_http(data);
+    }
+
+    /// Dispatches one frame payload on a fresh connection to `server`.
+    pub async fn dispatch(server: &crate::SmbServer, frame: &[u8]) -> Option<Vec<u8>> {
+        let state = server.state();
+        let conn = Arc::new(Connection::new(
+            state.config.server_guid,
+            state.config.max_read_size,
+            state.config.max_write_size,
+        ));
+        crate::dispatch::dispatch_frame(&state, &conn, frame)
+            .await
+            .map(|out| out.bytes)
+    }
+}

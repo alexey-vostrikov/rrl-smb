@@ -1,0 +1,753 @@
+//! `ShareBackend` and `Handle` traits: the storage abstraction.
+//!
+//! Implementors of these traits plug into `Share::new(name, backend)`. The
+//! protocol layer never exposes raw FS types to backends; everything goes
+//! through validated `SmbPath`s and the small structs below.
+
+use async_trait::async_trait;
+use std::time::SystemTime;
+
+use crate::ea::Ea;
+use crate::error::{SmbError, SmbResult};
+use crate::path::SmbPath;
+use crate::stream::{StreamInfo, StreamName};
+
+// ---------------------------------------------------------------------------
+// OpenOptions
+// ---------------------------------------------------------------------------
+
+/// SMB CREATE disposition as seen by a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenIntent {
+    /// `FILE_OPEN`: open existing only; fail if missing.
+    Open,
+    /// `FILE_CREATE`: create new only; fail if exists.
+    Create,
+    /// `FILE_OPEN_IF`: open existing or create new.
+    OpenOrCreate,
+    /// `FILE_OVERWRITE_IF`: open existing (truncating) or create new.
+    OverwriteOrCreate,
+    /// `FILE_OVERWRITE`: open existing and truncate; fail if missing.
+    Truncate,
+}
+
+/// Options passed to `ShareBackend::open`.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenOptions {
+    /// The open was granted `FILE_READ_DATA`, or has no data write access.
+    /// At least one of `read` and `write` is set.
+    pub read: bool,
+    /// The open was granted `FILE_WRITE_DATA` or `FILE_APPEND_DATA`.
+    pub write: bool,
+    /// The open was granted `FILE_WRITE_ATTRIBUTES`: the handle must be able
+    /// to change times and attributes, including on a read-only file.
+    pub write_attributes: bool,
+    /// CREATE disposition.
+    pub intent: OpenIntent,
+    /// `FILE_DIRECTORY_FILE` was set on CREATE, or the name ended in
+    /// `::$INDEX_ALLOCATION`: open or create a directory.
+    pub directory: bool,
+    /// `FILE_NON_DIRECTORY_FILE` was set on CREATE, or the name ended in
+    /// `::$DATA`: fail if the target is a directory.
+    pub non_directory: bool,
+    /// `FILE_DELETE_ON_CLOSE` was set on CREATE.
+    pub delete_on_close: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            read: true,
+            write: false,
+            write_attributes: false,
+            intent: OpenIntent::Open,
+            directory: false,
+            non_directory: false,
+            delete_on_close: false,
+        }
+    }
+}
+
+/// What `ShareBackend::open` did to the file (MS-SMB2 2.2.14 CreateAction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAction {
+    /// An existing file or directory was opened.
+    Opened,
+    /// A new file or directory was created.
+    Created,
+    /// An existing file was truncated to zero length, as
+    /// [`OpenIntent::Truncate`] and [`OpenIntent::OverwriteOrCreate`] do.
+    Overwritten,
+}
+
+// ---------------------------------------------------------------------------
+// FileInfo / DirEntry / FileTimes
+// ---------------------------------------------------------------------------
+
+/// Filesystem-style metadata for a single file or directory. Built with
+/// [`FileInfo::new`]; every field is public.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FileInfo {
+    /// Display name (last component). For QUERY_INFO at the share root this
+    /// is the share name.
+    pub name: String,
+    /// File size in bytes. The server reports a directory with a size of
+    /// 0 whatever this says.
+    pub end_of_file: u64,
+    /// Allocation size, usually `end_of_file` rounded up to a cluster.
+    /// Backends may return `end_of_file`. The server reports 0 for a
+    /// directory.
+    pub allocation_size: u64,
+    /// FILETIME (100ns ticks since 1601).
+    pub creation_time: u64,
+    pub last_access_time: u64,
+    pub last_write_time: u64,
+    pub change_time: u64,
+    /// True if this is a directory.
+    pub is_directory: bool,
+    /// The file has `FILE_ATTRIBUTE_READONLY`.
+    pub read_only: bool,
+    /// Stable id of the file, unique within the share including any mounts
+    /// below the share root, reported as the file id by QUERY_INFO and
+    /// QUERY_DIRECTORY. Backends return the same value from `Handle::stat`
+    /// and `Handle::list_dir` for the same file, across opens and renames.
+    /// `0` if the backend has none; the server then tells files apart by
+    /// path, so a file reached through two hard links counts as two files:
+    /// share modes, byte-range locks and leases taken through one name do
+    /// not see opens through the other, and clients on the two names can
+    /// both cache writes to it.
+    pub file_index: u64,
+    /// POSIX mode of the file, file type bits included, as `st_mode` has
+    /// it. Directory listings give macOS clients that negotiated Apple's
+    /// extensions its low 16 bits. `None` where the host has no modes.
+    pub unix_mode: Option<u32>,
+    /// Bytes the file's extended attributes take as FILE_FULL_EA_INFORMATION
+    /// entries of what [`Handle::eas`] returns, each 8 bytes, the name, a
+    /// NUL and the value, padded to 4 bytes. `0` when it has none or the
+    /// backend does not report [`BackendCapabilities::extended_attributes`].
+    /// FileEaInformation, FileAllInformation and directory listings report
+    /// it as EaSize; on an open of a named stream, the file's.
+    pub ea_size: u32,
+    /// The file's other attributes (MS-FSCC 2.6) as the backend stores
+    /// them: any of `FILE_ATTRIBUTE_HIDDEN`, `SYSTEM`, `ARCHIVE`,
+    /// `TEMPORARY`, `OFFLINE` and `NOT_CONTENT_INDEXED`. Other flags here
+    /// are ignored: `read_only` and `is_directory` give READONLY and
+    /// DIRECTORY. `0` for a backend that stores none of them.
+    pub file_attributes: u32,
+}
+
+// File attributes (MS-FSCC 2.6).
+pub(crate) const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+pub(crate) const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+pub(crate) const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+pub(crate) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub(crate) const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+pub(crate) const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub(crate) const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+pub(crate) const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+pub(crate) const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
+
+/// Attributes [`FileInfo::file_attributes`] carries.
+const OTHER_ATTRIBUTES: u32 = FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE
+    | FILE_ATTRIBUTE_TEMPORARY
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+/// Attributes FileBasicInformation can set (MS-FSA 2.1.5.15.2).
+pub(crate) const VALID_SET_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY | OTHER_ATTRIBUTES;
+
+impl FileInfo {
+    /// A zero-length, writable file named `name` with no times and no file
+    /// id. Set the fields the backend knows.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            end_of_file: 0,
+            allocation_size: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            is_directory: false,
+            read_only: false,
+            file_index: 0,
+            unix_mode: None,
+            ea_size: 0,
+            file_attributes: 0,
+        }
+    }
+
+    /// SMB2 file attributes (MS-FSCC 2.6) for this file:
+    /// `FILE_ATTRIBUTE_DIRECTORY` for directories,
+    /// `FILE_ATTRIBUTE_READONLY` for read-only files, and the flags of
+    /// [`FileInfo::file_attributes`]. `FILE_ATTRIBUTE_NORMAL` stands alone
+    /// when none applies.
+    pub fn attributes(&self) -> u32 {
+        let mut attributes = self.file_attributes & OTHER_ATTRIBUTES;
+        if self.is_directory {
+            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        if self.read_only {
+            attributes |= FILE_ATTRIBUTE_READONLY;
+        }
+        if attributes == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            attributes
+        }
+    }
+
+    /// EndOfFile and AllocationSize as the server reports them: 0 for a
+    /// directory, which has no data of its own.
+    pub(crate) fn sizes(&self) -> (u64, u64) {
+        if self.is_directory {
+            (0, 0)
+        } else {
+            (self.end_of_file, self.allocation_size)
+        }
+    }
+}
+
+/// One entry of a directory listing.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub info: FileInfo,
+}
+
+/// Optional FILETIME values for `set_times`. `None` means "leave unchanged".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileTimes {
+    pub creation_time: Option<u64>,
+    pub last_access_time: Option<u64>,
+    pub last_write_time: Option<u64>,
+    pub change_time: Option<u64>,
+}
+
+impl FileTimes {
+    /// `FileTimes` with all four fields set to `t`.
+    pub fn all(t: SystemTime) -> Self {
+        let ft = crate::utils::system_time_to_filetime(t);
+        Self {
+            creation_time: Some(ft),
+            last_access_time: Some(ft),
+            last_write_time: Some(ft),
+            change_time: Some(ft),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BackendCapabilities
+// ---------------------------------------------------------------------------
+
+/// Static, advertised capabilities of a backend. Built from
+/// [`BackendCapabilities::default`]; every field is public.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct BackendCapabilities {
+    /// If true, all write-class operations are denied at the protocol layer
+    /// before reaching the backend (matches `LocalFsBackend::read_only()`).
+    pub is_read_only: bool,
+    /// True iff the backend treats names case-sensitively.
+    pub case_sensitive: bool,
+    /// The backend stores named streams (`file.txt:name`), served by
+    /// [`ShareBackend::open_stream`], [`ShareBackend::remove_stream`],
+    /// [`ShareBackend::rename_stream`] and [`Handle::streams`]. On a share
+    /// that leaves [`Share::named_streams`](crate::Share::named_streams) on,
+    /// FileFsAttributeInformation then reports FILE_NAMED_STREAMS. Without
+    /// it, a CREATE that names a stream fails with
+    /// STATUS_OBJECT_NAME_INVALID before the backend is called.
+    pub named_streams: bool,
+    /// The backend stores extended attributes of files and directories,
+    /// served by [`Handle::eas`] and [`Handle::set_eas`]. On a share that
+    /// leaves
+    /// [`Share::extended_attributes`](crate::Share::extended_attributes)
+    /// on, FileFsAttributeInformation then reports
+    /// FILE_SUPPORTS_EXTENDED_ATTRIBUTES. Without it, the share answers as
+    /// [`Share::extended_attributes`](crate::Share::extended_attributes)
+    /// describes for a share that turns them off.
+    pub extended_attributes: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Traits
+// ---------------------------------------------------------------------------
+
+/// Pluggable storage backend mounted as a share.
+///
+/// Implementors must be `Send + Sync + 'static` so the server can spawn
+/// per-request handlers freely.
+#[async_trait]
+pub trait ShareBackend: Send + Sync + 'static {
+    /// Open or create a file or directory. Returns a fresh handle and what
+    /// the open did to the file.
+    ///
+    /// Fail with [`SmbError::PathNotFound`] when a directory on the way to
+    /// `path` is missing and [`SmbError::NotFound`] when only the last
+    /// component is.
+    ///
+    /// A backend that reports [`BackendCapabilities::named_streams`] keeps
+    /// the named streams of a file that [`OpenIntent::Truncate`] or
+    /// [`OpenIntent::OverwriteOrCreate`] overwrites: the protocol layer
+    /// removes them with [`ShareBackend::remove_stream`], each once no open
+    /// is on it. `unlink` removes them with the file, and `rename` keeps
+    /// them with it.
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)>;
+
+    /// Delete a file or an empty directory.
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
+
+    /// Rename `from` to `to`.
+    ///
+    /// If `to` names an existing file other than `from`, including another
+    /// hard link to the same file, fail with [`SmbError::Exists`] unless
+    /// `replace_if_exists` is set, in which case the existing file is
+    /// replaced. An existing directory at `to` is never
+    /// replaced: fail with [`SmbError::AccessDenied`].
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
+
+    /// Static capabilities. TREE_CONNECT clamps access to read-only when
+    /// `is_read_only` is set.
+    fn capabilities(&self) -> BackendCapabilities;
+
+    /// Size, free space and identity of the volume behind the share, for the
+    /// filesystem QUERY_INFO classes. The default returns
+    /// [`VolumeInfo::default`].
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        Ok(VolumeInfo::default())
+    }
+
+    /// Open or create the named stream `stream` of the file or directory at
+    /// `path`. `file` is the handle `open` just gave for `path`, opened for
+    /// reading. The backend owns it and closes it, also when this fails; it
+    /// may keep it for as long as the stream's handle lasts, so the stream
+    /// follows the file through renames. `opts.intent` applies to the
+    /// stream; `opts.directory` and `opts.non_directory` are false. The
+    /// handle reads and writes the stream: its `stat` reports the file's
+    /// times, attributes and id with the stream's sizes, `set_times` and
+    /// `set_attributes` change the file, and `truncate` the stream. A
+    /// write or size change of the stream updates the file's last write
+    /// time, which the protocol layer reports as a change of the file.
+    ///
+    /// Stream names compare without regard to case: an existing stream
+    /// opens under any spelling of its name, and a new one keeps the
+    /// spelling of `stream`. An open that would write or create a stream of
+    /// a read-only file fails with STATUS_ACCESS_DENIED before this is
+    /// called.
+    ///
+    /// Called only when [`BackendCapabilities::named_streams`] is set. The
+    /// protocol layer answers [`SmbError::NotSupported`] from this, from
+    /// [`ShareBackend::remove_stream`], from [`ShareBackend::rename_stream`]
+    /// and from a stream's handle with STATUS_ACCESS_DENIED: macOS stores
+    /// an extended attribute in a `._` file when a stream request fails
+    /// with STATUS_NOT_SUPPORTED. The default closes `file` and returns
+    /// [`SmbError::NotSupported`].
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        _path: &SmbPath,
+        _stream: &StreamName,
+        _opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let _ = file.close().await;
+        Err(SmbError::NotSupported)
+    }
+
+    /// Remove the named stream of the file or directory at `path` that
+    /// `stream` names, whatever the case of its spelling. Fail with
+    /// [`SmbError::NotFound`] when the file has no such stream.
+    ///
+    /// `file_index` is the [`FileInfo::file_index`] the backend reported
+    /// for the file the protocol layer means, `0` if it reported none. A
+    /// backend with file ids fails with [`SmbError::NotFound`] when the
+    /// file at `path` has another id, as when another file took its place
+    /// outside the server, and leaves that file alone. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn remove_stream(
+        &self,
+        _path: &SmbPath,
+        _file_index: u64,
+        _stream: &StreamName,
+    ) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Rename a stream of the file or directory at `path`, which has the id
+    /// `file_index` as [`ShareBackend::remove_stream`] says: the named
+    /// stream `from` names, or the default stream when `from` is `None`,
+    /// to the named stream `to`, or to the default stream when `to` is
+    /// `None`. Names compare without regard to case, and a renamed stream
+    /// takes the spelling of `to`. `from` and `to` never name the same
+    /// stream, and a directory, which has no default stream, only renames
+    /// a named stream to another.
+    ///
+    /// When `to` names an existing stream, fail with [`SmbError::Exists`]
+    /// unless `replace_if_exists` is set; then that stream is replaced,
+    /// and the protocol layer has checked that it is empty and that no
+    /// open is on it. That holds for the default stream too, which a
+    /// rename to it always replaces.
+    ///
+    /// A rename from the default stream moves the file's data into the
+    /// named stream and leaves the default stream empty; a rename to it
+    /// moves the stream's data into the file and removes the stream. A
+    /// rename that fails leaves both streams as they were, a replaced one
+    /// included.
+    ///
+    /// Stream handles track their stream itself, not its name: every
+    /// handle open on a named stream renamed to another name keeps reading
+    /// and writing it under its new name. A rename to or from the default
+    /// stream comes from the only open on the stream it renames, whose
+    /// handle the protocol layer replaces with a new one; the old handle
+    /// still has to close cleanly. The rename updates the file's last
+    /// write time, which the protocol layer reports as a change of the
+    /// file.
+    ///
+    /// The default returns [`SmbError::NotSupported`].
+    async fn rename_stream(
+        &self,
+        _path: &SmbPath,
+        _file_index: u64,
+        _from: Option<&StreamName>,
+        _to: Option<&StreamName>,
+        _replace_if_exists: bool,
+    ) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+}
+
+/// A live open file or directory handle.
+///
+/// One handle per `CREATE`. `close` runs when CLOSE arrives, and when the
+/// tree, session or connection the open belongs to ends. A durable open's
+/// handle stays open past the end of its session or connection, until its
+/// client takes the open back, the open expires, or something else closes
+/// it; see the crate docs.
+#[async_trait]
+pub trait Handle: Send + Sync {
+    /// Read up to `len` bytes at `offset`. May return fewer.
+    async fn read(&self, offset: u64, len: u32) -> SmbResult<bytes::Bytes>;
+
+    /// Write `data` at `offset`. Returns bytes written. A write that starts
+    /// past the end of the file leaves a gap that reads as zeros.
+    async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32>;
+
+    /// Write owned `data` at `offset`. Backends that need ownership across a
+    /// blocking boundary can override this to avoid an extra copy.
+    async fn write_owned(&self, offset: u64, data: Vec<u8>) -> SmbResult<u32> {
+        self.write(offset, &data).await
+    }
+
+    /// Flush buffered writes. May be a no-op on backends that always flush.
+    async fn flush(&self) -> SmbResult<()>;
+
+    /// Stat: current file info.
+    async fn stat(&self) -> SmbResult<FileInfo>;
+
+    /// Set timestamps on a file or directory. `None` fields leave the
+    /// corresponding time alone.
+    ///
+    /// Return [`SmbError::NotSupported`] for an access or write time the
+    /// backend cannot store. A backend that cannot store a creation time
+    /// ignores it and applies the other fields; a request with only a
+    /// creation time then succeeds and changes nothing.
+    /// `change_time` is the time of the last change: a backend whose
+    /// storage moves it to the current time on every change, as POSIX ctime
+    /// does, may keep doing so and not store the requested value.
+    ///
+    /// `LocalFsBackend` sets access and write times on every host and
+    /// creation time on Windows and macOS. Elsewhere it ignores the creation
+    /// time. The host keeps the change time.
+    async fn set_times(&self, times: FileTimes) -> SmbResult<()>;
+
+    /// Set the attributes (MS-FSCC 2.6) of a file or directory to
+    /// `attributes`, a combination of `FILE_ATTRIBUTE_READONLY` (0x1),
+    /// `HIDDEN` (0x2), `SYSTEM` (0x4), `ARCHIVE` (0x20), `TEMPORARY`
+    /// (0x100), `OFFLINE` (0x1000) and `NOT_CONTENT_INDEXED` (0x2000).
+    /// Flags left out are cleared. The protocol layer calls this only when
+    /// the request differs from the attributes [`Handle::stat`] reports.
+    ///
+    /// Return [`SmbError::NotSupported`] if a flag cannot be stored, or
+    /// store what the backend can and ignore the rest, as long as
+    /// [`Handle::stat`] then reports what is stored.
+    ///
+    /// `LocalFsBackend` on Windows stores every flag as the host's
+    /// attributes. On Unix hosts it stores `READONLY` on files as the
+    /// absence of write permission bits and ignores the other flags, and
+    /// `READONLY` on a directory: [`FileInfo::file_attributes`] stays 0
+    /// there.
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()>;
+
+    /// Truncate (or extend) to `len` bytes; bytes added by extending read as
+    /// zeros. For directories: the protocol layer rejects this before
+    /// reaching the backend.
+    async fn truncate(&self, len: u64) -> SmbResult<()>;
+
+    /// List directory entries matching the optional pattern. The pattern
+    /// uses the wildcards of MS-FSA 2.1.4.4: `*` and `?`, and the DOS forms
+    /// `<` (DOS_STAR), `>` (DOS_QM) and `"` (DOS_DOT).
+    /// QUERY_DIRECTORY returns the result as is, so the backend applies the
+    /// pattern. The `.` and `..` entries are left out; QUERY_DIRECTORY adds
+    /// them.
+    async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
+
+    /// [`Handle::list_dir`] for a caller that reads the
+    /// [`FileInfo::ea_size`] of the entries only when `ea_size` is set;
+    /// without it a backend may leave that 0 and skip reading it.
+    /// QUERY_DIRECTORY calls this when a listing starts or restarts, with
+    /// `ea_size` set when the share serves extended attributes and the
+    /// information class carries EaSize; the layout with Finder data for
+    /// macOS clients carries none. Queries that carry on a listing reuse
+    /// its entries, so one carried on under a class with EaSize after it
+    /// started under one without reports 0 until it restarts. The default
+    /// calls `list_dir`.
+    async fn list_dir_sized(
+        &self,
+        pattern: Option<&str>,
+        ea_size: bool,
+    ) -> SmbResult<Vec<DirEntry>> {
+        let _ = ea_size;
+        self.list_dir(pattern).await
+    }
+
+    /// Close the handle. Boxed self lets implementors consume internal state.
+    async fn close(self: Box<Self>) -> SmbResult<()>;
+
+    /// Number of hard links to the file, reported as NumberOfLinks by
+    /// FileStandardInformation. `0` means the file has been deleted while
+    /// open. The default reports `1`.
+    async fn link_count(&self) -> SmbResult<u32> {
+        Ok(1)
+    }
+
+    /// True if this directory has no entries other than `.` and `..`,
+    /// including entries [`Handle::list_dir`] leaves out. The default checks
+    /// `list_dir(None)`, so a backend whose listing hides entries overrides
+    /// it.
+    async fn dir_is_empty(&self) -> SmbResult<bool> {
+        Ok(self.list_dir(None).await?.is_empty())
+    }
+
+    /// Watch this directory for changes to its entries made by anyone,
+    /// including outside the server. The server asks one open of a watched
+    /// directory and shares the watch among every watch of that directory;
+    /// it may outlive the handle, and is dropped with the directory's last
+    /// watch. The default returns `Ok(None)`: the server then reports only
+    /// the changes made through it.
+    async fn watch(&self) -> SmbResult<Option<Box<dyn DirWatch>>> {
+        Ok(None)
+    }
+
+    /// The named streams of the file or directory this handle is on,
+    /// whichever of its streams the handle is open on, in the order
+    /// FileStreamInformation lists them. The default stream is not listed.
+    /// Called only when [`BackendCapabilities::named_streams`] is set. The
+    /// default returns none.
+    async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// The named streams of entries of this directory: for each entry of
+    /// `entries`, a name and the streams to read with the most bytes to
+    /// read of each, one result per stream, in order, with the stream's
+    /// size and up to that many bytes from its start. A result is `None`
+    /// when the entry has no such stream, or when it or the entry cannot
+    /// be read; stream names compare without regard to case. An entry
+    /// that is not a regular file or a directory has none: no FIFO,
+    /// socket or device is opened in a way that blocks, and no link is
+    /// followed out of the share.
+    ///
+    /// QUERY_DIRECTORY for a macOS client that negotiated Apple's
+    /// extensions calls it once per response, for `AFP_AfpInfo` of the
+    /// entries the response carries, other than "." and "..", and
+    /// `AFP_Resource` of the files among them. Called only on a directory
+    /// and only when [`BackendCapabilities::named_streams`] is set. A
+    /// handle that wraps another has to forward it, or listings carry no
+    /// Finder data. The default returns [`SmbError::NotSupported`];
+    /// listings then carry no Finder info or resource fork sizes.
+    async fn peek_streams(
+        &self,
+        _entries: &[(&str, &[(StreamName, u32)])],
+    ) -> SmbResult<Vec<Vec<Option<(u64, bytes::Bytes)>>>> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// The extended attributes of the file or directory this handle is
+    /// on, in the order FileFullEaInformation lists them. The protocol
+    /// layer leaves out those with names a client cannot send, empty
+    /// values or values over 65535 bytes. Called only when
+    /// [`BackendCapabilities::extended_attributes`] is set, and never on a
+    /// handle of a named stream. The default returns none.
+    async fn eas(&self) -> SmbResult<Vec<Ea>> {
+        Ok(Vec::new())
+    }
+
+    /// Changes the extended attributes of the file or directory this
+    /// handle is on: each of `eas` replaces the attribute of its name, or
+    /// adds it, and one with an empty value removes it, if there is one.
+    /// Names compare without regard to ASCII case; a replaced attribute
+    /// may keep the spelling it had. A name appears once in `eas`. All
+    /// of them apply or none does.
+    ///
+    /// The protocol layer has checked the names, and that the attributes
+    /// the file ends up with take at most 65531 bytes, counting 5 bytes,
+    /// the name and the value of each. Fail with
+    /// [`SmbError::EaTooLarge`] when they need more room than the backend
+    /// has, and with [`SmbError::EaNameInvalid`] for a name it cannot
+    /// store. Called only when
+    /// [`BackendCapabilities::extended_attributes`] is set, and never on a
+    /// handle of a named stream. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn set_eas(&self, _eas: &[Ea]) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+}
+
+/// What a backend saw happen to an entry of a watched directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DirChangeKind {
+    /// The entry appeared.
+    Added,
+    /// The entry went away.
+    Removed,
+    /// The entry was renamed within the directory from `from`.
+    Renamed { from: String },
+    /// The entry's contents were written.
+    Modified,
+    /// The entry's attributes or times changed.
+    AttributesChanged,
+    /// Changes were lost; the client has to list the directory again.
+    Lost,
+    /// The watched directory itself was renamed or moved. Changes to its
+    /// entries keep coming.
+    Moved,
+    /// The watched directory itself was deleted. No change follows.
+    Deleted,
+}
+
+/// A change to an entry of a watched directory, as the backend saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DirChange {
+    /// Name of the entry in the directory. Empty for
+    /// [`DirChangeKind::Lost`], [`DirChangeKind::Moved`] and
+    /// [`DirChangeKind::Deleted`].
+    pub name: String,
+    /// What happened to the entry.
+    pub kind: DirChangeKind,
+    /// The entry is a directory.
+    pub is_directory: bool,
+}
+
+impl DirChange {
+    /// A change of `kind` to the entry `name`, a directory when
+    /// `is_directory`.
+    pub fn new(name: impl Into<String>, kind: DirChangeKind, is_directory: bool) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            is_directory,
+        }
+    }
+}
+
+/// Changes to the entries of one directory, from [`Handle::watch`].
+#[async_trait]
+pub trait DirWatch: Send {
+    /// The next changes, in the order they happened; `None` once the watch
+    /// has stopped. A watch that stops without [`DirChangeKind::Deleted`]
+    /// may have lost changes, and the server asks for a new one. The server
+    /// leaves out names it cannot use, and takes a rename from or to one as
+    /// the addition or removal of the other name.
+    ///
+    /// Must be cancel-safe: the server may drop the future before it
+    /// completes, and changes it had not returned must come with the next
+    /// call.
+    async fn next(&mut self) -> Option<Vec<DirChange>>;
+}
+
+/// Backend for the synthetic IPC$ share. `open`, `unlink` and `rename`
+/// return [`SmbError::NotSupported`].
+pub(crate) struct NotSupportedBackend;
+
+#[async_trait]
+impl ShareBackend for NotSupportedBackend {
+    async fn open(
+        &self,
+        _path: &SmbPath,
+        _opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        Err(SmbError::NotSupported)
+    }
+    async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+    async fn rename(&self, _from: &SmbPath, _to: &SmbPath, _replace: bool) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            is_read_only: true,
+            case_sensitive: false,
+            named_streams: false,
+            extended_attributes: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VolumeInfo
+// ---------------------------------------------------------------------------
+
+/// Volume behind a share, as reported by FileFsVolumeInformation,
+/// FileFsSizeInformation, FileFsFullSizeInformation,
+/// FileFsAttributeInformation and FileFsSectorSizeInformation (MS-FSCC 2.5).
+///
+/// Sizes count allocation units of `sectors_per_allocation_unit *
+/// bytes_per_sector` bytes. Built from [`VolumeInfo::default`]; every
+/// field is public.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VolumeInfo {
+    /// Total allocation units on the volume.
+    pub total_allocation_units: u64,
+    /// Free allocation units available to the share's users, after quotas
+    /// and reserved space.
+    pub caller_available_allocation_units: u64,
+    /// Free allocation units on the volume.
+    pub actual_available_allocation_units: u64,
+    /// Sectors in one allocation unit.
+    pub sectors_per_allocation_unit: u32,
+    /// Bytes in one sector.
+    pub bytes_per_sector: u32,
+    /// Volume serial number.
+    pub serial_number: u32,
+    /// Volume label. `None` reports the share name.
+    pub label: Option<String>,
+    /// Longest file name the volume stores, in characters.
+    pub max_name_length: u32,
+}
+
+impl Default for VolumeInfo {
+    /// A 4 PiB volume with 2 PiB free, in 4 KiB allocation units.
+    fn default() -> Self {
+        Self {
+            total_allocation_units: 1 << 40,
+            caller_available_allocation_units: 1 << 39,
+            actual_available_allocation_units: 1 << 39,
+            sectors_per_allocation_unit: 1,
+            bytes_per_sector: 4096,
+            serial_number: crate::info_class::VOLUME_SERIAL_NUMBER,
+            label: None,
+            max_name_length: 255,
+        }
+    }
+}

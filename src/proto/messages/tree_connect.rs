@@ -1,0 +1,161 @@
+//! TREE_CONNECT Request/Response (MS-SMB2 §2.2.9 / §2.2.10).
+
+use binrw::{BinRead, BinWrite, binrw};
+use std::io::Cursor;
+
+use crate::proto::error::ProtoResult;
+use crate::proto::header::SMB2_HEADER_LEN;
+use crate::utils::utf16le_to_units;
+
+/// SMB2_TREE_CONNECT_REQUEST (MS-SMB2 §2.2.9).
+///
+/// `path` is UTF-16LE. The wire format gives `PathOffset` (from the start of
+/// the SMB2 header) and `PathLength`; `path` is encoded and decoded
+/// immediately following the fixed prefix, and [`TreeConnectRequest::path_in`]
+/// finds it by `PathOffset`. 3.1.1 tree-connect extensions are not decoded.
+#[binrw]
+#[brw(little)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeConnectRequest {
+    pub structure_size: u16,
+    /// 3.1.1: flags. 2.x/3.0/3.0.2: reserved.
+    pub flags: u16,
+    pub path_offset: u16,
+    pub path_length: u16,
+    /// UTF-16LE share path bytes (e.g. `\\server\share`).
+    #[br(parse_with = super::read_buf, args(path_length as usize))]
+    pub path: Vec<u8>,
+}
+
+impl TreeConnectRequest {
+    /// Flag: SMB2_TREE_CONNECT_FLAG_CLUSTER_RECONNECT (3.1.1).
+    pub const FLAG_CLUSTER_RECONNECT: u16 = 0x0001;
+    /// Flag: SMB2_TREE_CONNECT_FLAG_REDIRECT_TO_OWNER (3.1.1).
+    pub const FLAG_REDIRECT_TO_OWNER: u16 = 0x0002;
+    /// Flag: SMB2_TREE_CONNECT_FLAG_EXTENSION_PRESENT (3.1.1).
+    pub const FLAG_EXTENSION_PRESENT: u16 = 0x0004;
+
+    /// Decode the UTF-16LE share path into a `String`. Returns `None` if the
+    /// stored bytes are not an even length (malformed UTF-16LE).
+    pub fn path_str(&self) -> Option<String> {
+        utf16le_to_units(&self.path).map(|units| String::from_utf16_lossy(&units))
+    }
+
+    /// The share path bytes in `body`, the request after the SMB2 header,
+    /// located by `PathOffset` and `PathLength`. With
+    /// SMB2_TREE_CONNECT_FLAG_EXTENSION_PRESENT the path follows the
+    /// extension and `PathOffset` points at it. `None` when the path lies
+    /// outside the request's buffer.
+    pub fn path_in<'a>(&self, body: &'a [u8]) -> Option<&'a [u8]> {
+        let start = usize::from(self.path_offset).checked_sub(SMB2_HEADER_LEN)?;
+        if start < FIXED_LEN {
+            return None;
+        }
+        body.get(start..start + usize::from(self.path_length))
+    }
+
+    pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
+        Ok(Self::read(&mut Cursor::new(buf))?)
+    }
+    pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
+        let mut c = Cursor::new(Vec::new());
+        BinWrite::write(self, &mut c)?;
+        out.extend_from_slice(&c.into_inner());
+        Ok(())
+    }
+}
+
+/// Size of the fixed part of a TREE_CONNECT request, before Buffer.
+const FIXED_LEN: usize = 8;
+
+/// SMB2_TREE_CONNECT_RESPONSE (MS-SMB2 §2.2.10).
+#[binrw]
+#[brw(little)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeConnectResponse {
+    pub structure_size: u16,
+    pub share_type: u8,
+    pub reserved: u8,
+    pub share_flags: u32,
+    pub capabilities: u32,
+    pub maximal_access: u32,
+}
+
+impl TreeConnectResponse {
+    /// Share type: SMB2_SHARE_TYPE_DISK.
+    pub const SHARE_TYPE_DISK: u8 = 0x01;
+    pub const SHARE_TYPE_PIPE: u8 = 0x02;
+    pub const SHARE_TYPE_PRINT: u8 = 0x03;
+
+    pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
+        Ok(Self::read(&mut Cursor::new(buf))?)
+    }
+    pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
+        let mut c = Cursor::new(Vec::new());
+        BinWrite::write(self, &mut c)?;
+        out.extend_from_slice(&c.into_inner());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn request_round_trips() {
+        let path = utf16le(r"\\server\share");
+        let r = TreeConnectRequest {
+            structure_size: 9,
+            flags: 0,
+            path_offset: 0x48,
+            path_length: path.len() as u16,
+            path,
+        };
+        let mut buf = Vec::new();
+        r.write_to(&mut buf).unwrap();
+        let decoded = TreeConnectRequest::parse(&buf).unwrap();
+        assert_eq!(decoded, r);
+        assert_eq!(decoded.path_str().unwrap(), r"\\server\share");
+    }
+
+    #[test]
+    fn path_is_found_by_path_offset() {
+        let path = utf16le(r"\\srv\data");
+        // A 16-byte extension header comes before the path.
+        let mut body = vec![9, 0, 4, 0];
+        body.extend_from_slice(&(64u16 + 8 + 16).to_le_bytes());
+        body.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&path);
+        let req = TreeConnectRequest::parse(&body).unwrap();
+        assert_eq!(req.path_in(&body), Some(&path[..]));
+
+        let mut short = req.clone();
+        short.path_offset = 64 + 4;
+        assert_eq!(short.path_in(&body), None);
+        short.path_offset = 64 + 30;
+        assert_eq!(short.path_in(&body), None);
+        short.path_offset = 10;
+        assert_eq!(short.path_in(&body), None);
+    }
+
+    #[test]
+    fn response_round_trips() {
+        let r = TreeConnectResponse {
+            structure_size: 16,
+            share_type: TreeConnectResponse::SHARE_TYPE_DISK,
+            reserved: 0,
+            share_flags: 0,
+            capabilities: 0,
+            maximal_access: 0x001F_01FF,
+        };
+        let mut buf = Vec::new();
+        r.write_to(&mut buf).unwrap();
+        assert_eq!(TreeConnectResponse::parse(&buf).unwrap(), r);
+    }
+}
