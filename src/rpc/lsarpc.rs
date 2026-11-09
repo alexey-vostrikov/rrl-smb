@@ -20,8 +20,8 @@
 //! (`ServerConfig::domain_sid`), and the answer holds it. Without one the answer is NULL, which is
 //! the honest refusal: inventing a SID would attach every ACL to a domain that is not this one.
 
-use crate::rpc::ndr::{NdrReader, NdrWriter};
 use crate::rpc::association::Fault;
+use crate::rpc::ndr::{NdrReader, NdrWriter};
 use crate::rpc::pdu::NCA_OP_RNG_ERROR;
 use crate::server::{Caller, ServerState};
 
@@ -111,11 +111,26 @@ pub(crate) async fn serve(
     opnum: u16,
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
+    dispatch(&server.config, opnum, stub)
+}
+
+/// Which call an opnum reaches, and what it answers.
+///
+/// Separate from [`serve`] because serving needs a whole [`ServerState`] and routing does not: the
+/// only thing any handler here reads is the configuration. Keeping them together is why no test
+/// checked that opnum 0 reaches `lsa_Close` rather than the shared handle path - a mutation
+/// answering one with the other would have survived, and a client would see a closed handle where
+/// it asked for an opened one.
+pub(crate) fn dispatch(
+    config: &crate::server::ServerConfig,
+    opnum: u16,
+    stub: &[u8],
+) -> Result<Vec<u8>, Fault> {
     match opnum {
         OPNUM_CLOSE => close_handle(stub),
         OPNUM_OPEN_POLICY => open_policy_v1(stub),
         OPNUM_OPEN_POLICY2 => open_policy(stub),
-        OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(server, stub),
+        OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(config, stub),
         other => {
             // A client sees only "the procedure number is out of range" and cannot say which
             // number, so the number goes here: an unimplemented call is a fact about this server,
@@ -185,7 +200,7 @@ fn open_policy_v1(stub: &[u8]) -> Result<Vec<u8>, Fault> {
 }
 
 /// `PolicyDnsDomainInfo` for the domain this server answers for.
-fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+fn query_info(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let Some(level) = policy_level(stub) else {
         // The bytes, not a guess about them: the request layout for this call was wrong twice
         // already, and each guess cost a stand run.
@@ -199,19 +214,11 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
             did_not_execute: true,
         });
     };
-    // A level this server does not answer is refused by name rather than with an empty structure:
-    // a client that asked for account domains and got a DNS name would go on to use it.
-    if !matches!(
-        level,
-        POLICY_DNS_DOMAIN_INFO | POLICY_DNS_DOMAIN_INFORMATION
-    ) {
-        return Err(Fault {
-            status: crate::rpc::pdu::NCA_PROTO_ERROR,
-            did_not_execute: true,
-        });
-    }
+    // No second check on the level here. `policy_level` answers only 5 and 12 and refuses the
+    // rest, so a guard at this point cannot fire: a mutation removing it survived, which is how
+    // dead code announces itself. The refusal lives there, where the level is read.
 
-    let body = dns_domain_info_body(level, &DomainView::of(server));
+    let body = dns_domain_info_body(level, &DomainView::of(config));
     // The answer is logged at debug with its length only: a member's join is the one client of
     // this call, and when it refuses the body, the length says whether a field went missing. The
     // bytes themselves were useful while the layout was being established and are not worth the
@@ -234,19 +241,19 @@ pub(crate) struct DomainView {
 }
 
 impl DomainView {
-    fn of(server: &ServerState) -> Self {
+    fn of(config: &crate::server::ServerConfig) -> Self {
         Self {
             // The domain's NetBIOS name, not this server's: a member compares it against the
             // workgroup it was configured with, and answering with the server's own name stopped a
             // real join at "workgroup set to 'AD', should be 'SAMBA'" after every other answer had
             // been accepted.
-            netbios: match &server.config.domain_netbios {
+            netbios: match &config.domain_netbios {
                 Some(name) => name.clone(),
-                None => server.config.netbios_name.clone(),
+                None => config.netbios_name.clone(),
             },
-            dns: dns_domain(server),
-            guid: server.config.server_guid,
-            sid: server.config.domain_sid.clone(),
+            dns: dns_domain(config),
+            guid: config.server_guid,
+            sid: config.domain_sid.clone(),
         }
     }
 }
@@ -323,24 +330,20 @@ pub(crate) fn dns_domain_info_body(level: u16, view: &DomainView) -> Vec<u8> {
 /// the two calls (MS-LSAD 3.1.4.4.10). And the level is last, so a stub that ends two octets
 /// early is not an error to report but a layout that was already read.
 ///
-/// Both widths and both offsets are tried, because the older call is still answerable: a guess
-/// about the layout never becomes an answer, since a wrong offset lands on handle octets that
-/// match no level this server knows.
+/// Two offsets are tried, because a client may send the handle inline or behind a referent id. Only
+/// the two-octet width is read, and a first version also tried four: for both levels this server
+/// answers - 5 and 12 - a little-endian `u32` has the same low two octets as the `ushort`, so the
+/// narrow read always decided first and the wide loop never ran. A mutation removing it survived,
+/// and deleting it is what the survivor was saying.
 fn policy_level(stub: &[u8]) -> Option<u16> {
     let levels = [POLICY_DNS_DOMAIN_INFO, POLICY_DNS_DOMAIN_INFORMATION];
     // `ushort`: offset 20 with the handle inline, 24 behind a referent id.
     for at in [20usize, 24] {
-        if let Some(bytes) = stub.get(at..at + 2).and_then(|b| <[u8; 2]>::try_from(b).ok()) {
+        if let Some(bytes) = stub
+            .get(at..at + 2)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+        {
             let level = u16::from_le_bytes(bytes);
-            if levels.contains(&level) {
-                return Some(level);
-            }
-        }
-    }
-    // `enum`, as the older call carries it.
-    for at in [20usize, 24] {
-        if let Some(bytes) = stub.get(at..at + 4).and_then(|b| <[u8; 4]>::try_from(b).ok()) {
-            let level = u32::from_le_bytes(bytes) as u16;
             if levels.contains(&level) {
                 return Some(level);
             }
@@ -410,16 +413,15 @@ fn write_unicode_array(writer: &mut NdrWriter, text: &str) {
     writer.align(4);
 }
 
-
 /// The DNS name of the domain this server answers for.
 ///
 /// Taken from the directory's naming context when the daemon passes one, and from the NetBIOS name
 /// otherwise: a join compares this against the realm it was told, and a wrong answer here sends the
 /// client looking for a domain that is not this one.
-fn dns_domain(server: &ServerState) -> String {
-    match &server.config.dns_domain {
+fn dns_domain(config: &crate::server::ServerConfig) -> String {
+    match &config.dns_domain {
         Some(domain) => domain.clone(),
-        None => format!("{}.local", server.config.netbios_name.to_lowercase()),
+        None => format!("{}.local", config.netbios_name.to_lowercase()),
     }
 }
 
@@ -501,23 +503,24 @@ mod tests {
     /// whose parser refuses our answers when they are wrong, which makes it the only oracle worth
     /// asking. Captured once, because asking at test time would need a container.
     const SAMBA_STRUCT: &[u8] = &[
-        0x0a, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x1c, 0x00, 0x1e, 0x00, 0x04, 0x00, 0x02, 0x00,
-        0x1c, 0x00, 0x1e, 0x00, 0x08, 0x00, 0x02, 0x00, 0xfd, 0xb1, 0x18, 0x47, 0x07, 0x23, 0x46, 0x76,
-        0xac, 0x58, 0x82, 0x7a, 0xaf, 0x7d, 0xda, 0xaf, 0x0c, 0x00, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x53, 0x00, 0x41, 0x00, 0x4d, 0x00, 0x42, 0x00,
-        0x41, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
-        0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00, 0x78, 0x00, 0x61, 0x00, 0x6d, 0x00, 0x70, 0x00,
-        0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x0f, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00,
-        0x78, 0x00, 0x61, 0x00, 0x6d, 0x00, 0x70, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00,
-        0x6f, 0x00, 0x6d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
-        0x15, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
+        0x0a, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x1c, 0x00, 0x1e, 0x00, 0x04, 0x00, 0x02,
+        0x00, 0x1c, 0x00, 0x1e, 0x00, 0x08, 0x00, 0x02, 0x00, 0xfd, 0xb1, 0x18, 0x47, 0x07, 0x23,
+        0x46, 0x76, 0xac, 0x58, 0x82, 0x7a, 0xaf, 0x7d, 0xda, 0xaf, 0x0c, 0x00, 0x02, 0x00, 0x06,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x53, 0x00, 0x41, 0x00,
+        0x4d, 0x00, 0x42, 0x00, 0x41, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x0e, 0x00, 0x00, 0x00, 0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00, 0x78, 0x00,
+        0x61, 0x00, 0x6d, 0x00, 0x70, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00, 0x6f,
+        0x00, 0x6d, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
+        0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00, 0x78, 0x00, 0x61, 0x00, 0x6d, 0x00, 0x70,
+        0x00, 0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x01,
+        0x02, 0x03, 0x04, 0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
     ];
 
     /// The same SID, as a directory stores it: revision, count, authority, sub-authorities.
     const DOMAIN_SID: &[u8] = &[
-        0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
-        0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
+        0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
+        0x04, 0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
     ];
 
     fn reference_view() -> DomainView {
@@ -603,6 +606,199 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_handle_nulls_it_and_puts_the_status_last() {
+        // `[in,out]` handle: the client gets back a NULL where its handle was, so a client that
+        // keeps the value it sent cannot use a handle the server has forgotten. The status is last
+        // here for the same reason it is last everywhere in this interface - the client reads it
+        // after the out parameters, and putting it first makes it read the handle as the status.
+        let reply = close_handle(&[0xAA; 20]).expect("lsa_Close is answered");
+        assert_eq!(reply.len(), 24);
+        assert_eq!(&reply[..20], &[0u8; 20], "the handle is nulled");
+        assert_eq!(
+            &reply[20..],
+            &[0, 0, 0, 0],
+            "STATUS_SUCCESS after the handle"
+        );
+    }
+
+    #[test]
+    fn each_opnum_reaches_its_own_handler() {
+        // Routing is behaviour: opnum 0 and opnum 6 both answer with a twenty-octet handle, and a
+        // match arm that sent one to the other would look right in review. What distinguishes them
+        // here is the rest of the reply - a closed handle is twenty zero octets, an opened one is
+        // the handle this server issues.
+        let config = crate::server::ServerConfig::for_test();
+        let handle = policy_handle();
+
+        let closed = dispatch(&config, OPNUM_CLOSE, &[0xAA; 20]).expect("opnum 0");
+        assert_eq!(&closed[..20], &[0u8; 20], "a closed handle is NULL");
+
+        for opnum in [OPNUM_OPEN_POLICY, OPNUM_OPEN_POLICY2] {
+            let opened = dispatch(&config, opnum, &[0u8; 28]).expect("opnum 6 and 44");
+            assert_eq!(&opened[..20], handle.as_slice(), "opnum {opnum}");
+        }
+
+        // The two query calls answer the same arm under their own discriminant.
+        for (opnum, level) in [
+            (OPNUM_QUERY_INFO_POLICY, POLICY_DNS_DOMAIN_INFO),
+            (OPNUM_QUERY_INFO_POLICY2, POLICY_DNS_DOMAIN_INFORMATION),
+        ] {
+            let mut stub = vec![0u8; 20];
+            stub.extend_from_slice(&level.to_le_bytes());
+            let answered = dispatch(&config, opnum, &stub).expect("a query opnum");
+            let expected = dns_domain_info_body(level, &DomainView::of(&config));
+            assert_eq!(answered, expected, "opnum {opnum}");
+        }
+
+        // And an opnum this interface does not implement is refused by status, not answered with
+        // whichever handler came last.
+        match dispatch(&config, 99, &[]) {
+            Err(Fault { status, .. }) => assert_eq!(status, NCA_OP_RNG_ERROR),
+            other => panic!("expected an opnum refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_query_for_the_dns_level_is_answered_with_the_domain() {
+        // The path a member's join actually takes, driven through the same entry point the pipe
+        // uses: level 12, handle inline, and the answer has to be the DNS domain information.
+        let mut stub = vec![0u8; 20];
+        stub.extend_from_slice(&12u16.to_le_bytes());
+        let answered = dispatch(
+            &crate::server::ServerConfig::for_test(),
+            OPNUM_QUERY_INFO_POLICY2,
+            &stub,
+        )
+        .expect("level 12 is answered");
+        let text = String::from_utf16_lossy(
+            &answered
+                .chunks(2)
+                .filter(|pair| pair.len() == 2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert!(text.contains("AD"), "the domain's name: {text:?}");
+        assert_eq!(text.matches("ad.example.com").count(), 2);
+        assert!(
+            !text.contains("SAMBA"),
+            "the server's own name belongs in neither domain field: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_query_for_a_level_this_server_does_not_answer_is_refused() {
+        // Level 3 is PolicyPrimaryDomainInformation. A member that asked for the primary domain and
+        // received the DNS name would use the name - refusing is the only answer that cannot be
+        // mistaken for a different one.
+        let mut stub = vec![0u8; 20];
+        stub.extend_from_slice(&3u16.to_le_bytes());
+        match dispatch(
+            &crate::server::ServerConfig::for_test(),
+            OPNUM_QUERY_INFO_POLICY2,
+            &stub,
+        ) {
+            Err(Fault { status, .. }) => assert_eq!(status, crate::rpc::pdu::NCA_PROTO_ERROR),
+            other => panic!("expected a level refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sid_shorter_than_its_header_writes_nothing() {
+        // The guard keeps a malformed SID from panicking on a slice: `domain_sid` normally comes
+        // from the issuer, but a value read from a store that a different version wrote is not
+        // something this module can assume is well formed. A panic in the pipe handler would take
+        // the connection down mid-answer, which is worse than an answer without a SID.
+        let mut writer = NdrWriter::new();
+        write_dom_sid2(&mut writer, &[0x01, 0x04, 0x00, 0x00]);
+        assert!(writer.finish().is_empty());
+
+        // And a well-formed one writes its count, its header and its sub-authorities.
+        let mut writer = NdrWriter::new();
+        write_dom_sid2(&mut writer, DOMAIN_SID);
+        let written = writer.finish();
+        assert_eq!(written.len(), 4 + 24, "count, header, four sub-authorities");
+        assert_eq!(&written[..4], &4u32.to_le_bytes(), "the conformant count");
+        assert_eq!(&written[4..], DOMAIN_SID);
+    }
+
+    #[tokio::test]
+    async fn serving_answers_through_the_pipe_entry_point() {
+        // `serve` is what the pipe calls, and it delegates to `dispatch` with the server's own
+        // configuration. A wrapper with no test can pass the wrong field and every handler test
+        // still passes - the state is built here directly rather than through the builder because
+        // this asserts the delegation, not the assembly.
+        let state = ServerState::new(
+            crate::server::ServerConfig::for_test(),
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        );
+        // Nobody is admitted by this test: `serve` ignores the caller for every call this
+        // interface implements, and the anonymous identity says so rather than inventing a user.
+        let caller = Caller {
+            identity: crate::proto::auth::ntlm::Identity::Anonymous,
+            can_encrypt: false,
+        };
+
+        let mut stub = vec![0u8; 20];
+        stub.extend_from_slice(&12u16.to_le_bytes());
+        let answered = serve(&state, &caller, OPNUM_QUERY_INFO_POLICY2, &stub)
+            .await
+            .expect("the pipe entry answers level 12");
+        assert_eq!(
+            answered,
+            dns_domain_info_body(
+                POLICY_DNS_DOMAIN_INFORMATION,
+                &DomainView::of(&state.config)
+            ),
+            "serve must pass this server's own configuration"
+        );
+    }
+
+    #[test]
+    fn a_truncated_close_is_refused_rather_than_answered() {
+        // Nineteen octets cannot be a policy handle. Answering would tell the client its handle was
+        // closed when there never was one.
+        match close_handle(&[0u8; 19]) {
+            Err(Fault { status, .. }) => assert_eq!(status, crate::rpc::pdu::NCA_PROTO_ERROR),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_answer_names_the_domain_when_it_has_one_and_this_server_when_it_does_not() {
+        // `Name` is what a member compares against its configured workgroup, so the fallback
+        // matters: a deployment that states no domain name still has to answer with something
+        // consistent, and the server's own name is the only name it has.
+        let named = DomainView::of(&crate::server::ServerConfig::for_test());
+        assert_eq!(named.netbios, "AD", "the domain's name, not the server's");
+        assert_eq!(named.dns, "ad.example.com");
+
+        let unnamed = crate::server::ServerConfig {
+            domain_netbios: None,
+            dns_domain: None,
+            ..crate::server::ServerConfig::for_test()
+        };
+        let view = DomainView::of(&unnamed);
+        assert_eq!(view.netbios, "SAMBA", "falls back to the server's own name");
+        assert_eq!(
+            view.dns, "samba.local",
+            "and to a .local domain, lowercased - a member that compares this against its realm              finds a different domain, which is the honest outcome when none was stated"
+        );
+    }
+
+    #[test]
+    fn only_the_handle_shape_of_the_level_is_answered() {
+        // The request carries the level as `ushort` after the handle; a level this server has no
+        // answer for is refused before anything is written, because a half-built answer is worse
+        // than none. Level 3 is PolicyPrimaryDomainInformation.
+        let mut stub = vec![0u8; 20];
+        stub.extend_from_slice(&3u16.to_le_bytes());
+        assert_eq!(policy_level(&stub), None);
+    }
+
+    #[test]
     fn a_truncated_open_policy_is_refused_rather_than_answered() {
         // A shorter stub cannot hold the referent, the object attributes and the access mask, so
         // answering would be guessing that the parts that did arrive meant what they looked like.
@@ -611,5 +807,4 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
-
 }

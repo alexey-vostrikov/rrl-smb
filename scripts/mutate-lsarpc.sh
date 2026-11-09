@@ -149,6 +149,45 @@ want guid && { check "guid: the uuid is written in big-endian field order" \
     'writer.bytes(&view.guid.to_bytes_le());' \
     'writer.bytes(view.guid.as_bytes());' || survived=$((survived + 1)); }
 
+want route && { check "route: lsa_Close reaches the open-policy answer" \
+    'OPNUM_CLOSE => close_handle(stub),' \
+    'OPNUM_CLOSE => open_policy(stub),' || survived=$((survived + 1)); }
+
+want routequery && { check "route: a query reaches the close answer" \
+    'OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(config, stub),' \
+    'OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => close_handle(stub),' || survived=$((survived + 1)); }
+
+want levelfilter && { check "level: the ushort filter accepts any level" \
+    '            if levels.contains(&level) {
+                return Some(level);
+            }' \
+    '            return Some(level);' || survived=$((survived + 1)); }
+
+want close && { check "close: the handle is echoed back instead of nulled" \
+    'writer.bytes(&[0u8; HANDLE]);' \
+    'writer.bytes(&stub[..HANDLE]);' || survived=$((survived + 1)); }
+
+# No mutation for the order of status and handle in `close_handle`. The handle is nulled and the
+# status is STATUS_SUCCESS, which is zero, so both orders write twenty-four zero octets - a client
+# cannot tell them apart and no test can either. An equivalent mutation is noise, and the first run
+# of this script spent an hour on one.
+want closeguard && { check "close: a short stub is answered" \
+    'if stub.len() < HANDLE {' \
+    'if false && stub.len() < HANDLE {' || survived=$((survived + 1)); }
+
+want domainname && { check "name: the server's name wins over the domain's" \
+    'netbios: match &config.domain_netbios {
+                Some(name) => name.clone(),
+                None => config.netbios_name.clone(),
+            },' \
+    'netbios: config.netbios_name.clone(),' || survived=$((survived + 1)); }
+
+want dnsfallback && { check "dns: a stated domain is ignored" \
+    'Some(domain) => domain.clone(),
+        None => format!("{}.local", config.netbios_name.to_lowercase()),' \
+    'Some(_) => format!("{}.local", config.netbios_name.to_lowercase()),
+        None => format!("{}.local", config.netbios_name.to_lowercase()),' || survived=$((survived + 1)); }
+
 want level && { check "level: only the referent offset is read" \
     'for at in [20usize, 24] {
         if let Some(bytes) = stub.get(at..at + 2)' \
