@@ -231,6 +231,34 @@ pub struct ServerConfig {
     pub(crate) discovery: Option<crate::discovery::Settings>,
 }
 
+/// A configuration with every field set deliberately, for tests of functions that read it.
+///
+/// There is no `Default`: a config whose GUID is nil and whose NetBIOS name is empty is not a legal
+/// identity, and a `Default` would make that shape reachable from production code. This one is
+/// `#[cfg(test)]` and lists every field, so a field added to the struct breaks it at compile time
+/// rather than silently taking a wrong value.
+#[cfg(test)]
+impl ServerConfig {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 445)),
+            netbios_name: "SAMBA".to_string(),
+            dns_domain: Some("ad.example.com".to_string()),
+            domain_netbios: Some("AD".to_string()),
+            domain_sid: None,
+            max_read_size: 1 << 20,
+            max_write_size: 1 << 20,
+            server_guid: Uuid::from_u128(0x4718_b1fd_2307_7646_ac58_827a_af7d_daaf),
+            limits: Limits::default(),
+            share_listing: true,
+            apple_model: None,
+            apple_copyfile: false,
+            #[cfg(feature = "discovery")]
+            discovery: None,
+        }
+    }
+}
+
 pub struct ServerUsers {
     /// Username -> precomputed NT hash record.
     pub table: RwLock<HashMap<String, UserCreds>>,
