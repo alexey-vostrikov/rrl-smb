@@ -1,0 +1,11 @@
+[toolchain]
+# The same version the directory server pins, because the two build together: `rust-rest-ldap`
+# consumes this crate as a path dependency, and a build that compiles one with 1.99.1 and the other
+# with whatever stable happened to be installed is a build nobody can reproduce.
+#
+# The components are named here rather than installed by hand because the image this crate is
+# built in carries rustc and cargo only: without the list, `clippy` and `rustfmt` are absent, and a
+# lint that cannot run reads as a lint that passed.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
