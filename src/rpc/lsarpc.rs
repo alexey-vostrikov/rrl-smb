@@ -320,8 +320,10 @@ pub(crate) fn dns_domain_info_body(level: u16, view: &DomainView) -> Vec<u8> {
 ///
 /// Established from the bytes a client sends, after three guesses about this request were wrong:
 ///
-///     00 00 00 00 6c 9d 2f 14 8a 3e 4b 71 9c 22 5d 08 3a 71 0e 4f 0c 00
-///     \_________________ the policy handle, 20 octets ________________/ \_/ level
+/// ```text
+/// 00 00 00 00 6c 9d 2f 14 8a 3e 4b 71 9c 22 5d 08 3a 71 0e 4f 0c 00
+/// \_________________ the policy handle, 20 octets ________________/ \_/ level
+/// ```
 ///
 /// Three things are visible there that the IDL does not say plainly. The handle is sent inline,
 /// with no referent id in front of it - it is a context handle, and a context handle travels as
