@@ -230,10 +230,20 @@ impl Pipe {
                         Some(syntax) if syntax == crate::rpc::pdu::SRVSVC => {
                             srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await
                         }
-                        _ => Err(crate::rpc::association::Fault {
-                            status: crate::rpc::pdu::NCA_UNK_IF,
-                            did_not_execute: true,
-                        }),
+                        other => {
+                            // Which interface the client bound is what names the missing handler:
+                            // an unimplemented interface and an unimplemented call on a known
+                            // one are different bugs, and the client reports both as a failure.
+                            tracing::warn!(
+                                interface = ?other,
+                                opnum = call.opnum,
+                                "rpc: no handler for this interface"
+                            );
+                            Err(crate::rpc::association::Fault {
+                                status: crate::rpc::pdu::NCA_UNK_IF,
+                                did_not_execute: true,
+                            })
+                        }
                     };
                     debug!(opnum = call.opnum, ok = result.is_ok(), "rpc call");
                     for reply in state.assoc.reply(&call, result) {
