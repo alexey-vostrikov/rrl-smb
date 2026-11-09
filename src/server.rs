@@ -189,6 +189,13 @@ pub struct ServerConfig {
     /// against the realm it was told, and a wrong answer sends it looking for a domain that is not
     /// this one. Absent means "not stated", and the answer falls back to the NetBIOS name.
     pub dns_domain: Option<String>,
+    /// The domain's NetBIOS name, `AD` for `AD.EXAMPLE.COM`.
+    ///
+    /// Not the server's own name: `PolicyDnsDomainInfo` reports the domain's identity, and a
+    /// member compares `Name` against the workgroup it was configured with before it joins. A
+    /// server that answered with its own NetBIOS name had the join stop at
+    /// "workgroup set to 'AD', should be 'SAMBA'" - every other answer already correct.
+    pub domain_netbios: Option<String>,
     /// The domain's SID, as the twenty-four and more octets a directory stores.
     ///
     /// `lsarpc` reports it inside the DNS domain information, and a member's join reads it there:

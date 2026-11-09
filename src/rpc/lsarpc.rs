@@ -185,7 +185,13 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
         });
     }
 
-    let netbios = server.config.netbios_name.as_str();
+    // The domain's NetBIOS name, not this server's: a member compares it against the workgroup it
+    // was configured with, and answering with the server's own name stopped a real join at
+    // "workgroup set to 'AD', should be 'SAMBA'" after every other answer had been accepted.
+    let netbios = match &server.config.domain_netbios {
+        Some(name) => name.as_str(),
+        None => server.config.netbios_name.as_str(),
+    };
     let dns = dns_domain(server);
 
     let mut writer = NdrWriter::new();
@@ -220,7 +226,7 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     // still answers NULL, because inventing a SID would attach every ACL to a domain that is not
     // this one; the daemon that has one passes it.
     match &server.config.domain_sid {
-        Some(sid) => writer.pointer(true),
+        Some(_) => writer.pointer(true),
         None => writer.pointer(false),
     }
 
@@ -297,8 +303,13 @@ fn write_dom_sid2(writer: &mut NdrWriter, sid: &[u8]) {
         return;
     }
     let count = usize::from(sid[1]);
-    writer.raw(&sid[..HEADER]);
+    // The count first: `[size_is(num_auths)] uint32 sub_auths[]` is a conformant array, and NDR
+    // puts a conformant array's maximum before the structure that contains it. Writing the header
+    // first - the obvious order, since `num_auths` lives in it - made a client read the revision
+    // byte `01` as an array of one element. Samba's own encoder writes `04 00 00 00 01 04 ...`:
+    // the count, then revision and count again inside the header.
     writer.u32(u32::try_from(count).unwrap_or(u32::MAX));
+    writer.raw(&sid[..HEADER]);
     writer.raw(&sid[HEADER..HEADER + count * 4]);
 }
 
@@ -309,8 +320,11 @@ fn write_lsa_string(writer: &mut NdrWriter, text: &str) {
     // and nothing else. An independent implementation's own body writes `0a 00 0a 00` for a
     // five-character name, and a client that finds a count larger than the characters it read
     // reports the array as past its bounds.
+    // MS-DTYP 2.2.5: `Length` excludes the terminating null, `MaximumLength` includes it. Two
+    // uint16 in one word, `Length` low.
     let length = units.saturating_mul(2);
-    writer.u32(length | (length << 16));
+    let maximum = length.saturating_add(2);
+    writer.u32(length | (maximum << 16));
     writer.pointer(true);
 }
 
@@ -320,22 +334,27 @@ fn write_lsa_string(writer: &mut NdrWriter, text: &str) {
 /// count that an `lsa_String` has no field for. Writing the longer form shifts every field after
 /// it, and the client reads the domain's name out of the middle of its own forest name.
 fn write_unicode_array(writer: &mut NdrWriter, text: &str) {
+    // `[size_is(size/2),length_is(length/2)] uint16 *string`: conformant *and* varying, so two
+    // different numbers. The maximum comes from `size`, which counts the room the terminator needs;
+    // the count that arrives comes from `length`, which does not. Samba's own encoder, run on the
+    // same values, writes `06 00 00 00 00 00 00 00 05 00 00 00` for `SAMBA`: six, then five.
     let units: Vec<u16> = text.encode_utf16().collect();
-    // `[size_is(size/2),length_is(length/2)] uint16 *string`: a conformant varying array whose
-    // contents are the characters alone. The counts equal `Length/2`, which is why a terminator
-    // here would be one element the client did not ask for.
-    let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
-    writer.u32(count);
+    let actual = u32::try_from(units.len()).unwrap_or(u32::MAX);
+    let maximum = actual.saturating_add(1);
+    writer.u32(maximum);
     writer.u32(0);
-    writer.u32(count);
+    writer.u32(actual);
     let mut raw = Vec::with_capacity(units.len() * 2);
     for unit in units {
         raw.extend_from_slice(&unit.to_le_bytes());
     }
-    // Not `bytes`: a `uint16` array is aligned to two, and padding it to four moves every field
-    // after it by two octets. The client reads that as an array past its bounds.
+    // The elements are aligned to two, the array as a whole to four: Samba writes ten octets of
+    // characters for `SAMBA` and then two of padding, and without that padding every referent
+    // after it starts two octets early.
     writer.raw(&raw);
+    writer.align(4);
 }
+
 
 /// The DNS name of the domain this server answers for.
 ///
