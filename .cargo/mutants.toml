@@ -1,0 +1,29 @@
+# cargo-mutants settings for this crate.
+#
+# Parallelism is deliberately NOT here: `jobs` is a flag, not a key, because a config file is
+# committed and shared while the number of cores is a property of the machine the run happens on.
+# `scripts/mutants.sh` passes `-j $(nproc)`.
+#
+# Scope is not here either. What to mutate is decided per run - the lines a branch changed
+# (`--in-diff`) for the everyday run, the whole crate for the nightly one - and a `examine_globs`
+# written here would silently narrow every future run to whatever was interesting once.
+
+# The Kerberos code is behind this feature, and most of the LDAP-facing work is in it. Without the
+# flag, half the mutants of interest are not generated at all, and a run that skips them reads as
+# "no failures" rather than "not tested".
+features = ["krb5"]
+
+# The suite is fast (714 unit tests, ~3 s) but the build is not: a mutant that hangs is a mutant
+# whose timeout should be generous enough to be about the mutant, not about a cold cache.
+timeout_multiplier = 2.0
+build_timeout_multiplier = 2.0
+
+# `cargo` on purpose: `nextest` is not in the toolchain image, and a `test_tool` naming a binary
+# that is absent turns every mutant into a build failure that reads like a survivor.
+test_tool = "cargo"
+
+# No `exclude_re`. An exclusion is a claim that a mutation is equivalent - invisible to any client -
+# and every claim of that kind in this crate so far has been wrong at least once: the discriminant
+# width and the status/handle order were both "obviously equivalent" and both needed an argument
+# written down before they could be dropped (see `scripts/mutate-lsarpc.sh`). Add a pattern here
+# only together with the reason, and prefer `--in-diff` over a permanent exclusion.
