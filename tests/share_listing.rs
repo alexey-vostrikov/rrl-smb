@@ -42,17 +42,28 @@ async fn ipc(server: &Server) -> Client {
     ipc_client(server.addr, SMB21, None).await
 }
 
+/// The two pipes this server answers, and the names that must not reach them.
+///
+/// `lsarpc` and the leading-separator spellings used to be in the refused list and stayed there
+/// after the pipe was implemented and the separators were made acceptable: the test kept asserting
+/// facts that had stopped being true, and because only `--lib` was run for a while, nothing
+/// noticed. `cargo-mutants` noticed first - its baseline run of the whole test
+/// suite failed before a single mutant was generated, which is the cheapest possible way to find
+/// out that a suite has a test in it nobody runs.
 #[tokio::test]
-async fn only_srvsvc_opens() {
+async fn only_the_implemented_pipes_open() {
     let (server, _td) = server().await;
     let mut c = ipc(&server).await;
+    // `\pipe\srvsvc` stays refused: the `\pipe\` in a client's UNC path is not part of the name a
+    // CREATE carries, so a name that spells it out is asking for a pipe called `pipe\srvsvc`. The
+    // leading separator alone IS stripped - a client that writes `\srvsvc` means `srvsvc`.
     for name in [
-        "lsarpc",
         "mdssvc",
         "MsFteWds",
         "wkssvc",
-        "\\srvsvc",
         "\\pipe\\srvsvc",
+        "\\pipe\\lsarpc",
+        "\\unknown",
         "",
     ] {
         assert_eq!(
@@ -61,7 +72,17 @@ async fn only_srvsvc_opens() {
             "{name}"
         );
     }
-    for name in ["srvsvc", "SRVSVC", "SrvSvc"] {
+    // The name is matched without its leading separators and without regard to case: a client that
+    // writes `\PIPE\LSARPC` means the same pipe as one that writes `lsarpc`.
+    for name in [
+        "srvsvc",
+        "SRVSVC",
+        "SrvSvc",
+        "\\srvsvc",
+        "lsarpc",
+        "LSARPC",
+        "\\lsarpc",
+    ] {
         c.open_pipe(name).await.expect(name);
     }
 }
