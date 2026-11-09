@@ -42,11 +42,16 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
     }
 fi
 
-# Cargo's homes live under the user's cache rather than a shared volume: a target directory written
-# by another run as root is one this run cannot write, and the failure reads as "Permission denied"
-# at a path nobody typed.
+# One cargo home for every Rust project on this machine, and it is named after the base it serves:
+# a registry filled under one glibc is a registry this one may not be able to use, and the volume
+# that held it says which base it was for. The volume's directories are owned by this user - a
+# target or registry written by another run as root is one this run cannot write, and the failure
+# reads as "Permission denied" at a path nobody typed.
+#
+# The build directory stays under the user's cache: it is per-checkout and large, and a shared one
+# would have two runs overwrite each other's artifacts.
 cache="${SMB_CACHE:-$HOME/.cache/smb-server}"
-mkdir -p "$cache/cargo" "$cache/target"
+mkdir -p "$cache/target"
 backup="${TMPDIR:-/tmp}/lsarpc.rs.mutation-backup"
 
 run_tests() {
@@ -55,7 +60,7 @@ run_tests() {
     # same mistake as a stand that announced a join it had not made.
     docker run --rm -u "$(id -u):$(id -g)" \
         -v "$repo":/w -w /w \
-        -v "$cache/cargo":/cargo -v "$cache/target":/target \
+        -v "${SMB_CARGO_VOLUME:-rrl-cargo-bullseye}":/cargo -v "$cache/target":/target \
         -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
         "$image" sh -c 'cargo test --lib --features krb5 lsarpc >/tmp/mutation.log 2>&1'
     status=$?
