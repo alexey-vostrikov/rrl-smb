@@ -24,6 +24,16 @@ use crate::rpc::association::Fault;
 use crate::rpc::pdu::NCA_OP_RNG_ERROR;
 use crate::server::{Caller, ServerState};
 
+/// `lsa_OpenPolicy` (MS-LSAD 3.1.4.4.3). The older of the two calls that open a policy handle, and
+/// the one Samba's join actually makes: implementing only `OpenPolicy2` answered a join with "the
+/// procedure number is out of range", which names nothing and reads as a protocol mismatch.
+///
+/// The difference is in the request, not the answer. `system_name` here is a `uint16` array with a
+/// count and no terminator - the "screwup" Samba's own IDL names in a comment above this call, and
+/// the reason `OpenPolicy2` exists. Nothing in the request is read for its value: this server
+/// ignores the name and issues the same read-only handle either way.
+pub(crate) const OPNUM_OPEN_POLICY: u16 = 6;
+
 /// `lsa_OpenPolicy2` (MS-LSAD 3.1.4.4.4). Opens a policy handle; takes a server name that this
 /// server ignores, an object attributes pointer it also ignores, and the access wanted.
 pub(crate) const OPNUM_OPEN_POLICY2: u16 = 44;
@@ -60,19 +70,31 @@ pub(crate) async fn serve(
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
     match opnum {
+        OPNUM_OPEN_POLICY => open_policy_v1(stub),
         OPNUM_OPEN_POLICY2 => open_policy(stub),
         OPNUM_QUERY_INFO_POLICY2 => query_info(server, stub),
-        _ => Err(Fault {
-            status: NCA_OP_RNG_ERROR,
-            did_not_execute: true,
-        }),
+        other => {
+            // A client sees only "the procedure number is out of range" and cannot say which
+            // number, so the number goes here: an unimplemented call is a fact about this server,
+            // not about the request.
+            tracing::warn!(
+                opnum = other,
+                stub = stub.len(),
+                "lsarpc: no handler for this call"
+            );
+            Err(Fault {
+                status: NCA_OP_RNG_ERROR,
+                did_not_execute: true,
+            })
+        }
     }
 }
 
-/// The handle, and the access granted with it.
+/// The handle, and nothing else.
 ///
-/// The access is echoed as `0x000f_0fff` - everything - because there is nothing here a client could
-/// do with more than it asked for: the only call this interface answers reads the domain's own name.
+/// A first version of this wrote the granted access after the handle, which the IDL does not ask
+/// for: both `lsa_OpenPolicy` and `lsa_OpenPolicy2` return `[out] policy_handle *handle`. Four
+/// bytes a client does not expect are four bytes it reads as part of the next field.
 fn open_policy(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     // The server name, the object attributes and the desired access. Read only so that a stub too
@@ -81,13 +103,24 @@ fn open_policy(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let _object_attributes = reader.pointer();
     let _desired_access = reader.u32();
 
-    // The handle is 20 octets of opaque data, so it is written as bytes rather than as words.
-    let mut out = Vec::with_capacity(24);
-    out.extend_from_slice(&policy_handle());
-    // The access granted, echoed as everything: the only call this interface answers reads the
-    // domain's own name, and there is nothing here a client could do with more than it asked for.
-    out.extend_from_slice(&0x000f_0fffu32.to_le_bytes());
-    Ok(out)
+    Ok(policy_handle().to_vec())
+}
+
+/// The same handle from the older request layout.
+///
+/// The name is a unique pointer to a conformant array, so the request is at least a referent, the
+/// twenty octets of object attributes and the access mask - 28 bytes - whether or not a name is
+/// present. Nothing in it is read for its value; the length check exists so that a truncated
+/// request is refused as malformed rather than answered as if it had been understood.
+fn open_policy_v1(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    const INLINE: usize = 4 + 20 + 4;
+    if stub.len() < INLINE {
+        return Err(Fault {
+            status: crate::rpc::pdu::NCA_PROTO_ERROR,
+            did_not_execute: true,
+        });
+    }
+    Ok(policy_handle().to_vec())
 }
 
 /// `PolicyDnsDomainInfo` for the domain this server answers for.
@@ -171,6 +204,30 @@ mod tests {
         let mut stub = vec![0u8; 20];
         stub.extend_from_slice(&2u32.to_le_bytes());
         match query_info_stub(&stub) {
+            Err(Fault { status, .. }) => assert_eq!(status, crate::rpc::pdu::NCA_PROTO_ERROR),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_calls_that_open_a_policy_answer_with_the_handle_and_nothing_else() {
+        // A join calls the older opnum first. Implementing only `OpenPolicy2` made a real Samba
+        // client report "the procedure number is out of range" - a message that names neither the
+        // interface nor the number, and reads as a server that does not speak this protocol.
+        let v1 = open_policy_v1(&[0u8; 28]).expect("lsa_OpenPolicy is answered");
+        let v2 = open_policy(&[0u8; 28]).expect("lsa_OpenPolicy2 is answered");
+        assert_eq!(v1, policy_handle().to_vec());
+        assert_eq!(v2, policy_handle().to_vec());
+        // Twenty octets: the first version appended the granted access, which the IDL does not ask
+        // for, and a client reads those four bytes as part of the next field.
+        assert_eq!(v1.len(), 20);
+    }
+
+    #[test]
+    fn a_truncated_open_policy_is_refused_rather_than_answered() {
+        // A shorter stub cannot hold the referent, the object attributes and the access mask, so
+        // answering would be guessing that the parts that did arrive meant what they looked like.
+        match open_policy_v1(&[0u8; 27]) {
             Err(Fault { status, .. }) => assert_eq!(status, crate::rpc::pdu::NCA_PROTO_ERROR),
             other => panic!("expected a refusal, got {other:?}"),
         }
