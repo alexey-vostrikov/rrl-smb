@@ -52,7 +52,26 @@ fi
 # would have two runs overwrite each other's artifacts.
 cache="${SMB_CACHE:-$HOME/.cache/smb-server}"
 mkdir -p "$cache/target"
-backup="${TMPDIR:-/tmp}/lsarpc.rs.mutation-backup"
+
+# Two runs in one checkout do not merely share a backup file - they share the source file. Each
+# backs up what the other already mutated, and restores it afterwards, so a run can end with a
+# mutation still in place and the *other* run reports a compile error or a survivor that does not
+# exist. That happened: a suite that had reported 13 of 13 killed reported a survivor and a
+# `could not compile` in the same batch, and neither was real.
+#
+# A lock, not a comment: the tool refuses rather than answers wrongly. `mkdir` is the portable
+# atomic operation - `flock` is not in every image this runs in.
+lock="$cache/mutate-lsarpc.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+    echo "another mutation run holds $lock; two runs in one checkout corrupt each other" >&2
+    echo "if no run is active, remove the directory by hand" >&2
+    exit 2
+fi
+
+# The backup is per-run as well: the lock already excludes a second run, and a stale file from a
+# run that was killed must never be the thing a later run restores.
+backup="${TMPDIR:-/tmp}/lsarpc.rs.mutation-backup.$$"
+trap 'rm -f "$backup"; rmdir "$lock" 2>/dev/null' EXIT INT TERM
 
 run_tests() {
     # The output goes to a file and is read afterwards, never piped: `cargo test | tail` reports
@@ -93,7 +112,9 @@ check() {
     if ! apply "$old" "$new" 2>/dev/null; then
         printf 'NOT APPLIED (the code moved)\n'
         cp "$backup" "$file"
-        return 1
+        # A distinct status, not a survivor: a survivor is a hole in the tests, this is a hole in
+        # the script. Reporting one as the other sends the reader looking in the wrong file.
+        return 2
     fi
     if run_tests; then
         printf 'SURVIVED\n'
@@ -107,19 +128,33 @@ check() {
 }
 
 survived=0
+stale=0
+killed=0
 only="${1:-}"
 
 want() {
     [ -z "$only" ] || [ "$only" = "$1" ]
 }
 
-want order && { check "order: handle and status swapped" \
+# Three outcomes, three counters. `check` says 0 for killed, 1 for a mutant the tests let through,
+# 2 for a mutant the code has moved out from under.
+record() {
+    rc=0
+    check "$@" || rc=$?
+    case "$rc" in
+    0) killed=$((killed + 1)) ;;
+    1) survived=$((survived + 1)) ;;
+    2) stale=$((stale + 1)) ;;
+    esac
+}
+
+want order && { record "order: handle and status swapped" \
     'writer.bytes(&policy_handle());
     writer.u32(NTSTATUS_SUCCESS);' \
     'writer.u32(NTSTATUS_SUCCESS);
-    writer.bytes(&policy_handle());' || survived=$((survived + 1)); }
+    writer.bytes(&policy_handle());'; }
 
-want status && { check "status: a failure status is written instead of success" \
+want status && { record "status: a failure status is written instead of success" \
     'writer.u32(NTSTATUS_SUCCESS);
     writer.finish()
 }
@@ -129,70 +164,75 @@ want status && { check "status: a failure status is written instead of success" 
     writer.finish()
 }
 
-/// The same handle from the older request layout.' || survived=$((survived + 1)); }
+/// The same handle from the older request layout.'; }
 
 # No mutation for the discriminant's width. `u16` followed by `align(4)` writes the same four
 # octets as `u32` would, so that mutation is equivalent and a survivor would say nothing about the
 # tests - which is exactly what it said the first time this script ran, and cost an hour of
 # looking for a hole that was not there.
-want sid && { check "sid: the conformant count moves after the header" \
+want sid && { record "sid: the conformant count moves after the header" \
     'writer.u32(u32::try_from(count).unwrap_or(u32::MAX));
     writer.raw(&sid[..HEADER]);' \
     'writer.raw(&sid[..HEADER]);
-    writer.u32(u32::try_from(count).unwrap_or(u32::MAX));' || survived=$((survived + 1)); }
+    writer.u32(u32::try_from(count).unwrap_or(u32::MAX));'; }
 
-want string && { check "string: the array's maximum equals its length" \
+want string && { record "string: the array's maximum equals its length" \
     'let maximum = actual.saturating_add(1);' \
-    'let maximum = actual;' || survived=$((survived + 1)); }
+    'let maximum = actual;'; }
 
-want guid && { check "guid: the uuid is written in big-endian field order" \
+want guid && { record "guid: the uuid is written in big-endian field order" \
     'writer.bytes(&view.guid.to_bytes_le());' \
-    'writer.bytes(view.guid.as_bytes());' || survived=$((survived + 1)); }
+    'writer.bytes(view.guid.as_bytes());'; }
 
-want route && { check "route: lsa_Close reaches the open-policy answer" \
+want route && { record "route: lsa_Close reaches the open-policy answer" \
     'OPNUM_CLOSE => close_handle(stub),' \
-    'OPNUM_CLOSE => open_policy(stub),' || survived=$((survived + 1)); }
+    'OPNUM_CLOSE => open_policy(stub),'; }
 
-want routequery && { check "route: a query reaches the close answer" \
+want routequery && { record "route: a query reaches the close answer" \
     'OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(config, stub),' \
-    'OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => close_handle(stub),' || survived=$((survived + 1)); }
+    'OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => close_handle(stub),'; }
 
-want levelfilter && { check "level: the ushort filter accepts any level" \
+want levelfilter && { record "level: the ushort filter accepts any level" \
     '            if levels.contains(&level) {
                 return Some(level);
             }' \
-    '            return Some(level);' || survived=$((survived + 1)); }
+    '            return Some(level);'; }
 
-want close && { check "close: the handle is echoed back instead of nulled" \
+want close && { record "close: the handle is echoed back instead of nulled" \
     'writer.bytes(&[0u8; HANDLE]);' \
-    'writer.bytes(&stub[..HANDLE]);' || survived=$((survived + 1)); }
+    'writer.bytes(&stub[..HANDLE]);'; }
 
 # No mutation for the order of status and handle in `close_handle`. The handle is nulled and the
 # status is STATUS_SUCCESS, which is zero, so both orders write twenty-four zero octets - a client
 # cannot tell them apart and no test can either. An equivalent mutation is noise, and the first run
 # of this script spent an hour on one.
-want closeguard && { check "close: a short stub is answered" \
+want closeguard && { record "close: a short stub is answered" \
     'if stub.len() < HANDLE {' \
-    'if false && stub.len() < HANDLE {' || survived=$((survived + 1)); }
+    'if false && stub.len() < HANDLE {'; }
 
-want domainname && { check "name: the server's name wins over the domain's" \
+want domainname && { record "name: the server's name wins over the domain's" \
     'netbios: match &config.domain_netbios {
                 Some(name) => name.clone(),
                 None => config.netbios_name.clone(),
             },' \
-    'netbios: config.netbios_name.clone(),' || survived=$((survived + 1)); }
+    'netbios: config.netbios_name.clone(),'; }
 
-want dnsfallback && { check "dns: a stated domain is ignored" \
+want dnsfallback && { record "dns: a stated domain is ignored" \
     'Some(domain) => domain.clone(),
         None => format!("{}.local", config.netbios_name.to_lowercase()),' \
     'Some(_) => format!("{}.local", config.netbios_name.to_lowercase()),
-        None => format!("{}.local", config.netbios_name.to_lowercase()),' || survived=$((survived + 1)); }
+        None => format!("{}.local", config.netbios_name.to_lowercase()),'; }
 
-want level && { check "level: only the referent offset is read" \
-    'for at in [20usize, 24] {
-        if let Some(bytes) = stub.get(at..at + 2)' \
-    'for at in [24usize] {
-        if let Some(bytes) = stub.get(at..at + 2)' || survived=$((survived + 1)); }
+# The offsets alone, not the `if` that follows them: the body was reformatted when the wide read
+# was deleted, and a pattern spanning both lines stops applying for a reason that has nothing to do
+# with the fault it describes.
+want level && { record "level: only the referent offset is read" \
+    'for at in [20usize, 24] {' \
+    'for at in [24usize] {'; }
 
-printf '\nsurvivors: %s\n' "$survived"
-[ "$survived" -eq 0 ]
+printf '\nkilled: %s, survivors: %s, not applied: %s\n' "$killed" "$survived" "$stale"
+[ "$survived" -eq 0 ] || exit 1
+[ "$stale" -eq 0 ] || {
+    echo "a mutation no longer applies: the code moved, the script did not" >&2
+    exit 3
+}
