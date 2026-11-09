@@ -8,8 +8,13 @@ pub(crate) mod pdu;
 pub(crate) mod pipe;
 pub(crate) mod srvsvc;
 
-/// The pipe IPC$ serves, as a CREATE names it.
+/// The pipe IPC$ serves for share enumeration, as a CREATE names it.
 pub(crate) const SRVSVC_PIPE: &str = "srvsvc";
+
+/// The pipe a domain member's join opens first: LSA, where it asks what domain it reached.
+pub(crate) const LSARPC_PIPE: &str = "lsarpc";
+
+pub(crate) mod lsarpc;
 
 /// Source of association group ids for binds that ask for a new group.
 static NEXT_ASSOC_GROUP: AtomicU32 = AtomicU32::new(1);
