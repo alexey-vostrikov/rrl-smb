@@ -27,7 +27,7 @@ use crate::proto::messages::{
     QueryDirectoryRequest, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse,
     SetInfoRequest, WriteRequest, WriteResponse,
 };
-use crate::rpc::SRVSVC_PIPE;
+use crate::rpc::{LSARPC_PIPE, SRVSVC_PIPE};
 use crate::rpc::pipe::{MAX_PIPES_PER_CONNECTION, Pipe, Read};
 use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
@@ -189,7 +189,17 @@ async fn create(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
     let name = String::from_utf16_lossy(&units);
-    if !server.config.share_listing || !name.eq_ignore_ascii_case(SRVSVC_PIPE) {
+    // Two pipes, and each names exactly one interface. `srvsvc` is what a client lists shares
+    // through; `lsarpc` is what a domain member's join opens first, and refusing it made the join
+    // stop at "cannot connect to the LSA pipe" before it asked anything.
+    //
+    // The leading separator is stripped because a client may name a channel either way, and the
+    // difference is not one a server should act on: `\lsarpc` and `lsarpc` are the same pipe, and a
+    // comparison that refused one would be a refusal with no reason a client could see.
+    let pipe = name.trim_start_matches(['\\', '/']);
+    let known = (server.config.share_listing && pipe.eq_ignore_ascii_case(SRVSVC_PIPE))
+        || pipe.eq_ignore_ascii_case(LSARPC_PIPE);
+    if !known {
         debug!(name = %name, "no such pipe");
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
     }
