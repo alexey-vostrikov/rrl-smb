@@ -60,7 +60,7 @@ check() {
     old=$2
     new=$3
     cp "$file" "$backup"
-    printf '%s ... ' "$name"
+    printf '\n%s ... ' "$name"
     if ! apply "$old" "$new" 2>/dev/null; then
         printf 'NOT APPLIED (the code moved)\n'
         cp "$backup" "$file"
@@ -102,10 +102,10 @@ want status && { check "status: a failure status is written instead of success" 
 
 /// The same handle from the older request layout.' || survived=$((survived + 1)); }
 
-want discriminant && { check "discriminant: the union tag is written as a word" \
-    'writer.u16(level);' \
-    'writer.u32(u32::from(level));' || survived=$((survived + 1)); }
-
+# No mutation for the discriminant's width. `u16` followed by `align(4)` writes the same four
+# octets as `u32` would, so that mutation is equivalent and a survivor would say nothing about the
+# tests - which is exactly what it said the first time this script ran, and cost an hour of
+# looking for a hole that was not there.
 want sid && { check "sid: the conformant count moves after the header" \
     'writer.u32(u32::try_from(count).unwrap_or(u32::MAX));
     writer.raw(&sid[..HEADER]);' \
