@@ -57,6 +57,19 @@ RUN cargo install cargo-llvm-cov --locked --version 0.6.18 \
 RUN cargo install cargo-mutants --locked --version 27.1.0 \
  && cargo mutants --version
 
+# CRAP and duplicates, both in Rust, because ub-mode's own tools are Python and would need a second
+# runtime here: `cargo-crap` reads the same LCOV `cargo-llvm-cov` writes and computes the same
+# formula, `cargo-dupes` compares normalised ASTs with the same 0.8 similarity threshold ub-mode
+# names. A Python toolchain in a Rust image is a second interpreter to keep patched for a metric
+# that has a native implementation.
+#
+# Pinned for the same reason as the rest: a CRAP figure or a duplicate count that moves because
+# somebody published a release is not a measurement.
+RUN cargo install cargo-crap --locked --version 0.9.0 \
+ && cargo crap --version
+RUN cargo install cargo-dupes --locked --version 0.2.1 \
+ && cargo dupes --version
+
 # The gates assert their tools exist rather than discovering at report time that `rustfmt` was
 # missing and the check silently did nothing.
 RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version
