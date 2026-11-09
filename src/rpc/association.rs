@@ -9,7 +9,7 @@ use tracing::debug;
 
 use super::pdu::{
     self, Body, ContextElem, ContextResult, FAULT_ACCESS_DENIED, Header, MAX_FRAG, NCA_PROTO_ERROR,
-    NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, PFC_DID_NOT_EXECUTE, PFC_FIRST_FRAG, PFC_LAST_FRAG,
+    LSARPC, NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, PFC_DID_NOT_EXECUTE, PFC_FIRST_FRAG, PFC_LAST_FRAG,
     PTYPE_ALTER_CONTEXT, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND, PTYPE_BIND_ACK, RESPONSE_HEADER_LEN,
     Request, SRVSVC, SyntaxId,
 };
@@ -54,6 +54,12 @@ const FIRST_AND_LAST: u8 = PFC_FIRST_FRAG | PFC_LAST_FRAG;
 pub(crate) struct Call {
     pub call_id: u32,
     pub context_id: u16,
+    /// The interface this call was bound to.
+    ///
+    /// Carried with the call rather than looked up by the caller: `srvsvc` and `lsarpc`
+    /// are dispatched by it, and a call whose context was never accepted has no interface
+    /// - which is a fault, not a guess.
+    pub interface: Option<SyntaxId>,
     pub opnum: u16,
     pub stub: Vec<u8>,
 }
@@ -82,7 +88,7 @@ pub(crate) struct Association {
     max_frag: u16,
     assoc_group_id: u32,
     /// Bound presentation context ids, all on srvsvc over NDR.
-    contexts: Vec<u16>,
+    contexts: Vec<(u16, SyntaxId)>,
     /// The request being reassembled.
     partial: Option<Call>,
     /// The highest call_id received (MS-RPCE 3.3.3.1.1, Current call_id).
@@ -366,6 +372,14 @@ impl Association {
     /// srvsvc over NDR 2.0 is accepted; NDR64 and every other interface are
     /// rejected. `None`, binding nothing, when the elements would take the
     /// association past [`MAX_CONTEXTS`] (MS-RPCE 3.3.3.5.5).
+    /// The interface a presentation context was accepted for.
+    fn interface_of(&self, context_id: u16) -> Option<SyntaxId> {
+        self.contexts
+            .iter()
+            .find(|(id, _)| *id == context_id)
+            .map(|(_, syntax)| *syntax)
+    }
+
     fn negotiate(
         &mut self,
         contexts: &[ContextElem],
@@ -390,14 +404,19 @@ impl Association {
                         transfer_syntax: SyntaxId::default(),
                     };
                 }
-                if c.abstract_syntax != SRVSVC {
+                // The interfaces this server carries. Not a list of everything RPC
+                // defines: a context accepted for an interface nobody implements would
+                // fail at the first call with a fault the client cannot read.
+                if c.abstract_syntax != SRVSVC && c.abstract_syntax != LSARPC {
                     return reject(ABSTRACT_SYNTAX_NOT_SUPPORTED);
                 }
                 if !c.transfer_syntaxes.contains(&NDR) {
                     return reject(TRANSFER_SYNTAXES_NOT_SUPPORTED);
                 }
-                if !self.contexts.contains(&c.id) && !added.contains(&c.id) {
-                    added.push(c.id);
+                if !self.contexts.iter().any(|(id, _)| *id == c.id)
+                    && !added.iter().any(|(id, _)| *id == c.id)
+                {
+                    added.push((c.id, c.abstract_syntax));
                 }
                 ContextResult {
                     result: ACCEPTANCE,
@@ -424,6 +443,7 @@ impl Association {
             (None, true) => Call {
                 call_id: header.call_id,
                 context_id: request.context_id,
+                interface: self.interface_of(request.context_id),
                 opnum: request.opnum,
                 stub: Vec::new(),
             },
@@ -460,7 +480,7 @@ impl Association {
             self.partial = Some(call);
             return None;
         }
-        if !self.contexts.contains(&call.context_id) {
+        if !self.contexts.iter().any(|(id, _)| *id == call.context_id) {
             debug!(
                 context = call.context_id,
                 "rpc request on an unbound context"
@@ -840,6 +860,7 @@ mod tests {
         let call = Call {
             call_id: 4,
             context_id: 0,
+            interface: Some(SRVSVC),
             opnum: 99,
             stub: Vec::new(),
         };
@@ -871,6 +892,7 @@ mod tests {
             Call {
                 call_id: 7,
                 context_id: 0,
+                interface: Some(SRVSVC),
                 opnum: 15,
                 stub: b"abcdefg".to_vec(),
             }
@@ -1097,6 +1119,7 @@ mod tests {
         let call = Call {
             call_id: 9,
             context_id: 0x0102,
+            interface: Some(SRVSVC),
             opnum: 15,
             stub: Vec::new(),
         };
