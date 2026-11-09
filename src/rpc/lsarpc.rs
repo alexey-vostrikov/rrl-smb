@@ -211,14 +211,50 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
         });
     }
 
-    // The domain's NetBIOS name, not this server's: a member compares it against the workgroup it
-    // was configured with, and answering with the server's own name stopped a real join at
-    // "workgroup set to 'AD', should be 'SAMBA'" after every other answer had been accepted.
-    let netbios = match &server.config.domain_netbios {
-        Some(name) => name.as_str(),
-        None => server.config.netbios_name.as_str(),
-    };
-    let dns = dns_domain(server);
+    let body = dns_domain_info_body(level, &DomainView::of(server));
+    // The answer is logged at debug with its length only: a member's join is the one client of
+    // this call, and when it refuses the body, the length says whether a field went missing. The
+    // bytes themselves were useful while the layout was being established and are not worth the
+    // noise now.
+    tracing::debug!(len = body.len(), "lsarpc: QueryInfoPolicy2 answer");
+    Ok(body)
+}
+
+/// The values `PolicyDnsDomainInfo` answers with, separate from the server that holds them.
+///
+/// The answer is bytes, and the only way to test bytes is to compare them with bytes. Reaching
+/// them through a `ServerState` would mean building a whole server in a unit test for four fields,
+/// and a test that is hard to write is a test that does not get written - which is how the layout
+/// faults in this module came to be found by a stand instead.
+pub(crate) struct DomainView {
+    pub(crate) netbios: String,
+    pub(crate) dns: String,
+    pub(crate) guid: uuid::Uuid,
+    pub(crate) sid: Option<Vec<u8>>,
+}
+
+impl DomainView {
+    fn of(server: &ServerState) -> Self {
+        Self {
+            // The domain's NetBIOS name, not this server's: a member compares it against the
+            // workgroup it was configured with, and answering with the server's own name stopped a
+            // real join at "workgroup set to 'AD', should be 'SAMBA'" after every other answer had
+            // been accepted.
+            netbios: match &server.config.domain_netbios {
+                Some(name) => name.clone(),
+                None => server.config.netbios_name.clone(),
+            },
+            dns: dns_domain(server),
+            guid: server.config.server_guid,
+            sid: server.config.domain_sid.clone(),
+        }
+    }
+}
+
+/// The `PolicyDnsDomainInfo` body: pointer, discriminant, the structure, its referents, status.
+pub(crate) fn dns_domain_info_body(level: u16, view: &DomainView) -> Vec<u8> {
+    let netbios = view.netbios.as_str();
+    let dns = view.dns.as_str();
 
     let mut writer = NdrWriter::new();
     // `[out,ref,switch_is(Level)] LSA_POLICY_INFO *` (MS-LSAD 3.1.4.4.9): one pointer to the
@@ -237,47 +273,40 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     writer.align(4);
 
     // POLICY_DNS_DOMAIN_INFO: three `lsa_String`s, a GUID, and a SID pointer.
-    for text in [netbios, dns.as_str(), dns.as_str()] {
+    for text in [netbios, dns, dns] {
         write_lsa_string(&mut writer, text);
     }
     // DomainGuid: the server's own, which is stable for the life of the install. A GUID on the
     // wire is its first three fields little endian and the last eight as written (MS-DTYP 2.3.4.2)
     // - which is what `to_bytes_le` is, and `as_bytes` is not.
-    let guid = server.config.server_guid;
-    writer.bytes(&guid.to_bytes_le());
+    writer.bytes(&view.guid.to_bytes_le());
 
     // The domain SID. A NULL is what this answered before the field existed, and Samba's join
     // takes it as an allocation failure it cannot explain - `dom_sid_dup` on NULL returns NULL,
     // and `NT_STATUS_HAVE_NO_MEMORY` is the error the operator then sees. Absent configuration
     // still answers NULL, because inventing a SID would attach every ACL to a domain that is not
     // this one; the daemon that has one passes it.
-    match &server.config.domain_sid {
+    match &view.sid {
         Some(_) => writer.pointer(true),
         None => writer.pointer(false),
     }
 
     // The referents, in the order their pointers appeared.
-    for text in [netbios, dns.as_str(), dns.as_str()] {
+    for text in [netbios, dns, dns] {
         write_unicode_array(&mut writer, text);
     }
-    if let Some(sid) = &server.config.domain_sid {
+    if let Some(sid) = &view.sid {
         // `dom_sid2` is not the flat octets a directory stores (MS-DTYP 2.4.2.2): its
-        // `[size_is(num_auths)] uint32 sub_auths[]` is a conformant array, so the count is
-        // written before the sub-authorities. Sending the flat form made a client read a
-        // sub-authority as the array's length - and report the array as past its bounds.
+        // `[size_is(num_auths)] uint32 sub_auths[]` is a conformant array, so its maximum is
+        // written before the header. Sending the flat form made a client read a revision byte as
+        // the array's length - and report the array as past its bounds.
         write_dom_sid2(&mut writer, sid);
     }
     // The return value last, where the client reads it: after the out parameters and their
     // referents, not before.
     writer.u32(NTSTATUS_SUCCESS);
 
-    let body = writer.finish();
-    // The answer is logged at debug with its length only: a member's join is the one client of
-    // this call, and when it refuses the body, the length says whether a field went missing. The
-    // bytes themselves were useful while the layout was being established and are not worth the
-    // noise now.
-    tracing::debug!(len = body.len(), "lsarpc: QueryInfoPolicy2 answer");
-    Ok(body)
+    writer.finish()
 }
 
 /// The level a `QueryInformationPolicy` request asks for, or `None` when the stub is not one.
@@ -464,6 +493,113 @@ mod tests {
         assert_eq!(&v1[..20], handle.as_slice());
         assert_eq!(&v1[20..], &[0, 0, 0, 0], "STATUS_SUCCESS after the handle");
         assert_eq!(v2, v1);
+    }
+
+    /// The reference body, written by Samba's own NDR encoder for these exact values.
+    ///
+    /// `ndr_pack(lsa.DnsDomainInfo)` from the python bindings that ship with Samba - the library
+    /// whose parser refuses our answers when they are wrong, which makes it the only oracle worth
+    /// asking. Captured once, because asking at test time would need a container.
+    const SAMBA_STRUCT: &[u8] = &[
+        0x0a, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x1c, 0x00, 0x1e, 0x00, 0x04, 0x00, 0x02, 0x00,
+        0x1c, 0x00, 0x1e, 0x00, 0x08, 0x00, 0x02, 0x00, 0xfd, 0xb1, 0x18, 0x47, 0x07, 0x23, 0x46, 0x76,
+        0xac, 0x58, 0x82, 0x7a, 0xaf, 0x7d, 0xda, 0xaf, 0x0c, 0x00, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x53, 0x00, 0x41, 0x00, 0x4d, 0x00, 0x42, 0x00,
+        0x41, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
+        0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00, 0x78, 0x00, 0x61, 0x00, 0x6d, 0x00, 0x70, 0x00,
+        0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x0f, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x61, 0x00, 0x64, 0x00, 0x2e, 0x00, 0x65, 0x00,
+        0x78, 0x00, 0x61, 0x00, 0x6d, 0x00, 0x70, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x63, 0x00,
+        0x6f, 0x00, 0x6d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+        0x15, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
+    ];
+
+    /// The same SID, as a directory stores it: revision, count, authority, sub-authorities.
+    const DOMAIN_SID: &[u8] = &[
+        0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
+        0x08, 0x07, 0x06, 0x05, 0x09, 0x0a, 0x0b, 0x0c,
+    ];
+
+    fn reference_view() -> DomainView {
+        DomainView {
+            netbios: "SAMBA".to_string(),
+            dns: "ad.example.com".to_string(),
+            guid: uuid::Uuid::parse_str("4718b1fd-2307-7646-ac58-827aaf7ddaaf").expect("a uuid"),
+            sid: Some(DOMAIN_SID.to_vec()),
+        }
+    }
+
+    #[test]
+    fn the_answer_is_the_body_samba_writes_for_the_same_values() {
+        // Byte for byte against an implementation we did not write. Five faults were found by a
+        // stand before this test existed - wrong pointer count, wrong discriminant width, missing
+        // padding, the SID's count on the wrong side of its header, an array not padded - and
+        // every one of them would have failed here in a second instead of a stand run.
+        //
+        // One difference is expected and has to be produced deliberately. `SAMBA_STRUCT` was packed
+        // from the structure alone, so its own referent counter starts at 0x00020000. In a reply
+        // the counter is shared with the union pointer, which takes the first id, so every referent
+        // inside the structure is four higher. The ids are opaque to the client - what they must be
+        // is unique and non-zero - but the shift is real and a comparison that ignored it would be
+        // comparing the wrong thing.
+        let mut expected = vec![0x00, 0x00, 0x02, 0x00];
+        expected.extend_from_slice(&[0x0c, 0x00, 0x00, 0x00]);
+        expected.extend_from_slice(SAMBA_STRUCT);
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // The referent ids in `SAMBA_STRUCT` sit at 12, 20, 28 and 48 once the eight-octet prefix
+        // (union pointer, discriminant, its padding) is in front of it - not at 8, which is the
+        // first string's `Length`. A first version of this shifted offset 8 and turned Length 10
+        // into 14, which the test reported as a difference in the wrong field.
+        for referent in [12usize, 20, 28, 48] {
+            let value = u32::from_le_bytes(expected[referent..referent + 4].try_into().expect("4"));
+            assert_ne!(value, 0, "a referent, not a NULL pointer, at {referent}");
+            expected[referent..referent + 4].copy_from_slice(&(value + 4).to_le_bytes());
+        }
+
+        let ours = dns_domain_info_body(POLICY_DNS_DOMAIN_INFORMATION, &reference_view());
+        assert_eq!(ours, expected, "body differs from Samba's own encoding");
+    }
+
+    #[test]
+    fn the_answer_names_the_domain_and_repeats_its_name_as_the_forest() {
+        // Read back rather than compared as hex: a member compares `Name` against its workgroup,
+        // so a body that renders correctly but puts the server's name there is a wrong answer that
+        // a hex comparison cannot point at.
+        let body = dns_domain_info_body(POLICY_DNS_DOMAIN_INFORMATION, &reference_view());
+        let text: Vec<u16> = body
+            .chunks(2)
+            .filter(|pair| pair.len() == 2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let rendered: String = String::from_utf16_lossy(&text);
+        assert!(rendered.contains("SAMBA"), "{rendered:?}");
+        assert_eq!(rendered.matches("ad.example.com").count(), 2);
+    }
+
+    #[test]
+    fn a_domain_without_a_sid_answers_null_and_no_referent() {
+        // The honest refusal, and it has to be *shorter*: a pointer of 0 writes nothing after it,
+        // and a body that still wrote a SID would leave four octets the client reads as the next
+        // field. Inventing a SID would attach every ACL to a domain that is not this one.
+        let view = DomainView {
+            sid: None,
+            ..reference_view()
+        };
+        let body = dns_domain_info_body(POLICY_DNS_DOMAIN_INFORMATION, &view);
+        let with_sid = dns_domain_info_body(POLICY_DNS_DOMAIN_INFORMATION, &reference_view());
+        assert_eq!(with_sid.len() - body.len(), 4 + DOMAIN_SID.len());
+    }
+
+    #[test]
+    fn both_dns_levels_answer_the_same_arm_under_their_own_discriminant() {
+        // Level 5 and 12 select the same structure, and the discriminant has to say which was
+        // asked: a client that reads level 12 out of a body labelled 5 is being told a different
+        // question was answered.
+        let five = dns_domain_info_body(POLICY_DNS_DOMAIN_INFO, &reference_view());
+        let twelve = dns_domain_info_body(POLICY_DNS_DOMAIN_INFORMATION, &reference_view());
+        assert_eq!(&five[4..6], &5u16.to_le_bytes());
+        assert_eq!(&twelve[4..6], &12u16.to_le_bytes());
+        assert_eq!(five[6..], twelve[6..], "the arm itself is the same");
     }
 
     #[test]
