@@ -355,6 +355,8 @@ pub struct SmbServerBuilder {
     dns_domain: Option<String>,
     /// The domain's SID, answered by `lsarpc` beside that name.
     domain_sid: Option<Vec<u8>>,
+    /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
+    domain_netbios: Option<String>,
     max_read_size: u32,
     max_write_size: u32,
     server_guid: Option<Uuid>,
@@ -410,6 +412,7 @@ impl SmbServerBuilder {
             netbios_name: None,
             dns_domain: None,
             domain_sid: None,
+            domain_netbios: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
             server_guid: None,
@@ -463,6 +466,12 @@ impl SmbServerBuilder {
     /// after every other answer was right.
     pub fn domain_sid(mut self, sid: impl Into<Vec<u8>>) -> Self {
         self.domain_sid = Some(sid.into());
+        self
+    }
+
+    /// The domain's NetBIOS name, which a member compares against its configured workgroup.
+    pub fn domain_netbios(mut self, name: impl Into<String>) -> Self {
+        self.domain_netbios = Some(name.into());
         self
     }
 
@@ -812,6 +821,7 @@ impl SmbServerBuilder {
             netbios_name: netbios,
             dns_domain: self.dns_domain.clone(),
             domain_sid: self.domain_sid.clone(),
+            domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
             server_guid,
