@@ -14,10 +14,11 @@
 //!
 //! # The SID
 //!
-//! `PolicyDnsDomainInfo` carries the domain's SID. This server answers it as NULL: a domain SID is
-//! the directory's to issue, and this crate does not read a directory. A client that needs it - and
-//! a join does, for the machine account - gets it from LDAP, where `rust-rest-ldap` already keeps and
-//! issues it. What a NULL here costs is a second question, not a wrong answer.
+//! `PolicyDnsDomainInfo` carries the domain's SID, and a member's join reads it from here and
+//! stores it as the domain the machine belongs to. A domain SID is the directory's to issue, and
+//! this crate does not read a directory - so the daemon that has one passes it in
+//! (`ServerConfig::domain_sid`), and the answer holds it. Without one the answer is NULL, which is
+//! the honest refusal: inventing a SID would attach every ACL to a domain that is not this one.
 
 use crate::rpc::ndr::{NdrReader, NdrWriter};
 use crate::rpc::association::Fault;
@@ -38,12 +39,28 @@ pub(crate) const OPNUM_OPEN_POLICY: u16 = 6;
 /// server ignores, an object attributes pointer it also ignores, and the access wanted.
 pub(crate) const OPNUM_OPEN_POLICY2: u16 = 44;
 
+/// `lsa_QueryInfoPolicy` (MS-LSAD 3.1.4.4.9). The older question, and the one a Samba join asks
+/// straight after `QueryInfoPolicy2` - so both are answered from the same body. The difference is
+/// in the request: the level arrives as an `enum` here and as a `ushort` there, which is why
+/// [`policy_level`] reads both widths.
+pub(crate) const OPNUM_QUERY_INFO_POLICY: u16 = 7;
+
 /// `lsa_QueryInfoPolicy2` (MS-LSAD 3.1.4.4.10). The same union as `lsa_QueryInfoPolicy`, with the
 /// level carried as a `ushort` rather than an `enum`, which is the whole difference between them.
 pub(crate) const OPNUM_QUERY_INFO_POLICY2: u16 = 46;
 
+/// `STATUS_SUCCESS`: the NTSTATUS a method returns when it answered the question asked.
+const NTSTATUS_SUCCESS: u32 = 0;
+
 /// `PolicyDnsDomainInfo` (MS-LSAD 2.2.7).
 const POLICY_DNS_DOMAIN_INFO: u16 = 5;
+
+/// `LsarQueryInformationPolicy2` level 12, `PolicyDnsDomainInformation` (MS-LSAD 2.2.7).
+///
+/// The same structure as level 5, asked for by a different number. A Samba member's join asks for
+/// this one - `dcerpc_lsa_QueryInfoPolicy2(..., LSA_POLICY_INFO_DNS, ...)` - so answering only
+/// level 5 answers the question a client asks only after it has failed to ask the other.
+const POLICY_DNS_DOMAIN_INFORMATION: u16 = 12;
 
 /// A policy handle is 20 octets: a context type and a UUID (MS-LSAD 2.2.1).
 ///
@@ -72,7 +89,7 @@ pub(crate) async fn serve(
     match opnum {
         OPNUM_OPEN_POLICY => open_policy_v1(stub),
         OPNUM_OPEN_POLICY2 => open_policy(stub),
-        OPNUM_QUERY_INFO_POLICY2 => query_info(server, stub),
+        OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(server, stub),
         other => {
             // A client sees only "the procedure number is out of range" and cannot say which
             // number, so the number goes here: an unimplemented call is a fact about this server,
@@ -90,11 +107,14 @@ pub(crate) async fn serve(
     }
 }
 
-/// The handle, and nothing else.
+/// The handle, behind the referent id an `[out]` pointer carries.
 ///
-/// A first version of this wrote the granted access after the handle, which the IDL does not ask
-/// for: both `lsa_OpenPolicy` and `lsa_OpenPolicy2` return `[out] policy_handle *handle`. Four
-/// bytes a client does not expect are four bytes it reads as part of the next field.
+/// Two wrong answers were tried before this one. The first appended the granted access, which the
+/// IDL does not ask for. The second sent the twenty octets of the handle alone - and a real client
+/// refused that with `{Buffer Too Small}`, because NDR marshals an `[out]` pointer with its
+/// referent id in front of the value (C706 14.3.10.5). `srvsvc` in this crate has always written
+/// that id; this interface did not, and four missing bytes are the difference between a client
+/// reading a handle and a client reading the start of one.
 fn open_policy(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     // The server name, the object attributes and the desired access. Read only so that a stub too
@@ -103,7 +123,22 @@ fn open_policy(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let _object_attributes = reader.pointer();
     let _desired_access = reader.u32();
 
-    Ok(policy_handle().to_vec())
+    Ok(handle_response())
+}
+
+/// A policy handle as a response carries it: the twenty octets, then the status.
+///
+/// Established by experiment, because the IDL shows neither the return value nor its place. Four
+/// layouts were tried against a real Samba member's join, and the status it reported named the
+/// layout each time without saying so: with the handle at offset 4 it reported the handle's last
+/// four octets (0x4f0e713a), with the handle at offset 8 the four before those (0x085d229c) - in
+/// both cases exactly the bytes that fall at offset 20. So the client reads the handle first, from
+/// offset 0, and the NTSTATUS return value after it.
+fn handle_response() -> Vec<u8> {
+    let mut writer = NdrWriter::new();
+    writer.bytes(&policy_handle());
+    writer.u32(NTSTATUS_SUCCESS);
+    writer.finish()
 }
 
 /// The same handle from the older request layout.
@@ -120,21 +155,30 @@ fn open_policy_v1(stub: &[u8]) -> Result<Vec<u8>, Fault> {
             did_not_execute: true,
         });
     }
-    Ok(policy_handle().to_vec())
+    Ok(handle_response())
 }
 
 /// `PolicyDnsDomainInfo` for the domain this server answers for.
 fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
-    let mut reader = NdrReader::new(stub);
-    // The handle, and the level. A level this server does not answer is refused by name rather than
-    // with an empty structure: a client that asked for account domains and got a DNS name would go
-    // on to use it.
-    let _handle = reader.u32();
-    for _ in 0..4 {
-        let _ = reader.u32();
-    }
-    let level = reader.u32().unwrap_or(u32::MAX);
-    if level as u16 != POLICY_DNS_DOMAIN_INFO {
+    let Some(level) = policy_level(stub) else {
+        // The bytes, not a guess about them: the request layout for this call was wrong twice
+        // already, and each guess cost a stand run.
+        tracing::warn!(
+            stub = %stub.iter().take(48).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+            len = stub.len(),
+            "lsarpc: QueryInfoPolicy2 with no level this server answers"
+        );
+        return Err(Fault {
+            status: crate::rpc::pdu::NCA_PROTO_ERROR,
+            did_not_execute: true,
+        });
+    };
+    // A level this server does not answer is refused by name rather than with an empty structure:
+    // a client that asked for account domains and got a DNS name would go on to use it.
+    if !matches!(
+        level,
+        POLICY_DNS_DOMAIN_INFO | POLICY_DNS_DOMAIN_INFORMATION
+    ) {
         return Err(Fault {
             status: crate::rpc::pdu::NCA_PROTO_ERROR,
             did_not_execute: true,
@@ -145,32 +189,152 @@ fn query_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let dns = dns_domain(server);
 
     let mut writer = NdrWriter::new();
-    // `[out, switch_is(Level)] LSA_POLICY_INFO **`: a pointer, then the union member it names.
+    // `[out,ref,switch_is(Level)] LSA_POLICY_INFO *` (MS-LSAD 3.1.4.4.9): one pointer to the
+    // union, then the union's discriminant, then the arm it selects.
+    // `PLSAPR_POLICY_INFORMATION` is one pointer, not two (MS-LSAD 2.2.4.2). A second one here
+    // cost a stand run: the client read the union's first field out of a pointer it had not asked
+    // for and answered INVALID_PARAMETER.
     writer.pointer(true);
+    // The union's discriminant (C706 14.3.8.2), two octets wide - `switch_type(uint16)` in the
+    // IDL. What follows is aligned to four, so two octets of padding fall between it and the arm;
+    // a reference body built by an independent implementation shows `0c 00`, then padding.
+    writer.u16(level);
+    // Padding, not a field: the arm is aligned to four and nothing is written in between. A
+    // four-octet zero here instead of two octets of padding shifted every field after it by two -
+    // which is the same symptom as a wrong count, and it took a byte-by-byte comparison to see.
+    writer.align(4);
 
-    // POLICY_DNS_DOMAIN_INFO: three RPC_UNICODE_STRINGs, a GUID, and a SID pointer.
+    // POLICY_DNS_DOMAIN_INFO: three `lsa_String`s, a GUID, and a SID pointer.
     for text in [netbios, dns.as_str(), dns.as_str()] {
-        let units = text.encode_utf16().count();
-        let length = u16::try_from(units * 2).unwrap_or(u16::MAX);
-        // Length and MaximumLength are inline; the characters are referents after the structure.
-        writer.u32(u32::from(length));
-        writer.pointer(true);
+        write_lsa_string(&mut writer, text);
     }
-    // DomainGuid: the server's own, which is stable for the life of the install.
+    // DomainGuid: the server's own, which is stable for the life of the install. A GUID on the
+    // wire is its first three fields little endian and the last eight as written (MS-DTYP 2.3.4.2)
+    // - which is what `to_bytes_le` is, and `as_bytes` is not.
     let guid = server.config.server_guid;
-    writer.u32(u32::from_le_bytes(guid.as_bytes()[0..4].try_into().expect("4")));
-    writer.u32(u32::from_le_bytes(guid.as_bytes()[4..8].try_into().expect("4")));
-    writer.u32(u32::from_le_bytes(guid.as_bytes()[8..12].try_into().expect("4")));
-    writer.u32(u32::from_le_bytes(guid.as_bytes()[12..16].try_into().expect("4")));
-    // The domain SID: NULL, and the module note says why.
-    writer.pointer(false);
+    writer.bytes(&guid.to_bytes_le());
+
+    // The domain SID. A NULL is what this answered before the field existed, and Samba's join
+    // takes it as an allocation failure it cannot explain - `dom_sid_dup` on NULL returns NULL,
+    // and `NT_STATUS_HAVE_NO_MEMORY` is the error the operator then sees. Absent configuration
+    // still answers NULL, because inventing a SID would attach every ACL to a domain that is not
+    // this one; the daemon that has one passes it.
+    match &server.config.domain_sid {
+        Some(sid) => writer.pointer(true),
+        None => writer.pointer(false),
+    }
 
     // The referents, in the order their pointers appeared.
     for text in [netbios, dns.as_str(), dns.as_str()] {
-        writer.string(text);
+        write_unicode_array(&mut writer, text);
     }
+    if let Some(sid) = &server.config.domain_sid {
+        // `dom_sid2` is not the flat octets a directory stores (MS-DTYP 2.4.2.2): its
+        // `[size_is(num_auths)] uint32 sub_auths[]` is a conformant array, so the count is
+        // written before the sub-authorities. Sending the flat form made a client read a
+        // sub-authority as the array's length - and report the array as past its bounds.
+        write_dom_sid2(&mut writer, sid);
+    }
+    // The return value last, where the client reads it: after the out parameters and their
+    // referents, not before.
+    writer.u32(NTSTATUS_SUCCESS);
 
-    Ok(writer.finish())
+    let body = writer.finish();
+    // The answer is logged at debug with its length only: a member's join is the one client of
+    // this call, and when it refuses the body, the length says whether a field went missing. The
+    // bytes themselves were useful while the layout was being established and are not worth the
+    // noise now.
+    tracing::debug!(len = body.len(), "lsarpc: QueryInfoPolicy2 answer");
+    Ok(body)
+}
+
+/// The level a `QueryInformationPolicy` request asks for, or `None` when the stub is not one.
+///
+/// Established from the bytes a client sends, after three guesses about this request were wrong:
+///
+///     00 00 00 00 6c 9d 2f 14 8a 3e 4b 71 9c 22 5d 08 3a 71 0e 4f 0c 00
+///     \_________________ the policy handle, 20 octets ________________/ \_/ level
+///
+/// Three things are visible there that the IDL does not say plainly. The handle is sent inline,
+/// with no referent id in front of it - it is a context handle, and a context handle travels as
+/// its twenty octets. The level is two octets, not four: `lsa_QueryInfoPolicy2` carries it as a
+/// `ushort` where `lsa_QueryInfoPolicy` carries an `enum`, which is the entire difference between
+/// the two calls (MS-LSAD 3.1.4.4.10). And the level is last, so a stub that ends two octets
+/// early is not an error to report but a layout that was already read.
+///
+/// Both widths and both offsets are tried, because the older call is still answerable: a guess
+/// about the layout never becomes an answer, since a wrong offset lands on handle octets that
+/// match no level this server knows.
+fn policy_level(stub: &[u8]) -> Option<u16> {
+    let levels = [POLICY_DNS_DOMAIN_INFO, POLICY_DNS_DOMAIN_INFORMATION];
+    // `ushort`: offset 20 with the handle inline, 24 behind a referent id.
+    for at in [20usize, 24] {
+        if let Some(bytes) = stub.get(at..at + 2).and_then(|b| <[u8; 2]>::try_from(b).ok()) {
+            let level = u16::from_le_bytes(bytes);
+            if levels.contains(&level) {
+                return Some(level);
+            }
+        }
+    }
+    // `enum`, as the older call carries it.
+    for at in [20usize, 24] {
+        if let Some(bytes) = stub.get(at..at + 4).and_then(|b| <[u8; 4]>::try_from(b).ok()) {
+            let level = u32::from_le_bytes(bytes) as u16;
+            if levels.contains(&level) {
+                return Some(level);
+            }
+        }
+    }
+    None
+}
+
+/// A `dom_sid2` as NDR writes it: the eight-octet header, the count, then the sub-authorities.
+fn write_dom_sid2(writer: &mut NdrWriter, sid: &[u8]) {
+    const HEADER: usize = 8;
+    if sid.len() < HEADER {
+        // A SID shorter than its own header is not one; writing nothing keeps the pointers in
+        // step with the referents that follow them.
+        return;
+    }
+    let count = usize::from(sid[1]);
+    writer.raw(&sid[..HEADER]);
+    writer.u32(u32::try_from(count).unwrap_or(u32::MAX));
+    writer.raw(&sid[HEADER..HEADER + count * 4]);
+}
+
+/// An `lsa_String`: `Length` and `MaximumLength` in one word, then a pointer to its units.
+fn write_lsa_string(writer: &mut NdrWriter, text: &str) {
+    let units = u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX);
+    // Both counts are `2*strlen`, with no terminator added: the array below carries the characters
+    // and nothing else. An independent implementation's own body writes `0a 00 0a 00` for a
+    // five-character name, and a client that finds a count larger than the characters it read
+    // reports the array as past its bounds.
+    let length = units.saturating_mul(2);
+    writer.u32(length | (length << 16));
+    writer.pointer(true);
+}
+
+/// The units of an `lsa_String`: a conformant array, so its count and nothing else.
+///
+/// Not `[string]`: a `[string]` array is varying-conformant and carries an offset and an actual
+/// count that an `lsa_String` has no field for. Writing the longer form shifts every field after
+/// it, and the client reads the domain's name out of the middle of its own forest name.
+fn write_unicode_array(writer: &mut NdrWriter, text: &str) {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    // `[size_is(size/2),length_is(length/2)] uint16 *string`: a conformant varying array whose
+    // contents are the characters alone. The counts equal `Length/2`, which is why a terminator
+    // here would be one element the client did not ask for.
+    let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
+    writer.u32(count);
+    writer.u32(0);
+    writer.u32(count);
+    let mut raw = Vec::with_capacity(units.len() * 2);
+    for unit in units {
+        raw.extend_from_slice(&unit.to_le_bytes());
+    }
+    // Not `bytes`: a `uint16` array is aligned to two, and padding it to four moves every field
+    // after it by two octets. The client reads that as an array past its bounds.
+    writer.raw(&raw);
 }
 
 /// The DNS name of the domain this server answers for.
@@ -201,11 +365,42 @@ mod tests {
     #[test]
     fn a_level_this_server_does_not_answer_is_refused_rather_than_approximated() {
         // A client that asked for account domains and received a DNS name would use the name.
+        // Level 2 is PolicyAccountDomainInfo; the refusal has to happen before anything is
+        // written, because a half-built answer is worse than none.
         let mut stub = vec![0u8; 20];
         stub.extend_from_slice(&2u32.to_le_bytes());
-        match query_info_stub(&stub) {
-            Err(Fault { status, .. }) => assert_eq!(status, crate::rpc::pdu::NCA_PROTO_ERROR),
-            other => panic!("expected a refusal, got {other:?}"),
+        assert_eq!(policy_level(&stub), None);
+    }
+
+    #[test]
+    fn the_level_is_read_from_the_bytes_a_client_actually_sends() {
+        // Taken from a stand run: handle inline, then the level as one `ushort`.
+        let stub = [
+            0x00, 0x00, 0x00, 0x00, 0x6c, 0x9d, 0x2f, 0x14, 0x8a, 0x3e, 0x4b, 0x71, 0x9c, 0x22,
+            0x5d, 0x08, 0x3a, 0x71, 0x0e, 0x4f, 0x0c, 0x00,
+        ];
+        assert_eq!(policy_level(&stub), Some(POLICY_DNS_DOMAIN_INFORMATION));
+        // Level 5 in the same place, and the older call's four-octet form.
+        let mut five = stub[..20].to_vec();
+        five.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(policy_level(&five), Some(5));
+        let mut wide = stub[..20].to_vec();
+        wide.extend_from_slice(&12u32.to_le_bytes());
+        assert_eq!(policy_level(&wide), Some(12));
+    }
+
+    #[test]
+    fn the_level_is_read_from_where_the_client_put_it() {
+        // Both offsets, and both the `ushort` a current client sends and the `enum` an older one
+        // sends. The level itself says which reading was right, so none of these is a guess.
+        for (prefix, level) in [(4usize, 12u16), (0, 12), (4, 5), (0, 5)] {
+            let mut stub = vec![0u8; 20 + prefix];
+            stub.extend_from_slice(&u32::from(level).to_le_bytes());
+            assert_eq!(
+                policy_level(&stub),
+                Some(level),
+                "prefix {prefix} octets before the handle"
+            );
         }
     }
 
@@ -216,11 +411,14 @@ mod tests {
         // interface nor the number, and reads as a server that does not speak this protocol.
         let v1 = open_policy_v1(&[0u8; 28]).expect("lsa_OpenPolicy is answered");
         let v2 = open_policy(&[0u8; 28]).expect("lsa_OpenPolicy2 is answered");
-        assert_eq!(v1, policy_handle().to_vec());
-        assert_eq!(v2, policy_handle().to_vec());
-        // Twenty octets: the first version appended the granted access, which the IDL does not ask
-        // for, and a client reads those four bytes as part of the next field.
-        assert_eq!(v1.len(), 20);
+        let handle = policy_handle();
+        // The twenty octets, then the status - no referent id in front. Every other layout was
+        // refused by a real client, and the status it reported was a window onto these bytes:
+        // whatever fell at offset 20 was read as the NTSTATUS. See `handle_response`.
+        assert_eq!(v1.len(), 24);
+        assert_eq!(&v1[..20], handle.as_slice());
+        assert_eq!(&v1[20..], &[0, 0, 0, 0], "STATUS_SUCCESS after the handle");
+        assert_eq!(v2, v1);
     }
 
     #[test]
@@ -233,20 +431,4 @@ mod tests {
         }
     }
 
-    /// `query_info` without a `ServerState`, for the branch that refuses before reading one.
-    fn query_info_stub(stub: &[u8]) -> Result<Vec<u8>, Fault> {
-        let mut reader = NdrReader::new(stub);
-        let _handle = reader.u32();
-        for _ in 0..4 {
-        let _ = reader.u32();
-    }
-        let level = reader.u32().unwrap_or(u32::MAX);
-        if level as u16 != POLICY_DNS_DOMAIN_INFO {
-            return Err(Fault {
-                status: crate::rpc::pdu::NCA_PROTO_ERROR,
-                did_not_execute: true,
-            });
-        }
-        Ok(Vec::new())
-    }
 }

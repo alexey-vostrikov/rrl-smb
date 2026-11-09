@@ -103,6 +103,37 @@ impl NdrWriter {
         }
     }
 
+    /// A two-octet value, aligned to two.
+    pub(crate) fn u16(&mut self, value: u16) {
+        self.stub.resize(self.stub.len().next_multiple_of(2), 0);
+        self.stub.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Pads to the next multiple of `alignment`, writing nothing else.
+    pub(crate) fn align(&mut self, alignment: usize) {
+        self.stub
+            .resize(self.stub.len().next_multiple_of(alignment), 0);
+    }
+
+    /// Raw octets with no alignment of their own.
+    ///
+    /// For the contents of an array whose element size is smaller than four: a `uint16` array is
+    /// aligned to two, and padding it to four shifts every field that follows by two octets - which
+    /// a reader reports as an array running past its bounds, not as a shift.
+    pub(crate) fn raw(&mut self, value: &[u8]) {
+        self.stub.extend_from_slice(value);
+    }
+
+    /// Raw octets, aligned to four.
+    ///
+    /// For values this crate already holds as wire bytes rather than as fields - a SID is the one
+    /// case: its layout (revision, count, authority, sub-authorities) is the same in the directory
+    /// and on the wire, so taking it apart to write it back would be two chances to disagree.
+    pub(crate) fn bytes(&mut self, value: &[u8]) {
+        self.stub.resize(self.stub.len().next_multiple_of(4), 0);
+        self.stub.extend_from_slice(value);
+    }
+
     pub(crate) fn finish(self) -> Vec<u8> {
         self.stub
     }

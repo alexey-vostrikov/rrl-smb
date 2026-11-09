@@ -353,6 +353,8 @@ pub struct SmbServerBuilder {
     netbios_name: Option<String>,
     /// The DNS name of the domain, answered by `lsarpc`.
     dns_domain: Option<String>,
+    /// The domain's SID, answered by `lsarpc` beside that name.
+    domain_sid: Option<Vec<u8>>,
     max_read_size: u32,
     max_write_size: u32,
     server_guid: Option<Uuid>,
@@ -407,6 +409,7 @@ impl SmbServerBuilder {
             shares: Vec::new(),
             netbios_name: None,
             dns_domain: None,
+            domain_sid: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
             server_guid: None,
@@ -450,6 +453,16 @@ impl SmbServerBuilder {
     /// falls back to the NetBIOS name.
     pub fn dns_domain(mut self, domain: impl Into<String>) -> Self {
         self.dns_domain = Some(domain.into());
+        self
+    }
+
+    /// The domain's SID, in the octets a directory stores.
+    ///
+    /// Answered by `lsarpc` with the domain's DNS information. A member's join reads it from
+    /// there and stores it as the machine's own domain, so an absent SID is a join that fails
+    /// after every other answer was right.
+    pub fn domain_sid(mut self, sid: impl Into<Vec<u8>>) -> Self {
+        self.domain_sid = Some(sid.into());
         self
     }
 
@@ -798,6 +811,7 @@ impl SmbServerBuilder {
             listen_addr: listen,
             netbios_name: netbios,
             dns_domain: self.dns_domain.clone(),
+            domain_sid: self.domain_sid.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
             server_guid,
