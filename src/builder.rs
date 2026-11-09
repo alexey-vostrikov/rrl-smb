@@ -351,6 +351,8 @@ pub struct SmbServerBuilder {
     user_order: Vec<String>,
     shares: Vec<Share>,
     netbios_name: Option<String>,
+    /// The DNS name of the domain, answered by `lsarpc`.
+    dns_domain: Option<String>,
     max_read_size: u32,
     max_write_size: u32,
     server_guid: Option<Uuid>,
@@ -404,6 +406,7 @@ impl SmbServerBuilder {
             user_order: Vec::new(),
             shares: Vec::new(),
             netbios_name: None,
+            dns_domain: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
             server_guid: None,
@@ -438,6 +441,15 @@ impl SmbServerBuilder {
 
     pub fn share(mut self, share: Share) -> Self {
         self.shares.push(share);
+        self
+    }
+
+    /// The DNS name of the domain this server answers for.
+    ///
+    /// Answered by `lsarpc` when a member asks what domain it has reached; absent means the answer
+    /// falls back to the NetBIOS name.
+    pub fn dns_domain(mut self, domain: impl Into<String>) -> Self {
+        self.dns_domain = Some(domain.into());
         self
     }
 
@@ -785,6 +797,7 @@ impl SmbServerBuilder {
         let cfg = ServerConfig {
             listen_addr: listen,
             netbios_name: netbios,
+            dns_domain: self.dns_domain.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
             server_guid,

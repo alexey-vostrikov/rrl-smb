@@ -194,6 +194,12 @@ impl ShareBindings {
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub netbios_name: String,
+    /// The DNS name of the domain this server answers for, `example.com`.
+    ///
+    /// Used by `lsarpc` when a member asks what domain it has reached: a client compares this
+    /// against the realm it was told, and a wrong answer sends it looking for a domain that is not
+    /// this one. Absent means "not stated", and the answer falls back to the NetBIOS name.
+    pub dns_domain: Option<String>,
     pub max_read_size: u32,
     pub max_write_size: u32,
     pub server_guid: Uuid,

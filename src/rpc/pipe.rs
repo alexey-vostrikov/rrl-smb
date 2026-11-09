@@ -218,7 +218,23 @@ impl Pipe {
             match step {
                 Step::Send(pdu) => state.push(pdu),
                 Step::Call(call) => {
-                    let result = srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await;
+                    // The interface the call was bound to decides who answers. A call on a
+                    // context that was never accepted has none, and an interface with no handler
+                    // is a fault rather than a guess: answering `srvsvc` to an LSA call would be
+                    // worse than refusing it.
+                    let result = match call.interface {
+                        Some(syntax) if syntax == crate::rpc::pdu::LSARPC => {
+                            crate::rpc::lsarpc::serve(server, &self.caller, call.opnum, &call.stub)
+                                .await
+                        }
+                        Some(syntax) if syntax == crate::rpc::pdu::SRVSVC => {
+                            srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await
+                        }
+                        _ => Err(crate::rpc::association::Fault {
+                            status: crate::rpc::pdu::NCA_UNK_IF,
+                            did_not_execute: true,
+                        }),
+                    };
                     debug!(opnum = call.opnum, ok = result.is_ok(), "rpc call");
                     for reply in state.assoc.reply(&call, result) {
                         state.push(reply);
