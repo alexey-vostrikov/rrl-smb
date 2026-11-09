@@ -27,8 +27,8 @@ use crate::proto::messages::{
     QueryDirectoryRequest, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse,
     SetInfoRequest, WriteRequest, WriteResponse,
 };
-use crate::rpc::{LSARPC_PIPE, SRVSVC_PIPE};
 use crate::rpc::pipe::{MAX_PIPES_PER_CONNECTION, Pipe, Read};
+use crate::rpc::{LSARPC_PIPE, SRVSVC_PIPE};
 use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
 

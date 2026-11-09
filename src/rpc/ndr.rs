@@ -111,7 +111,8 @@ impl NdrWriter {
 
     /// Pads to the next multiple of `alignment`, writing nothing else.
     pub(crate) fn align(&mut self, alignment: usize) {
-        self.stub.resize(self.stub.len().next_multiple_of(alignment), 0);
+        self.stub
+            .resize(self.stub.len().next_multiple_of(alignment), 0);
     }
 
     /// Raw octets with no alignment of their own.
