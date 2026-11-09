@@ -17,22 +17,46 @@ set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 file="$repo/src/rpc/lsarpc.rs"
 
-# The image tag comes from rust-toolchain.toml, not from a constant here: a version written in two
-# places is a version that drifts, and the drift shows up as tests that pass on one machine and
-# fail on another. `SMB_IMAGE` overrides it for a one-off run against another toolchain.
+# The toolchain version comes from rust-toolchain.toml, not from a constant here: a version written
+# in two places is a version that drifts, and the drift shows up as tests that pass on one machine
+# and fail on another.
+#
+# The base is bullseye, and it is built locally rather than pulled. `rust:<version>-bullseye` is not
+# published - the official project stopped shipping bullseye variants after 1.90 - and the reason
+# to want it is glibc: bullseye gives 2.31, which is what the stands and Astra Linux run, while
+# bookworm gives 2.36 and a binary built there will not start. A tag assembled by hand on one
+# machine is how a build starts depending on that machine, so the assembly lives in
+# `docker/toolchain.Dockerfile` and is run from here when the image is absent.
 channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$repo/rust-toolchain.toml")
 if [ -z "$channel" ]; then
     echo "rust-toolchain.toml names no channel" >&2
     exit 2
 fi
-image="${SMB_IMAGE:-rust:${channel}-slim-trixie}"
+image="${SMB_IMAGE:-rust:${channel}-bullseye}"
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "building $image from docker/toolchain.Dockerfile (once)" >&2
+    docker build -f "$repo/docker/toolchain.Dockerfile" \
+        -t "$image" --build-arg "RUST_TOOLCHAIN=${channel}" "$repo/docker" >&2 || {
+        echo "could not build $image; the mutations cannot run without it" >&2
+        exit 2
+    }
+fi
+
+# Cargo's homes live under the user's cache rather than a shared volume: a target directory written
+# by another run as root is one this run cannot write, and the failure reads as "Permission denied"
+# at a path nobody typed.
+cache="${SMB_CACHE:-$HOME/.cache/smb-server}"
+mkdir -p "$cache/cargo" "$cache/target"
 backup="${TMPDIR:-/tmp}/lsarpc.rs.mutation-backup"
 
 run_tests() {
     # The output goes to a file and is read afterwards, never piped: `cargo test | tail` reports
     # `tail`'s status, so the first version of this script called every mutation a survivor - the
     # same mistake as a stand that announced a join it had not made.
-    docker run --rm -v "$repo":/w -w /w -v rrl-cargo:/cargo -e CARGO_HOME=/cargo \
+    docker run --rm -u "$(id -u):$(id -g)" \
+        -v "$repo":/w -w /w \
+        -v "$cache/cargo":/cargo -v "$cache/target":/target \
+        -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
         "$image" sh -c 'cargo test --lib --features krb5 lsarpc >/tmp/mutation.log 2>&1'
     status=$?
     tail -5 /tmp/mutation.log 2>/dev/null || true
