@@ -16,12 +16,27 @@ set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 file="$repo/src/rpc/lsarpc.rs"
-image="${SMB_IMAGE:-rust:1.99.1-slim-trixie}"
+
+# The image tag comes from rust-toolchain.toml, not from a constant here: a version written in two
+# places is a version that drifts, and the drift shows up as tests that pass on one machine and
+# fail on another. `SMB_IMAGE` overrides it for a one-off run against another toolchain.
+channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$repo/rust-toolchain.toml")
+if [ -z "$channel" ]; then
+    echo "rust-toolchain.toml names no channel" >&2
+    exit 2
+fi
+image="${SMB_IMAGE:-rust:${channel}-slim-trixie}"
 backup="${TMPDIR:-/tmp}/lsarpc.rs.mutation-backup"
 
 run_tests() {
+    # The output goes to a file and is read afterwards, never piped: `cargo test | tail` reports
+    # `tail`'s status, so the first version of this script called every mutation a survivor - the
+    # same mistake as a stand that announced a join it had not made.
     docker run --rm -v "$repo":/w -w /w -v rrl-cargo:/cargo -e CARGO_HOME=/cargo \
-        "$image" sh -c 'cargo test --lib --features krb5 lsarpc 2>&1 | tail -5'
+        "$image" sh -c 'cargo test --lib --features krb5 lsarpc >/tmp/mutation.log 2>&1'
+    status=$?
+    tail -5 /tmp/mutation.log 2>/dev/null || true
+    return $status
 }
 
 # Applies one mutation by replacing text, and fails loudly if the text is not there: a mutation
@@ -51,12 +66,12 @@ check() {
         cp "$backup" "$file"
         return 1
     fi
-    if run_tests >/tmp/mutation.log 2>&1; then
+    if run_tests; then
         printf 'SURVIVED\n'
-        result=0
+        result=1
     else
         printf 'killed\n'
-        result=1
+        result=0
     fi
     cp "$backup" "$file"
     return $result
@@ -75,10 +90,17 @@ want order && { check "order: handle and status swapped" \
     'writer.u32(NTSTATUS_SUCCESS);
     writer.bytes(&policy_handle());' || survived=$((survived + 1)); }
 
-want referent && { check "referent: the handle pointer is not written" \
-    '    writer.pointer(true);
-    writer.bytes(&policy_handle());' \
-    '    writer.bytes(&policy_handle());' || survived=$((survived + 1)); }
+want status && { check "status: a failure status is written instead of success" \
+    'writer.u32(NTSTATUS_SUCCESS);
+    writer.finish()
+}
+
+/// The same handle from the older request layout.' \
+    'writer.u32(0xC000_000D);
+    writer.finish()
+}
+
+/// The same handle from the older request layout.' || survived=$((survived + 1)); }
 
 want discriminant && { check "discriminant: the union tag is written as a word" \
     'writer.u16(level);' \
@@ -89,6 +111,14 @@ want sid && { check "sid: the conformant count moves after the header" \
     writer.raw(&sid[..HEADER]);' \
     'writer.raw(&sid[..HEADER]);
     writer.u32(u32::try_from(count).unwrap_or(u32::MAX));' || survived=$((survived + 1)); }
+
+want string && { check "string: the array's maximum equals its length" \
+    'let maximum = actual.saturating_add(1);' \
+    'let maximum = actual;' || survived=$((survived + 1)); }
+
+want guid && { check "guid: the uuid is written in big-endian field order" \
+    'writer.bytes(&view.guid.to_bytes_le());' \
+    'writer.bytes(view.guid.as_bytes());' || survived=$((survived + 1)); }
 
 want level && { check "level: only the referent offset is read" \
     'for at in [20usize, 24] {
