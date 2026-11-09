@@ -25,6 +25,31 @@ use crate::rpc::association::Fault;
 use crate::rpc::pdu::NCA_OP_RNG_ERROR;
 use crate::server::{Caller, ServerState};
 
+/// `lsa_Close` (MS-LSAD 3.1.4.4.1). Closes a policy handle and nulls it in the reply.
+///
+/// A join closes the handle it opened before it does anything else with what it learned, so a
+/// refusal here arrives at a point where the client has already succeeded - and a refusal at that
+/// point reads as a failure of the whole exchange.
+pub(crate) const OPNUM_CLOSE: u16 = 0;
+
+/// The handle the client sent, nulled, and the status last.
+///
+/// `lsa_Close` takes `[in,out] policy_handle *handle` and must write NULL back into it (MS-LSAD
+/// 3.1.4.4.1): a client that keeps the value it sent would use a handle the server has forgotten.
+fn close_handle(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    const HANDLE: usize = 20;
+    if stub.len() < HANDLE {
+        return Err(Fault {
+            status: crate::rpc::pdu::NCA_PROTO_ERROR,
+            did_not_execute: true,
+        });
+    }
+    let mut writer = NdrWriter::new();
+    writer.bytes(&[0u8; HANDLE]);
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
+}
+
 /// `lsa_OpenPolicy` (MS-LSAD 3.1.4.4.3). The older of the two calls that open a policy handle, and
 /// the one Samba's join actually makes: implementing only `OpenPolicy2` answered a join with "the
 /// procedure number is out of range", which names nothing and reads as a protocol mismatch.
@@ -87,6 +112,7 @@ pub(crate) async fn serve(
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
     match opnum {
+        OPNUM_CLOSE => close_handle(stub),
         OPNUM_OPEN_POLICY => open_policy_v1(stub),
         OPNUM_OPEN_POLICY2 => open_policy(stub),
         OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(server, stub),
