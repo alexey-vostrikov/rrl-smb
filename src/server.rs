@@ -189,6 +189,14 @@ pub struct ServerConfig {
     /// against the realm it was told, and a wrong answer sends it looking for a domain that is not
     /// this one. Absent means "not stated", and the answer falls back to the NetBIOS name.
     pub dns_domain: Option<String>,
+    /// The domain's SID, as the twenty-four and more octets a directory stores.
+    ///
+    /// `lsarpc` reports it inside the DNS domain information, and a member's join reads it there:
+    /// Samba dups the pointer without checking it, so a NULL here is a join that fails on an
+    /// allocation it cannot explain. Kept as wire bytes because the directory already holds it in
+    /// exactly this form, and re-deriving it from fields would be a second way to be wrong about
+    /// the same number.
+    pub domain_sid: Option<Vec<u8>>,
     pub max_read_size: u32,
     pub max_write_size: u32,
     pub server_guid: Uuid,
