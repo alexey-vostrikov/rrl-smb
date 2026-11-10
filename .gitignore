@@ -1,3 +1,7 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+
+# cargo-mutants writes its report beside the crate
+/mutants.out
+/mutants.out.old

@@ -16,7 +16,12 @@ features = ["krb5"]
 # The suite is fast (714 unit tests, ~3 s) but the build is not: a mutant that hangs is a mutant
 # whose timeout should be generous enough to be about the mutant, not about a cold cache.
 timeout_multiplier = 2.0
-build_timeout_multiplier = 2.0
+
+# Four, not two, and the reason is measured: eight mutant builds started at once on this machine
+# take 87 s each where one takes 45 s, because every `cargo build` wants the whole machine and they
+# fight for it. At the default multiplier of two that was 57 mutants reporting 55 timeouts - a
+# verdict about the timeouts, not about the tests.
+build_timeout_multiplier = 4.0
 
 # `cargo` on purpose: `nextest` is not in the toolchain image, and a `test_tool` naming a binary
 # that is absent turns every mutant into a build failure that reads like a survivor.
