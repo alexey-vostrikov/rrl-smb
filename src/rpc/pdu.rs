@@ -79,6 +79,21 @@ pub(crate) const LSARPC: SyntaxId = SyntaxId {
     version: 0,
 };
 
+/// samr **1.0**, 12345778-1234-abcd-ef00-0123456789ac (MS-SAMR 2.1).
+///
+/// The interface a member's join creates its machine account through: `samr_Connect2`,
+/// `samr_OpenDomain`, `samr_CreateUser2`, then the account's password. Same UUID prefix as `lsarpc`
+/// and a different version and last octet - which is why the two are compared as whole syntax ids:
+/// copied from `lsarpc` as 0.0, this was rejected on every bind, and the client reported
+/// `{Buffer Too Small}` from the pipe open rather than a rejected interface.
+pub(crate) const SAMR: SyntaxId = SyntaxId {
+    uuid: [
+        0x78, 0x57, 0x34, 0x12, 0x34, 0x12, 0xcd, 0xab, 0xef, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xac,
+    ],
+    version: 1,
+};
+
 /// First half of a bind time feature negotiation syntax, 6cb71c2c-9812-4540
 /// (MS-RPCE 3.3.1.5.3). The other eight bytes are the feature bitmask.
 const FEATURE_PREFIX: [u8; 8] = [0x2c, 0x1c, 0xb7, 0x6c, 0x12, 0x98, 0x40, 0x45];

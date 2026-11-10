@@ -227,6 +227,10 @@ impl Pipe {
                             crate::rpc::lsarpc::serve(server, &self.caller, call.opnum, &call.stub)
                                 .await
                         }
+                        Some(syntax) if syntax == crate::rpc::pdu::SAMR => {
+                            crate::rpc::samr::serve(server, &self.caller, call.opnum, &call.stub)
+                                .await
+                        }
                         Some(syntax) if syntax == crate::rpc::pdu::SRVSVC => {
                             srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await
                         }

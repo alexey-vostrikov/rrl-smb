@@ -385,3 +385,37 @@ async fn pipe_opens_are_released_on_every_path() {
         assert_eq!(open_count(&peer), 0, "{path}");
     }
 }
+
+#[tokio::test]
+async fn the_pipes_a_join_opens_are_named_the_way_a_client_names_them() {
+    // `lsarpc` then `samr`, in that order, and either name with or without the leading separator:
+    // a client may spell a channel either way, and a server that refused one spelling refused the
+    // join for a reason the client could not see. Both of these were missing at some point, and
+    // each time the failure read as a transport problem rather than as a missing pipe.
+    let state = server();
+    for name in ["lsarpc", "\\lsarpc", "LSARPC", "samr", "\\samr", "SAMR"] {
+        let mut peer = Peer::on_ipc(&state, false).await;
+        let (_, reply) = peer
+            .request(&state, Command::Create, &create_body(name))
+            .await;
+        assert_eq!(status(&reply), 0, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_pipe_this_server_does_not_serve_is_refused_by_name() {
+    // The control for the test above: the list of known pipes must still refuse what it does not
+    // serve, or "every name opens" would pass while the server accepted anything at all.
+    let state = server();
+    for name in ["samr2", "netlogon", ""] {
+        let mut peer = Peer::on_ipc(&state, false).await;
+        let (_, reply) = peer
+            .request(&state, Command::Create, &create_body(name))
+            .await;
+        assert_eq!(
+            status(&reply),
+            ntstatus::STATUS_OBJECT_NAME_NOT_FOUND,
+            "{name}"
+        );
+    }
+}
