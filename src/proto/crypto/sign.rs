@@ -1,23 +1,30 @@
 //! SMB2/3 message signing per MS-SMB2 §3.1.4.1.
 //!
-//! Two algorithms are supported:
+//! Three algorithms are supported:
 //! 1. **HMAC-SHA-256** for SMB 2.0.2 / 2.1.
-//! 2. **AES-CMAC** for SMB 3.0+.
+//! 2. **AES-CMAC** for SMB 3.0+, and the default for 3.1.1.
+//! 3. **AES-128-GMAC** for SMB 3.1.1, when the client's SIGNING_CAPABILITIES
+//!    context lists it and no earlier algorithm.
 //!
-//! Both produce a 16-byte signature that lives at bytes 48..64 of the SMB2
-//! header (the `Signature` field, MS-SMB2 §2.2.1.2).
+//! All three produce a 16-byte signature that lives at bytes 48..64 of the SMB2
+//! header (the `Signature` field, MS-SMB2 §2.2.1.2), and all three authenticate
+//! the message with that field zeroed. They differ in what else they take:
 //!
-//! Algorithm:
-//! 1. Zero out bytes 48..64 of the message.
-//! 2. Compute MAC over the **entire** message (header + body).
-//! 3. Place the first 16 bytes of MAC at bytes 48..64.
+//! * HMAC-SHA-256 and AES-CMAC take the message and nothing else.
+//! * AES-128-GMAC takes a nonce built from the MessageId and two flag bits, and
+//!   the message as associated data. The nonce is why `gmac_nonce` exists and
+//!   why it converts endianness: the header stores those fields little-endian
+//!   and the nonce takes them big-endian.
 
 use aes::Aes128;
+use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{AeadInPlace, KeyInit};
 use cmac::Cmac;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::proto::error::{ProtoError, ProtoResult};
+use crate::proto::header::{SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_SERVER_TO_REDIR};
 
 type HmacSha256 = Hmac<Sha256>;
 type CmacAes128 = Cmac<Aes128>;
@@ -27,6 +34,14 @@ const SIG_OFF: usize = 48;
 const SIG_LEN: usize = 16;
 const SMB2_HEADER_LEN: usize = 64;
 
+/// `SMB2_OP_CANCEL` (MS-SMB2 §2.2.1.2): the one opcode whose header fields the
+/// GMAC nonce reads as something other than a command's.
+const OP_CANCEL: u16 = 0x000C;
+
+/// Field offsets inside the fixed 64-byte header (MS-SMB2 §2.2.1.2).
+const OFF_FLAGS: usize = 16;
+const OFF_MESSAGE_ID: usize = 24;
+
 /// Which signing algorithm to use for a given session/dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigningAlgo {
@@ -34,6 +49,31 @@ pub enum SigningAlgo {
     HmacSha256,
     /// AES-CMAC over AES-128, used by SMB 3.0+.
     AesCmac,
+    /// AES-128-GMAC, offered by SMB 3.1.1 (MS-SMB2 §3.1.4.1).
+    AesGmac,
+}
+
+impl SigningAlgo {
+    /// The id this algorithm has in a SIGNING_CAPABILITIES negotiate context.
+    pub fn id(self) -> u16 {
+        match self {
+            Self::HmacSha256 => 0x0000,
+            Self::AesCmac => 0x0001,
+            Self::AesGmac => 0x0002,
+        }
+    }
+
+    /// The algorithm an id names, for the two this crate implements.
+    ///
+    /// `None` for anything else: a client may list algorithms nobody implements (Samba lists one
+    /// that nobody does), and a list that mentions a name is not a request for it.
+    pub fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0x0001 => Some(Self::AesCmac),
+            0x0002 => Some(Self::AesGmac),
+            _ => None,
+        }
+    }
 }
 
 /// Compute the 16-byte MAC over `msg` as if the SMB2 signature field were
@@ -63,8 +103,71 @@ fn compute_mac_zeroed_signature(msg: &[u8], key: &[u8; 16], algo: SigningAlgo) -
             let full = mac.finalize().into_bytes();
             out.copy_from_slice(&full[..SIG_LEN]);
         }
+        SigningAlgo::AesGmac => {
+            // GMAC and CMAC differ in more than the primitive: GMAC is an AEAD tag taken over the
+            // message as associated data, under a nonce that carries the MessageId and the flags.
+            // The message is authenticated with its signature field zeroed, exactly as the two MACs
+            // above are - but an AEAD takes one contiguous slice of associated data, so the zeroing
+            // happens in a copy rather than by feeding three pieces.
+            let nonce = gmac_nonce(msg);
+            let mut aad = msg.to_vec();
+            aad[SIG_OFF..SIG_OFF + SIG_LEN].fill(0);
+
+            let mut plaintext: [u8; 0] = [];
+            let tag = <Aes128Gcm as AeadInPlace>::encrypt_in_place_detached(
+                &Aes128Gcm::new_from_slice(key).expect("AES-128-GMAC requires a 16-byte key"),
+                (&nonce).into(),
+                &aad,
+                &mut plaintext,
+            );
+            match tag {
+                Ok(tag) => out.copy_from_slice(&tag),
+                // Reachable only for a message this crate built itself, and the honest answer to a
+                // tag that could not be produced is a refusal, not a zero signature: a zero
+                // signature over a message the client is told to trust is worse than no answer.
+                Err(_) => {
+                    debug_assert!(false, "GMAC over a well-formed header cannot fail");
+                    out = [0xFF; SIG_LEN];
+                }
+            }
+        }
     }
     out
+}
+
+/// The nonce GMAC signs under (MS-SMB2 §3.1.4.1, and Samba's `smb2_signing_sign_pdu`).
+///
+/// Twelve octets: the MessageId, then the two flag bits that make a message unique without being
+/// part of its id - `SERVER_TO_REDIR`, so a response and a request with the same MessageId sign
+/// differently, and `ASYNC_COMMAND` for a CANCEL, whose status and id fields carry something else.
+///
+/// Both fields are stored **little-endian**, matching the header they are read from: Samba's
+/// `SBVAL(iv, 0, msg_id)` is `PUSH_LE_U64`, and the flags land at octet 8 as a little-endian
+/// value. Writing them big-endian produces signatures that verify against themselves and against
+/// nothing else, which is how this was first written and how the stand caught it - Samba answered
+/// `Bad SMB2 (sign_algo_id=2) signature for message`.
+fn gmac_nonce(msg: &[u8]) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    let message_id = u64::from_le_bytes(
+        msg[OFF_MESSAGE_ID..OFF_MESSAGE_ID + 8]
+            .try_into()
+            .expect("a 64-byte header"),
+    );
+    let flags = u32::from_le_bytes(
+        msg[OFF_FLAGS..OFF_FLAGS + 4]
+            .try_into()
+            .expect("a 64-byte header"),
+    );
+    let command = u16::from_le_bytes(msg[12..14].try_into().expect("a 64-byte header"));
+
+    let mut high_bits = flags & SMB2_FLAGS_SERVER_TO_REDIR;
+    if command == OP_CANCEL {
+        high_bits |= SMB2_FLAGS_ASYNC_COMMAND;
+    }
+
+    nonce[..8].copy_from_slice(&message_id.to_le_bytes());
+    nonce[8..].copy_from_slice(&high_bits.to_le_bytes());
+    nonce
 }
 
 /// Compute and embed a signature in `msg`. Mutates `msg` in place.
@@ -163,6 +266,85 @@ mod tests {
         sign(&mut msg, &key, SigningAlgo::AesCmac).expect("sign ok");
         assert_ne!(&msg[SIG_OFF..SIG_OFF + SIG_LEN], &[0u8; 16]);
         verify(&msg, &key, SigningAlgo::AesCmac).expect("verify ok");
+    }
+
+    #[test]
+    fn sign_and_verify_aes_gmac() {
+        let key = [0x55u8; 16];
+        let mut msg = fixture_message();
+        sign(&mut msg, &key, SigningAlgo::AesGmac).expect("sign ok");
+        assert_ne!(&msg[SIG_OFF..SIG_OFF + SIG_LEN], &[0u8; 16]);
+        verify(&msg, &key, SigningAlgo::AesGmac).expect("verify ok");
+    }
+
+    /// The nonce rule, pinned byte for byte: both fields leave the header as they arrived.
+    ///
+    /// A version that converts endianness round-trips against itself and fails against every other
+    /// implementation, so the bytes are asserted rather than round-tripped.
+    #[test]
+    fn gmac_nonce_is_message_id_then_high_bits_little_endian() {
+        let mut msg = fixture_message();
+        // MessageId 0x0102_0304_0506_0708, stored little-endian as the header does.
+        msg[24..32].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        // SERVER_TO_REDIR set, ASYNC clear, command NEGOTIATE.
+        msg[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&SMB2_FLAGS_SERVER_TO_REDIR.to_le_bytes());
+
+        assert_eq!(
+            gmac_nonce(&msg),
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00
+            ],
+            "message id little-endian, then the redir bit little-endian"
+        );
+
+        // A request (no SERVER_TO_REDIR) and the response to it share a MessageId and must not
+        // share a nonce, or the two GMACs are over the same nonce and different data.
+        msg[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(&gmac_nonce(&msg)[8..], &[0, 0, 0, 0]);
+    }
+
+    /// A CANCEL carries ASYNC in the nonce whatever its Flags say (MS-SMB2 §3.1.4.1).
+    #[test]
+    fn gmac_nonce_sets_async_for_cancel() {
+        let mut msg = fixture_message();
+        msg[12..14].copy_from_slice(&OP_CANCEL.to_le_bytes());
+        msg[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            &gmac_nonce(&msg)[8..12],
+            &SMB2_FLAGS_ASYNC_COMMAND.to_le_bytes(),
+            "a cancel signs under the async bit"
+        );
+    }
+
+    /// The same message under the same key signs differently in CMAC and in GMAC: the algorithms
+    /// are not interchangeable, so a connection that picked one must not verify with the other.
+    #[test]
+    fn gmac_and_cmac_disagree() {
+        let key = [0x33u8; 16];
+        let mut cmac = fixture_message();
+        let mut gmac = fixture_message();
+        sign(&mut cmac, &key, SigningAlgo::AesCmac).expect("sign ok");
+        sign(&mut gmac, &key, SigningAlgo::AesGmac).expect("sign ok");
+        assert_ne!(
+            &cmac[SIG_OFF..SIG_OFF + SIG_LEN],
+            &gmac[SIG_OFF..SIG_OFF + SIG_LEN]
+        );
+        assert!(matches!(
+            verify(&cmac, &key, SigningAlgo::AesGmac),
+            Err(ProtoError::Crypto(_))
+        ));
+    }
+
+    #[test]
+    fn tamper_outside_sig_fails_verify_gmac() {
+        let key = [0xAAu8; 16];
+        let mut msg = fixture_message();
+        sign(&mut msg, &key, SigningAlgo::AesGmac).expect("sign ok");
+        msg[80] ^= 0x01;
+        assert!(matches!(
+            verify(&msg, &key, SigningAlgo::AesGmac),
+            Err(ProtoError::Crypto(_))
+        ));
     }
 
     #[test]
