@@ -140,9 +140,20 @@ fn read_contexts(body: &[u8], req: &NegotiateRequest) -> Result<ClientContexts, 
             if caps.signing_algorithm_count == 0 {
                 return Err(invalid);
             }
-            // AES-CMAC is the one 3.1.1 algorithm implemented, and the
-            // answer when the client lists none of the server's.
-            Some(SigningCapabilities::ALGORITHM_AES_CMAC)
+            let chosen = select_signing(&caps.signing_algorithms)?;
+            // Both halves of the choice in one line: a client that offers only GMAC and a server
+            // that answers CMAC is a bug that shows up as a failed signature several messages later,
+            // far from this decision.
+            tracing::debug!(
+                offered = ?caps
+                    .signing_algorithms
+                    .iter()
+                    .map(|id| format!("{id:04x}"))
+                    .collect::<Vec<_>>(),
+                chosen = format!("{chosen:04x}"),
+                "negotiate: signing algorithm"
+            );
+            Some(chosen)
         }
         None => None,
     };
@@ -161,6 +172,23 @@ fn read_contexts(body: &[u8], req: &NegotiateRequest) -> Result<ClientContexts, 
         signing_algorithm,
         cipher,
     })
+}
+
+/// The signing algorithm to answer with, from the client's list (MS-SMB2 §3.2.5.3.1).
+///
+/// The client's order decides: the first algorithm in its list that this crate implements. A
+/// server that answered a fixed algorithm - which is what this did while CMAC was the only one
+/// implemented - names an algorithm a client may never have offered, and the signatures that
+/// follow are the first thing to disagree.
+///
+/// No overlap is a refusal, not a fallback: a signature the other end cannot verify fails later,
+/// on a message whose failure looks like corruption rather than like a negotiation that went wrong.
+fn select_signing(algorithms: &[u16]) -> Result<u16, u32> {
+    algorithms
+        .iter()
+        .find_map(|id| SigningAlgo::from_id(*id))
+        .map(|algo| algo.id())
+        .ok_or(ntstatus::STATUS_NOT_SUPPORTED)
 }
 
 pub async fn handle(
@@ -203,6 +231,13 @@ pub async fn handle(
     *conn.client_guid.write().await = Uuid::from_bytes(req.client_guid);
     *conn.signing_algo.write().await = match dialect {
         Dialect::Smb202 | Dialect::Smb210 => SigningAlgo::HmacSha256,
+        // 3.1.1 signs with whichever algorithm the negotiation settled on; every earlier 3.x dialect
+        // has only CMAC, and so does a 3.1.1 client that sent no SIGNING_CAPABILITIES context.
+        Dialect::Smb311 => contexts
+            .as_ref()
+            .and_then(|c| c.signing_algorithm)
+            .and_then(SigningAlgo::from_id)
+            .unwrap_or(SigningAlgo::AesCmac),
         _ => SigningAlgo::AesCmac,
     };
     *conn.cipher.write().await = match (dialect, &contexts) {
@@ -404,4 +439,44 @@ pub async fn multi_protocol_response(
     let mut hr = HandlerResponse::ok(body_out);
     hr.skip_signing = true;
     hr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Samba 4.17 lists CMAC alone; Windows 2022 lists GMAC first. Both must get an answer they
+    /// can sign with, and the answer must be one they listed.
+    #[test]
+    fn select_signing_follows_the_client_order() {
+        assert_eq!(
+            select_signing(&[SigningAlgo::AesCmac.id()]),
+            Ok(SigningAlgo::AesCmac.id())
+        );
+        assert_eq!(
+            select_signing(&[SigningAlgo::AesGmac.id()]),
+            Ok(SigningAlgo::AesGmac.id())
+        );
+        assert_eq!(
+            select_signing(&[SigningAlgo::AesGmac.id(), SigningAlgo::AesCmac.id()]),
+            Ok(SigningAlgo::AesGmac.id()),
+            "the client's order wins, not this crate's preference"
+        );
+        // An algorithm nobody implements is skipped, not chosen: a list that mentions HMAC-SHA-256
+        // alongside CMAC still negotiates CMAC, because 3.1.1 does not offer SHA-256 there.
+        assert_eq!(
+            select_signing(&[0x0000, SigningAlgo::AesCmac.id()]),
+            Ok(SigningAlgo::AesCmac.id())
+        );
+    }
+
+    /// Nothing in common is a refusal at negotiation, with a status that names the cause.
+    #[test]
+    fn select_signing_refuses_a_list_it_cannot_sign_with() {
+        assert_eq!(select_signing(&[]), Err(ntstatus::STATUS_NOT_SUPPORTED));
+        assert_eq!(
+            select_signing(&[0x0000, 0x7FFF]),
+            Err(ntstatus::STATUS_NOT_SUPPORTED)
+        );
+    }
 }
