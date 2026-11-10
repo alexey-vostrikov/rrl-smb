@@ -71,7 +71,13 @@ socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
 # Kerberos accept side, in pure Rust: no libgssapi, no Heimdal, no C. The GSS-API framing, the token
 # ids, the AP-REP envelope and the PAC all come from here rather than from this crate.
-krb5 = { version = "1.0", optional = true }
+#
+# From the fork, so that this crate and rust-rest-ldap share one krb5: two copies of the crate in
+# one dependency graph is two copies of every Kerberos type, and a `Ticket` from one does not
+# convert to the other without a round trip through the wire. What the fork adds over the 1.0.0
+# release is DER and `KerberosTime` taken from `rrl-krb`, so both sides read one encoding, and a
+# `Key` that wipes its octets on drop. Move it back to `krb5 = "1.0"` when those reach a release.
+krb5 = { git = "https://github.com/alexey-vostrikov/krb5", branch = "main", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
