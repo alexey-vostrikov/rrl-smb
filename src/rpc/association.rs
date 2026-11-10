@@ -8,10 +8,10 @@
 use tracing::debug;
 
 use super::pdu::{
-    self, Body, ContextElem, ContextResult, FAULT_ACCESS_DENIED, Header, MAX_FRAG, NCA_PROTO_ERROR,
-    LSARPC, NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, PFC_DID_NOT_EXECUTE, PFC_FIRST_FRAG, PFC_LAST_FRAG,
-    PTYPE_ALTER_CONTEXT, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND, PTYPE_BIND_ACK, RESPONSE_HEADER_LEN,
-    Request, SRVSVC, SyntaxId,
+    self, Body, ContextElem, ContextResult, FAULT_ACCESS_DENIED, Header, LSARPC, MAX_FRAG,
+    NCA_PROTO_ERROR, NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, PFC_DID_NOT_EXECUTE, PFC_FIRST_FRAG,
+    PFC_LAST_FRAG, PTYPE_ALTER_CONTEXT, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND, PTYPE_BIND_ACK,
+    RESPONSE_HEADER_LEN, Request, SAMR, SRVSVC, SyntaxId,
 };
 
 /// Largest request stub one call may reassemble.
@@ -329,6 +329,15 @@ impl Association {
         debug!(
             max_frag = self.max_frag,
             assoc_group = self.assoc_group_id,
+            // What was asked and what was granted, kept because a rejected interface and a
+            // rejected transfer syntax both come back as one nameless refusal: three runs were lost
+            // to a version octet and to a missing interface in this list.
+            asked = ?bind
+                .contexts
+                .iter()
+                .map(|c| (c.id, c.abstract_syntax.version))
+                .collect::<Vec<_>>(),
+            results = ?results.iter().map(|r| (r.result, r.reason)).collect::<Vec<_>>(),
             contexts = ?self.contexts,
             "rpc bind"
         );
@@ -407,7 +416,10 @@ impl Association {
                 // The interfaces this server carries. Not a list of everything RPC
                 // defines: a context accepted for an interface nobody implements would
                 // fail at the first call with a fault the client cannot read.
-                if c.abstract_syntax != SRVSVC && c.abstract_syntax != LSARPC {
+                if c.abstract_syntax != SRVSVC
+                    && c.abstract_syntax != LSARPC
+                    && c.abstract_syntax != SAMR
+                {
                     return reject(ABSTRACT_SYNTAX_NOT_SUPPORTED);
                 }
                 if !c.transfer_syntaxes.contains(&NDR) {
@@ -582,6 +594,44 @@ mod tests {
             }
         }
         finish(out)
+    }
+
+    fn samr_bind(call_id: u32) -> Vec<u8> {
+        bind_pdu(PTYPE_BIND, call_id, (4280, 4280), 0, &[(0, SAMR, &[NDR])])
+    }
+
+    #[test]
+    fn the_samr_interface_is_accepted_on_a_bind() {
+        // Measured on the join stand: with the syntax rejected, the bind_ack carried no accepted
+        // context, and Samba reported `{Buffer Too Small}` from `cli_rpc_pipe_open_noauth` - a
+        // refusal that named the buffer rather than the interface.
+        let mut a = Association::default();
+        let ack = one(a.receive(&samr_bind(1)));
+
+        // Version 1.0, not 0.0: copied from `lsarpc`, the interface was rejected on every bind and
+        // the client reported a buffer problem from the pipe open.
+        assert_eq!(SAMR.version, 1);
+
+        let (_, _, results) = ack_of(&ack);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0, "accepted");
+        assert_eq!(results[0].2, NDR);
+
+        // And the association remembers it, so a call on context 0 reaches a handler instead of
+        // being refused as a context nobody bound.
+        assert_eq!(a.interface_of(0), Some(SAMR));
+    }
+
+    #[test]
+    fn an_interface_this_server_does_not_carry_is_still_rejected() {
+        // The control: adding samr must not turn the bind into "anything is accepted", or the
+        // first call on a foreign interface would fault with something unreadable.
+        let bind = bind_pdu(PTYPE_BIND, 1, (4280, 4280), 0, &[(0, OTHER, &[NDR])]);
+        let mut a = Association::default();
+        let ack = one(a.receive(&bind));
+
+        assert_eq!(ack_of(&ack).2[0].0, 2, "provider_rejection");
+        assert_eq!(a.interface_of(0), None);
     }
 
     fn srvsvc_bind(call_id: u32) -> Vec<u8> {
