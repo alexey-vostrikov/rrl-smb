@@ -33,6 +33,17 @@ impl<'a> NdrReader<'a> {
         Some(self.u32()? != 0)
     }
 
+    /// `len` fixed octets, aligned to four: a struct that travels inline, such as a context handle.
+    ///
+    /// Alignment to four because that is what a context handle's own alignment is (its first field
+    /// is `uint32 context_type`), and reading it unaligned shifts every field after it.
+    pub(crate) fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        let at = self.at.next_multiple_of(4);
+        let bytes = self.stub.get(at..at + len)?;
+        self.at = at + len;
+        Some(bytes)
+    }
+
     /// A conformant varying string of UTF-16 units (C706 14.3.4.2), without
     /// its terminating NUL when it has one. The offset must be 0, and the
     /// string must hold 1 to 1024 units, no more than its maximum count.

@@ -75,13 +75,8 @@ async fn only_the_implemented_pipes_open() {
     // The name is matched without its leading separators and without regard to case: a client that
     // writes `\PIPE\LSARPC` means the same pipe as one that writes `lsarpc`.
     for name in [
-        "srvsvc",
-        "SRVSVC",
-        "SrvSvc",
-        "\\srvsvc",
-        "lsarpc",
-        "LSARPC",
-        "\\lsarpc",
+        "srvsvc", "SRVSVC", "SrvSvc", "\\srvsvc", "lsarpc", "LSARPC", "\\lsarpc", "samr", "SAMR",
+        "\\samr",
     ] {
         c.open_pipe(name).await.expect(name);
     }
