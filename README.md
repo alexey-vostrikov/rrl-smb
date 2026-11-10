@@ -108,7 +108,7 @@ After 10 failed logons for one user name, each within 60 seconds of the one befo
 
 ## Signing
 
-Signed sessions use HMAC-SHA-256 on SMB 2.0.2 and 2.1 and AES-CMAC on SMB 3.x. `require_signing(true)` on the builder makes every authenticated session sign its requests and tells clients in the NEGOTIATE response that signing is required. With it off, a client can still require signing for its own sessions.
+Signed sessions use HMAC-SHA-256 on SMB 2.0.2 and 2.1, and AES-128-CMAC or AES-128-GMAC on SMB 3.x — GMAC only where a 3.1.1 client asks for it. The algorithm is the first one in the client's `SIGNING_CAPABILITIES` list that this crate implements, as MS-SMB2 3.2.5.3.1 requires; a client whose list has nothing in common is refused at NEGOTIATE rather than answered with an algorithm it never offered. `require_signing(true)` on the builder makes every authenticated session sign its requests and tells clients in the NEGOTIATE response that signing is required. With it off, a client can still require signing for its own sessions.
 
 ## Encryption
 
@@ -226,11 +226,11 @@ On the host firewall, open UDP port 5353 for mDNS, and UDP port 3702 and TCP por
 Not supported:
 
 - SMB1
-- Kerberos and NTLMv1; authentication is NTLMv2 only
+- NTLMv1. Sessions authenticate with NTLMv2, or with Kerberos when the `krb5` feature is built and a keytab or acceptor is configured; without that feature nothing in the crate names Kerberos.
 - oplocks and directory leases
 - answering a replayed CREATE with the open it repeats, and persistent and resilient handles
 - change notifications for changes made outside the server or through another share over the same directory, except with `LocalFsBackend` on Linux for the entries directly in a watched folder
-- named pipes other than `srvsvc`, and RPC calls other than listing shares and describing the server
+- named pipes other than `srvsvc`, `lsarpc` and `samr`, and RPC calls beyond listing shares, describing the server, and the LSA and SAMR calls those two pipes answer
 - DFS
 - multichannel and compression
 - transports other than direct TCP: NetBIOS sessions, QUIC and RDMA
