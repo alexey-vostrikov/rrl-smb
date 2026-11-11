@@ -110,8 +110,12 @@ pub(crate) struct Association {
 #[derive(Debug)]
 struct SealedChannel {
     key: [u8; 32],
-    next_in: u64,
-    next_out: u64,
+    /// One counter for both directions, because that is what the protocol keeps: every packet either
+    /// way takes the next number - `netsec_do_seq_num` increments the same field `SETUP_SEQNUM`
+    /// reads - so a client's first request is 0 and the answer to it is 1. A pair of counters, which
+    /// this file had, numbers the answer 0, and the client - expecting 1 - refuses it with
+    /// `ACCESS_DENIED` and a sentence about an unexpected RPC packet type.
+    next_seq: u64,
 }
 
 /// A negotiated authentication this server has not yet had proved.
@@ -276,11 +280,11 @@ impl Association {
             let sig = self.seal.as_mut().map(|channel| {
                 let sig = crate::rpc::schannel::seal(
                     &channel.key,
-                    channel.next_out,
+                    channel.next_seq,
                     false,
                     &mut fragment,
                 );
-                channel.next_out += 1;
+                channel.next_seq += 1;
                 sig
             });
             let auth = sig.as_ref().map(|sig| pdu::AuthReply {
@@ -617,15 +621,11 @@ impl Association {
                 debug!(%computer, "rpc: no channel key for this client");
                 return Some(self.refuse(header, request.context_id, FAULT_ACCESS_DENIED));
             };
-            let channel = self.seal.get_or_insert(SealedChannel {
-                key,
-                next_in: 0,
-                next_out: 0,
-            });
+            let channel = self.seal.get_or_insert(SealedChannel { key, next_seq: 0 });
             let mut stub = request.stub.to_vec();
             if let Err(err) = crate::rpc::schannel::unseal(
                 &channel.key,
-                channel.next_in,
+                channel.next_seq,
                 true,
                 auth.token,
                 &mut stub,
@@ -633,7 +633,7 @@ impl Association {
                 debug!(?err, "rpc: a call whose signature does not check out");
                 return Some(self.refuse(header, request.context_id, FAULT_ACCESS_DENIED));
             }
-            channel.next_in += 1;
+            channel.next_seq += 1;
             // The authentication padding travels inside the sealed payload and is not an argument.
             let pad = usize::from(auth.auth_pad_length);
             stub.truncate(stub.len().saturating_sub(pad));
@@ -1424,11 +1424,7 @@ mod tests {
             computer: "SAMBA".to_string(),
             flags: 0x0001,
         });
-        a.seal = Some(SealedChannel {
-            key,
-            next_in: 0,
-            next_out: 0,
-        });
+        a.seal = Some(SealedChannel { key, next_seq: 0 });
 
         let lookups = std::cell::Cell::new(0usize);
         let key_for = |computer: &str| {
@@ -1461,9 +1457,9 @@ mod tests {
         let trailer_at = frag - auth_len - 8;
         assert_eq!(answer[trailer_at], 68, "NETLOGON auth type");
 
-        // Opens with this server as the responder: counter 0, initiator bit clear.
+        // The one counter both directions share: the request took 0, so the answer takes 1.
         let mut payload = answer[24..trailer_at].to_vec();
-        crate::rpc::schannel::unseal(&key, 0, false, &answer[trailer_at + 8..], &mut payload)
+        crate::rpc::schannel::unseal(&key, 1, false, &answer[trailer_at + 8..], &mut payload)
             .expect("the answer opens under the channel");
         assert_eq!(payload, vec![0xAA; 4]);
     }
@@ -1479,8 +1475,7 @@ mod tests {
         });
         a.seal = Some(SealedChannel {
             key: [7; 32],
-            next_in: 0,
-            next_out: 0,
+            next_seq: 0,
         });
 
         let request = request_pdu(9, PFC_FIRST_FRAG, 0, 21, &[0; 16]);
