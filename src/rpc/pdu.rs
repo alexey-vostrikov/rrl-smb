@@ -342,6 +342,19 @@ pub(crate) struct ContextResult {
     pub transfer_syntax: SyntaxId,
 }
 
+/// A verifier this server puts at the end of a PDU.
+///
+/// The mirror of [`AuthVerifier`]: the same `sec_trailer`, with a token this side made. `auth_pad_length`
+/// is the padding the BODY needs, not the token, so it is zero unless a body was padded to align.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthReply<'a> {
+    pub auth_type: u8,
+    pub auth_level: u8,
+    pub auth_pad_length: u8,
+    pub auth_context_id: u32,
+    pub token: &'a [u8],
+}
+
 /// A bind_ack, or an alter_context_resp with `ptype` 15 (C706 12.6.4.2,
 /// 12.6.4.4). Both fragment sizes are `max_frag`. An empty
 /// `secondary_address` is sent as length 0.
@@ -352,6 +365,7 @@ pub(crate) fn bind_ack(
     assoc_group_id: u32,
     secondary_address: &str,
     results: &[ContextResult],
+    auth: Option<&AuthReply<'_>>,
 ) -> Vec<u8> {
     let mut out = header(ptype, PFC_FIRST_FRAG | PFC_LAST_FRAG, call_id);
     out.extend_from_slice(&max_frag.to_le_bytes());
@@ -372,6 +386,15 @@ pub(crate) fn bind_ack(
         out.extend_from_slice(&r.result.to_le_bytes());
         out.extend_from_slice(&r.reason.to_le_bytes());
         r.transfer_syntax.write(&mut out);
+    }
+    if let Some(auth) = auth {
+        // The sec_trailer goes after the body, and its `auth_pad_length` counts padding already
+        // added to the body to reach a four-octet boundary.
+        out.extend_from_slice(&[auth.auth_type, auth.auth_level, auth.auth_pad_length, 0]);
+        out.extend_from_slice(&auth.auth_context_id.to_le_bytes());
+        out.extend_from_slice(auth.token);
+        let auth_len = u16::try_from(auth.token.len()).expect("a token shorter than 64k");
+        out[10..12].copy_from_slice(&auth_len.to_le_bytes());
     }
     finish(out)
 }
@@ -513,7 +536,15 @@ pub(crate) mod tests {
                 transfer_syntax: zero,
             },
         ];
-        let ack = bind_ack(PTYPE_BIND_ACK, 2, 4280, 0x12345, "\\PIPE\\srvsvc", &results);
+        let ack = bind_ack(
+            PTYPE_BIND_ACK,
+            2,
+            4280,
+            0x12345,
+            "\\PIPE\\srvsvc",
+            &results,
+            None,
+        );
         // The feature element's reason is ours: 0x0002, where the vector
         // was generated with 0x0003.
         let mut expected = unhex(BIND_ACK_3CTX);
@@ -523,7 +554,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_empty_secondary_address_is_a_zero_length() {
-        let ack = bind_ack(PTYPE_ALTER_CONTEXT_RESP, 9, 2048, 7, "", &[]);
+        let ack = bind_ack(PTYPE_ALTER_CONTEXT_RESP, 9, 2048, 7, "", &[], None);
         assert_eq!(ack.len(), 32);
         assert_eq!(&ack[24..28], [0, 0, 0, 0]);
         assert_eq!(ack[28], 0);
