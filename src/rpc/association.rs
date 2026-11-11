@@ -244,6 +244,16 @@ impl Association {
             return Some(self.protocol_error(call_id));
         };
         let header = pdu.header;
+        // The verifier as it arrives: sec_trailer (8 octets) then the token. The IDL does not
+        // carry an NTLMSSP token, so the shape the parser is written against comes from here.
+        if header.auth_length > 0 && std::env::var_os("RPCE_DUMP").is_some() {
+            debug!(
+                ptype = header.ptype,
+                auth_len = header.auth_length,
+                hex = %bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "rpc: authenticated pdu"
+            );
+        }
         let step = self.dispatch(&header, pdu.body);
         self.current_call_id = self.current_call_id.max(header.call_id);
         step
