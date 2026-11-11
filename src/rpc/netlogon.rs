@@ -215,10 +215,16 @@ fn authenticate3(
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    // Deferred, as in `ServerReqChallenge`: the pointer is inline, the string is not.
-    let _server_name = reader.pointer();
+    // The pointer, then **its string**: `server_name` travels inline directly behind the pointer,
+    // as measured on this call from a live client - `0x00020000` then the UNC `\\samba.…`. Skipping
+    // that string made the account name the server's own UNC, and the lookup then reported
+    // `NO_SUCH_USER` for a machine account that existed.
+    let server_name_present = reader.pointer().unwrap_or(false);
+    if server_name_present && reader.string().is_none() {
+        return Err(malformed_hex("server_name", stub));
+    }
     let Some(account_units) = reader.string() else {
-        return Err(malformed_at("account_name"));
+        return Err(malformed_hex("account_name", stub));
     };
     // `secure_channel_type` is a **half** word: the enum carries no `v1_enum`, and reading it as a
     // full one puts every field after it two octets out. Measured: the client sends `0200`, the
