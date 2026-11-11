@@ -193,6 +193,24 @@ pub trait MachineSecrets: Send + Sync + std::fmt::Debug {
     fn machine(&self, account: &str) -> Option<MachineAccount>;
 }
 
+/// Setting a machine account's password, which only the daemon with a directory can do.
+///
+/// `netr_ServerPasswordSet2` carries the account's **new password in the clear** inside a blob the
+/// channel encrypts, and the join really does set it: a machine that joins sends one password when
+/// it creates the account and another through this call, then writes its keytab for the second.
+/// A server that acknowledges the call without writing it leaves the directory holding the first
+/// password while the member's keytab holds the second, and the next `kinit` says
+/// "Preauthentication failed" - an account that exists, with keys nobody derived.
+///
+/// The value handed over is the password's own octets, UTF-16LE as the protocol sends them. What to
+/// do with them - derive `unicodePwd`, write keys, refresh an index - is the directory's business;
+/// this crate holds no store.
+#[async_trait::async_trait]
+pub trait MachinePasswords: Send + Sync + std::fmt::Debug {
+    /// Writes `password` for `account`, and says whether the directory took it.
+    async fn set_password(&self, account: &str, password: &[u8]) -> bool;
+}
+
 /// A secure channel that has been proved: what signs its PDUs, and the pair of credentials its
 /// `netr_Authenticator`s carry.
 ///
@@ -269,6 +287,9 @@ pub struct ServerConfig {
     /// Absent means this server cannot prove a machine password, and `netlogon` says so instead of
     /// accepting any: a file-sharing server with no domain behind it is the ordinary case.
     pub machine_secrets: Option<Arc<dyn MachineSecrets>>,
+    /// Where `netr_ServerPasswordSet2` writes the password it carried, when this deployment has a
+    /// directory to write it to.
+    pub machine_passwords: Option<Arc<dyn MachinePasswords>>,
     /// Serve the secure channel of a client that offers no AES, which means DES.
     ///
     /// Off by default, and deliberately a setting rather than a build feature: DES is a 56-bit
@@ -306,6 +327,7 @@ impl ServerConfig {
             server_guid: Uuid::from_u128(0x4718_b1fd_2307_7646_ac58_827a_af7d_daaf),
             limits: Limits::default(),
             machine_secrets: None,
+            machine_passwords: None,
             netlogon_des: false,
             share_listing: true,
             apple_model: None,

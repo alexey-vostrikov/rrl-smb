@@ -68,6 +68,9 @@ pub(crate) const OPNUM_LOGON_GET_CAPABILITIES: u16 = 21;
 /// channel's session key.
 pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
 
+/// `netr_CryptPassword`: 512 octets of ciphertext, then the length, all of it encrypted.
+const PASSWORD_BLOB: usize = 516;
+
 /// What one netlogon pipe remembers.
 ///
 /// One entry, not a table: `ServerReqChallenge` stores the pair and `ServerAuthenticate3` consumes
@@ -114,7 +117,7 @@ pub(crate) async fn serve(
     match opnum {
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
-        OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, session, stub),
+        OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, stub).await,
         OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(server, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => {
             // Said out loud because the client's own report names the step and not the cause: it
@@ -140,13 +143,9 @@ pub(crate) async fn serve(
 /// the whole 516 is run through the channel's cipher - AES-128-CFB8 or RC4 - with the session key.
 /// The plaintext is the password in UTF-16LE, zero-padded to 512, and the length says how much of
 /// it is real.
-fn password_set2(
-    server: &ServerState,
-    session: &mut Session,
-    stub: &[u8],
-) -> Result<Vec<u8>, Fault> {
-    // The stub first: a client's argument order here is not the IDL's wording, and the hex is what
-    // settles it. Behind `NETLOGON_DUMP` so that an ordinary run stays quiet.
+async fn password_set2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    // The stub before anything else: a client's argument order here is not the IDL's wording, and the
+    // hex is what settles it. Behind `NETLOGON_DUMP` so that an ordinary run stays quiet.
     if std::env::var_os("NETLOGON_DUMP").is_some() {
         tracing::warn!(
             len = stub.len(),
@@ -154,11 +153,115 @@ fn password_set2(
             "netlogon: ServerPasswordSet2 stub"
         );
     }
-    let _ = (server, session);
-    Err(Fault {
-        status: NCA_OP_RNG_ERROR,
-        did_not_execute: true,
-    })
+
+    let mut reader = NdrReader::new(stub);
+    let Some(_server_name) = reader.string() else {
+        return Err(malformed_hex("server_name", stub));
+    };
+    let Some(account) = reader.string() else {
+        return Err(malformed_hex("account_name", stub));
+    };
+    let account = String::from_utf16_lossy(&account).trim().to_string();
+    // An enum without `v1_enum` travels as a half word (measured: `0200`), and reading it as a word
+    // eats the first two octets of the computer name.
+    let Some(_channel_type) = reader.u16() else {
+        return Err(malformed_hex("secure_channel_type", stub));
+    };
+    let Some(computer) = reader.string() else {
+        return Err(malformed_hex("computer_name", stub));
+    };
+    let computer = String::from_utf16_lossy(&computer).trim().to_string();
+    let Some(credential) = reader.bytes(8) else {
+        return Err(malformed_hex("credential", stub));
+    };
+    let credential: [u8; 8] = credential
+        .try_into()
+        .map_err(|_| malformed_at("credential"))?;
+    let Some(timestamp) = reader.bytes(8) else {
+        return Err(malformed_hex("credential.timestamp", stub));
+    };
+    let sequence = u32::from_le_bytes(
+        timestamp[..4]
+            .try_into()
+            .expect("four octets of the timestamp"),
+    );
+    // The whole blob is encrypted, the length included: the four octets that say how long the
+    // password is sit at its end, inside the ciphertext, and cannot be read before it is opened.
+    let Some(blob) = reader.bytes(PASSWORD_BLOB) else {
+        return Err(malformed_hex("new_password", stub));
+    };
+    let mut blob: Vec<u8> = blob.to_vec();
+
+    // The channel's own step: the credential is the one the previous call left behind, and the
+    // answer carries this call's server half.
+    let stepped = server.advance_channel(&computer, |channel| {
+        let aes = channel.flags & SUPPORTS_AES != 0;
+        let (expected_client, _) = advance_credential(channel, sequence);
+        let key = channel.key;
+        (expected_client, key, aes)
+    });
+    let Some((expected_client, key, aes)) = stepped else {
+        tracing::warn!("netlogon: a password set before any channel was proved");
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_ACCESS_DENIED));
+    };
+    if !rrl_crypto::ct_eq(&expected_client, &credential) {
+        tracing::warn!("netlogon: a password set with a credential the chain does not produce");
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_ACCESS_DENIED));
+    }
+
+    if !aes {
+        // `netr_CryptPassword` is AES-128-CFB8 or RC4 depending on the channel, and this server only
+        // serves the AES one: a client on the DES path has no password to give it here.
+        tracing::warn!("netlogon: a password set on a channel that is not AES");
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_NOT_SUPPORTED));
+    }
+
+    let iv = [0u8; 16];
+    crate::rpc::schannel::cfb8(&key[..16], &iv, &mut blob, true);
+    let length = u32::from_le_bytes(
+        blob[PASSWORD_BLOB - 4..]
+            .try_into()
+            .expect("four octets of the length"),
+    ) as usize;
+    if length == 0 || length > PASSWORD_BLOB - 4 || !length.is_multiple_of(2) {
+        tracing::warn!(
+            length,
+            "netlogon: the password blob's length is not a password's"
+        );
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_INVALID_PARAMETER));
+    }
+    let password = &blob[..length];
+
+    let Some(passwords) = server.config.machine_passwords.as_ref() else {
+        tracing::warn!(
+            account = %account,
+            "netlogon: this server has no directory to write a machine password to"
+        );
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_NOT_SUPPORTED));
+    };
+    if !passwords.set_password(&account, password).await {
+        tracing::warn!(account = %account, "netlogon: the directory refused the new password");
+        return Ok(set_password_reply(&[0u8; 8], NTSTATUS_ACCESS_DENIED));
+    }
+    tracing::info!(account = %account, octets = length, "netlogon: machine password set");
+
+    // Success answers with the server half the chain has just produced; the caller compares it and
+    // refuses a channel whose reply it cannot reproduce.
+    let answer = server
+        .channel(&computer)
+        .map_or([0u8; 8], |channel| channel.server_credential);
+    Ok(set_password_reply(&answer, NTSTATUS_SUCCESS))
+}
+
+/// The reply of `netr_ServerPasswordSet2`: the server's authenticator half, then the status.
+///
+/// Eight octets and not sixteen, for the reason the capabilities reply has: `return_authenticator`
+/// is `[in,out]`, so only its out half - the credential - travels.
+fn set_password_reply(credential: &[u8; 8], status: u32) -> Vec<u8> {
+    let mut writer = NdrWriter::new();
+    writer.raw(credential);
+    writer.u32(status);
+    writer.finish()
 }
 
 /// Advances the credential chain one step, and returns the pair the step produced.
@@ -1465,5 +1568,159 @@ mod tests {
             "the client expects a credential back and has none to send"
         );
         assert_eq!(reader.u32(), Some(1), "query_level");
+    }
+
+    /// A directory that only remembers what it was asked to write.
+    #[derive(Debug, Default)]
+    struct RecordingPasswords(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait::async_trait]
+    impl crate::server::MachinePasswords for RecordingPasswords {
+        async fn set_password(&self, account: &str, password: &[u8]) -> bool {
+            match self.0.lock() {
+                Ok(mut writes) => writes.push((account.to_string(), password.to_vec())),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .push((account.to_string(), password.to_vec())),
+            }
+            true
+        }
+    }
+
+    /// The stub a client sends to set a machine password, with the blob encrypted as the channel
+    /// encrypts it: AES-128-CFB8 under the session key's first half, a zero IV, all 516 octets.
+    fn set_password_stub(
+        credential: &[u8; 8],
+        sequence: u32,
+        password: &[u8],
+        key: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut blob = vec![0u8; PASSWORD_BLOB];
+        blob[..password.len()].copy_from_slice(password);
+        let length = u32::try_from(password.len()).expect("a short password");
+        blob[PASSWORD_BLOB - 4..].copy_from_slice(&length.to_le_bytes());
+        let iv = [0u8; 16];
+        crate::rpc::schannel::cfb8(&key[..16], &iv, &mut blob, false);
+
+        // A conformant string without the padding after it: the half word that follows aligns to
+        // two, and padding here would put it two octets past where the reader looks for it.
+        fn bare_string(stub: &mut Vec<u8>, text: &str) {
+            let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            stub.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            stub.extend_from_slice(&0u32.to_le_bytes());
+            stub.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            for unit in &units {
+                stub.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+
+        let mut stub = Vec::new();
+        string(&mut stub, "\\\\samba.ad.example.com");
+        bare_string(&mut stub, "SAMBA$");
+        stub.extend_from_slice(&2u16.to_le_bytes());
+        // A string's counts are aligned to four, and the half word above left the stub two octets
+        // past a boundary: without this padding the header lands where the reader will not look.
+        pad(&mut stub);
+        string(&mut stub, "SAMBA");
+        stub.extend_from_slice(credential);
+        let mut stamp = sequence.to_le_bytes().to_vec();
+        stamp.extend_from_slice(&[0u8; 4]);
+        stub.extend_from_slice(&stamp);
+        stub.extend_from_slice(&blob);
+        stub
+    }
+
+    /// The password the client sets is the one the directory is asked to write, in the octets the
+    /// protocol carried - UTF-16LE, no quotes, no padding.
+    ///
+    /// Success here is a write, not an acknowledgement: a server that answers `SUCCESS` without it
+    /// leaves the member's keytab holding a password the directory never saw, and the next `kinit`
+    /// says `Preauthentication failed`.
+    #[tokio::test]
+    async fn a_machine_password_reaches_the_directory_as_the_client_sent_it() {
+        let passwords = std::sync::Arc::new(RecordingPasswords::default());
+        let mut config = crate::server::ServerConfig::for_test();
+        config.machine_passwords = Some(passwords.clone());
+        let state = ServerState::new(
+            config,
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        );
+        state.remember_channel(
+            "SAMBA",
+            crate::server::ChannelState {
+                key: live_key(),
+                seed: octets(LIVE_SEED),
+                client_credential: octets(LIVE_SEED),
+                server_credential: octets(LIVE_SERVER),
+                flags: 0x610f_ffff,
+            },
+        );
+
+        let password: Vec<u8> = "a-machine-password"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let stub = set_password_stub(&octets(LIVE_CLIENT), LIVE_SEQUENCE, &password, &live_key());
+        let reply = password_set2(&state, &stub).await.expect("answered");
+
+        assert_eq!(
+            reply.len(),
+            12,
+            "eight octets of credential, then the status"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().expect("status")),
+            NTSTATUS_SUCCESS
+        );
+        let writes = passwords.0.lock().expect("not poisoned");
+        assert_eq!(writes.len(), 1, "one call, one write");
+        assert_eq!(writes[0].0, "SAMBA$", "the account the call named");
+        assert_eq!(writes[0].1, password, "the password, octet for octet");
+    }
+
+    /// A credential the chain does not produce is refused, and nothing is written.
+    #[tokio::test]
+    async fn a_password_set_with_the_wrong_credential_writes_nothing() {
+        let passwords = std::sync::Arc::new(RecordingPasswords::default());
+        let mut config = crate::server::ServerConfig::for_test();
+        config.machine_passwords = Some(passwords.clone());
+        let state = ServerState::new(
+            config,
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        );
+        state.remember_channel(
+            "SAMBA",
+            crate::server::ChannelState {
+                key: live_key(),
+                seed: octets(LIVE_SEED),
+                client_credential: octets(LIVE_SEED),
+                server_credential: octets(LIVE_SERVER),
+                flags: 0x610f_ffff,
+            },
+        );
+
+        let password: Vec<u8> = "x".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let stub = set_password_stub(
+            &octets("0000000000000001"),
+            LIVE_SEQUENCE,
+            &password,
+            &live_key(),
+        );
+        let reply = password_set2(&state, &stub).await.expect("answered");
+
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().expect("status")),
+            NTSTATUS_ACCESS_DENIED
+        );
+        assert!(
+            passwords.0.lock().expect("not poisoned").is_empty(),
+            "a refused call must not change the directory"
+        );
     }
 }
