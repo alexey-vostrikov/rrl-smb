@@ -636,6 +636,14 @@ impl Association {
             channel.next_seq += 1;
             // The authentication padding travels inside the sealed payload and is not an argument.
             let pad = usize::from(auth.auth_pad_length);
+            tracing::debug!(
+                opened = stub.len(),
+                pad,
+                auth_type = auth.auth_type,
+                auth_level = auth.auth_level,
+                token = auth.token.len(),
+                "rpc: sealed call opened"
+            );
             stub.truncate(stub.len().saturating_sub(pad));
             sealed_stub = Some(stub);
         }
