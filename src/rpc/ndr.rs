@@ -28,6 +28,15 @@ impl<'a> NdrReader<'a> {
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
+    /// A 16-bit word, aligned to two: an enum that is not `v1_enum` travels as a half word, and
+    /// reading it as a word takes the first two octets of the field after it.
+    pub(crate) fn u16(&mut self) -> Option<u16> {
+        let at = self.at.next_multiple_of(2);
+        let bytes = self.stub.get(at..at + 2)?;
+        self.at = at + 2;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     /// A unique pointer (C706 14.3.10): whether its referent follows.
     pub(crate) fn pointer(&mut self) -> Option<bool> {
         Some(self.u32()? != 0)
