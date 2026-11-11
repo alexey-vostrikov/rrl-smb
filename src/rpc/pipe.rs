@@ -209,7 +209,11 @@ impl Pipe {
         }
         let was_empty = state.outbox.is_empty();
         let mut rest = data;
-        while let Some(step) = state.assoc.next_step(&mut rest) {
+        // The key of the channel this client established, looked up by the computer name it
+        // negotiated - a client opens a second netlogon pipe and signs there with the first one's
+        // key, so the lookup cannot be confined to this pipe.
+        let key_for = |computer: &str| server.channel_key(computer);
+        while let Some(step) = state.assoc.next_step(&mut rest, &key_for) {
             if state.full() && !state.assoc.is_closed() {
                 let call_id = match &step {
                     Step::Call(call) => call.call_id,

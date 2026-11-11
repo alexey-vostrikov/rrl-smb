@@ -97,17 +97,39 @@ pub(crate) struct Association {
     inbox: Vec<u8>,
     /// A bind that negotiated schannel, waiting for the AUTH3 that proves it.
     schannel: Option<PendingSchannel>,
+    /// The channel once its key is known: every later PDU is checked against it and answered under
+    /// it, with one counter per direction.
+    seal: Option<SealedChannel>,
+}
+
+/// A channel whose key is known, and its two counters.
+///
+/// The counters are per association and per direction, and they are what stops a replayed PDU: the
+/// receiver builds the sequence number from its own count alone and compares, so a message from
+/// another position in the stream cannot be made to look current.
+#[derive(Debug)]
+struct SealedChannel {
+    key: [u8; 32],
+    next_in: u64,
+    next_out: u64,
 }
 
 /// A negotiated authentication this server has not yet had proved.
 ///
 /// Kept per association and not per process: the proof arrives on the same association as the
 /// negotiate, and an association that negotiated nothing must not accept an AUTH3.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingSchannel {
     /// The `auth_context_id` the client used, which its AUTH3 must repeat.
     auth_context_id: u32,
-    /// The flags the client said it supports.
+    /// The computer the client named in its negotiate - the account whose key signs its PDUs.
+    computer: String,
+    /// The flags the client said it supports. Kept because a later PDU carries no copy of them:
+    /// the negotiate is the only place the client states its terms.
+    #[allow(
+        dead_code,
+        reason = "read once the channel's capabilities decide which PDUs are accepted"
+    )]
     flags: u32,
 }
 
@@ -123,6 +145,7 @@ impl Default for Association {
             current_call_id: 0,
             inbox: Vec::new(),
             schannel: None,
+            seal: None,
         }
     }
 }
@@ -144,7 +167,11 @@ impl Association {
     /// span writes and a write may hold several. A frag_length below 16,
     /// or above [`MAX_FRAG`] for anything but a bind or alter_context, is a
     /// protocol error. Once the association is closed, bytes are dropped.
-    pub(crate) fn next_step(&mut self, data: &mut &[u8]) -> Option<Step> {
+    pub(crate) fn next_step(
+        &mut self,
+        data: &mut &[u8],
+        key_for: &dyn Fn(&str) -> Option<[u8; 32]>,
+    ) -> Option<Step> {
         while !self.closed && !data.is_empty() {
             if self.inbox.len() < pdu::HEADER_LEN {
                 let take = (pdu::HEADER_LEN - self.inbox.len()).min(data.len());
@@ -172,7 +199,7 @@ impl Association {
                 break;
             }
             let pdu = std::mem::take(&mut self.inbox);
-            let step = self.receive_pdu(&pdu);
+            let step = self.receive_pdu(&pdu, key_for);
             self.inbox = pdu;
             self.inbox.clear();
             if step.is_some() {
@@ -206,7 +233,7 @@ impl Association {
 
     /// The fragments that answer `call` with `result`: the response stub
     /// cut to the negotiated fragment size, or a fault.
-    pub(crate) fn reply(&self, call: &Call, result: Result<Vec<u8>, Fault>) -> Vec<Vec<u8>> {
+    pub(crate) fn reply(&mut self, call: &Call, result: Result<Vec<u8>, Fault>) -> Vec<Vec<u8>> {
         let stub = match result {
             Ok(stub) => stub,
             Err(fault) => {
@@ -238,12 +265,38 @@ impl Association {
                 flags |= PFC_LAST_FRAG;
             }
             let alloc_hint = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+            // A response on a sealed channel travels sealed, each fragment with its own signature
+            // and its own number: the counters run per PDU, not per call, and a client that finds
+            // one missing refuses the rest of the stream.
+            let mut fragment = rest[..len].to_vec();
+            let auth_context_id = self
+                .schannel
+                .as_ref()
+                .map_or(1, |pending| pending.auth_context_id);
+            let sig = self.seal.as_mut().map(|channel| {
+                let sig = crate::rpc::schannel::seal(
+                    &channel.key,
+                    channel.next_out,
+                    false,
+                    &mut fragment,
+                );
+                channel.next_out += 1;
+                sig
+            });
+            let auth = sig.as_ref().map(|sig| pdu::AuthReply {
+                auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
+                auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
+                auth_pad_length: 0,
+                auth_context_id,
+                token: sig,
+            });
             fragments.push(pdu::response(
                 call.call_id,
                 flags,
                 alloc_hint,
                 call.context_id,
-                &rest[..len],
+                &fragment,
+                auth.as_ref(),
             ));
             rest = &rest[len..];
             if rest.is_empty() {
@@ -252,7 +305,11 @@ impl Association {
         }
     }
 
-    fn receive_pdu(&mut self, bytes: &[u8]) -> Option<Step> {
+    fn receive_pdu(
+        &mut self,
+        bytes: &[u8],
+        key_for: &dyn Fn(&str) -> Option<[u8; 32]>,
+    ) -> Option<Step> {
         let Some(pdu) = pdu::parse(bytes) else {
             let call_id = Header::read(bytes).map_or(0, |h| h.call_id);
             debug!(call_id, "malformed rpc pdu");
@@ -269,7 +326,7 @@ impl Association {
                 "rpc: authenticated pdu"
             );
         }
-        let step = self.dispatch(&header, pdu.body, pdu.auth.as_ref());
+        let step = self.dispatch(&header, pdu.body, pdu.auth.as_ref(), key_for);
         self.current_call_id = self.current_call_id.max(header.call_id);
         step
     }
@@ -279,6 +336,7 @@ impl Association {
         header: &Header,
         body: Body<'_>,
         auth: Option<&pdu::AuthVerifier<'_>>,
+        key_for: &dyn Fn(&str) -> Option<[u8; 32]>,
     ) -> Option<Step> {
         if !self.bound {
             return Some(match body {
@@ -298,7 +356,7 @@ impl Association {
                 Some(self.close(pdu::bind_nak(header.call_id, NAK_NOT_SPECIFIED)))
             }
             Body::AlterContext(bind) => Some(self.alter_context(header, &bind.contexts)),
-            Body::Request(request) => self.request(header, &request),
+            Body::Request(request) => self.request(header, &request, auth, key_for),
             Body::CoCancel => None,
             // An orphaned PDU aborts the request it names (C706 12.6.4.8).
             Body::Orphaned => {
@@ -378,6 +436,7 @@ impl Association {
             );
             self.schannel = Some(PendingSchannel {
                 auth_context_id: auth.auth_context_id,
+                computer: message.computer.clone(),
                 flags: message.flags,
             });
             auth_reply = Some(crate::rpc::schannel::negotiate(message.flags));
@@ -415,7 +474,10 @@ impl Association {
             auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
             auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
             auth_pad_length: 0,
-            auth_context_id: self.schannel.map_or(1, |pending| pending.auth_context_id),
+            auth_context_id: self
+                .schannel
+                .as_ref()
+                .map_or(1, |pending| pending.auth_context_id),
             token,
         });
         Step::Send(pdu::bind_ack(
@@ -526,18 +588,64 @@ impl Association {
 
     /// C706 12.6.4.9, MS-RPCE 3.3.3.5.2. Fragments of one call share its
     /// call_id; its context and opnum come from the first.
-    fn request(&mut self, header: &Header, request: &Request<'_>) -> Option<Step> {
-        if header.auth_length > 0 {
-            return Some(self.protocol_error(header.call_id));
-        }
+    fn request(
+        &mut self,
+        header: &Header,
+        request: &Request<'_>,
+        auth: Option<&pdu::AuthVerifier<'_>>,
+        key_for: &dyn Fn(&str) -> Option<[u8; 32]>,
+    ) -> Option<Step> {
         let first = header.flags & PFC_FIRST_FRAG != 0;
+        // An authenticated call: the channel must be negotiated, its key known, and the signature
+        // right before a byte of the stub is believed. A first fragment without authentication on a
+        // negotiated channel is refused rather than served - accepting it would let a client skip
+        // the proof it agreed to.
+        let mut sealed_stub = None;
+        if auth.is_none() && self.seal.is_some() {
+            // Once a channel is sealed every call must be signed: serving an unsigned one would let
+            // a client skip the proof it agreed to on the very next message.
+            debug!("rpc: an unsigned call on a sealed channel");
+            return Some(self.refuse(header, request.context_id, FAULT_ACCESS_DENIED));
+        }
+        if let Some(auth) = auth {
+            let Some(pending) = self.schannel.as_ref() else {
+                debug!("rpc: an authenticated call on a channel that never negotiated");
+                return Some(self.protocol_error(header.call_id));
+            };
+            let computer = pending.computer.clone();
+            let Some(key) = key_for(&computer) else {
+                debug!(%computer, "rpc: no channel key for this client");
+                return Some(self.refuse(header, request.context_id, FAULT_ACCESS_DENIED));
+            };
+            let channel = self.seal.get_or_insert(SealedChannel {
+                key,
+                next_in: 0,
+                next_out: 0,
+            });
+            let mut stub = request.stub.to_vec();
+            if let Err(err) = crate::rpc::schannel::unseal(
+                &channel.key,
+                channel.next_in,
+                true,
+                auth.token,
+                &mut stub,
+            ) {
+                debug!(?err, "rpc: a call whose signature does not check out");
+                return Some(self.refuse(header, request.context_id, FAULT_ACCESS_DENIED));
+            }
+            channel.next_in += 1;
+            // The authentication padding travels inside the sealed payload and is not an argument.
+            let pad = usize::from(auth.auth_pad_length);
+            stub.truncate(stub.len().saturating_sub(pad));
+            sealed_stub = Some(stub);
+        }
         let mut call = match (self.partial.take(), first) {
             (None, true) => Call {
                 call_id: header.call_id,
                 context_id: request.context_id,
                 interface: self.interface_of(request.context_id),
                 opnum: request.opnum,
-                stub: Vec::new(),
+                stub: sealed_stub.unwrap_or_default(),
             },
             (Some(call), false) if call.call_id == header.call_id => call,
             (Some(call), _) => {
@@ -589,6 +697,16 @@ impl Association {
 
     /// Ends the association: a bind_nak before the bind, a fault after it
     /// (MS-RPCE 3.3.3.5.7).
+    /// A fault for a call this server refused before any handler saw it.
+    fn refuse(&mut self, header: &Header, context_id: u16, status: u32) -> Step {
+        Step::Send(pdu::fault(
+            header.call_id,
+            FIRST_AND_LAST | PFC_DID_NOT_EXECUTE,
+            context_id,
+            status,
+        ))
+    }
+
     fn protocol_error(&mut self, call_id: u32) -> Step {
         let pdu = if self.bound {
             pdu::fault(
@@ -623,7 +741,7 @@ mod tests {
     impl Association {
         /// Every step the PDUs in `data` ask for.
         fn receive(&mut self, mut data: &[u8]) -> Vec<Step> {
-            std::iter::from_fn(|| self.next_step(&mut data)).collect()
+            std::iter::from_fn(|| self.next_step(&mut data, &|_| None)).collect()
         }
     }
 
@@ -986,7 +1104,7 @@ mod tests {
 
     #[test]
     fn a_failed_call_faults_on_its_context() {
-        let a = bound();
+        let mut a = bound();
         let call = Call {
             call_id: 4,
             context_id: 0,
@@ -1245,7 +1363,7 @@ mod tests {
 
     #[test]
     fn responses_are_cut_into_fragments() {
-        let a = bound();
+        let mut a = bound();
         let call = Call {
             call_id: 9,
             context_id: 0x0102,
@@ -1281,5 +1399,95 @@ mod tests {
         assert_eq!(pdus.len(), 3);
         assert!(pdus.iter().all(|p| p.len() <= 2048));
         assert_eq!(response_of(&pdus[0]).3, 2016);
+    }
+
+    const LIVE_PDU: &str = "05000003100000002801380009000000c400000000001500ba09310f57de40c2b715f2ebe00031e360fa62e6e8dfbc219e5c1a5ea85ac7f9f19afa0d98e001b061cfb9c13a6915bb3d7bde124faabe4f5c0645e7ebb888fde3952c7cea57ab499c06356fe382b454a95b1c0e80d95ab1df176f8d07b251dffa00eb041af91b83ce9e6dd4b63d4674d1556f91f76a9b4ad2cd36f76873b53d9454c2b78f744f1ca6ee1d9a2c082ce4f31f780c853ef8e24df73a51196a36f8564afdc5c6ab78814b4bc10a41713fce47b10961a2d75fc3493efaecdd2ce304f3c69d7be623f99fb3c76f917a3bbdc344060c000100000013001a00ffff00001f830473f4d604d8282f52c2ef6da1301daa27ca945343aa000000000000000000000000000000000000000000000000";
+    const LIVE_KEY: &str = "d351cce0cd557a90bbaa07c5d2e2216136e1b83b1e20b669b586777fa25bcdeb";
+
+    /// A call the client signed, checked by the association and answered under the channel.
+    ///
+    /// The request octets are a live client's, so this covers the wiring as well as the arithmetic:
+    /// the key comes from the lookup by computer name, the counter comes from the association, and
+    /// the answer carries a signature of this server's own that opens back.
+    #[test]
+    fn a_signed_call_is_verified_and_its_answer_is_signed() {
+        let key: [u8; 32] = hex::decode(LIVE_KEY)
+            .expect("hex")
+            .try_into()
+            .expect("32 octets");
+        let request = hex::decode(LIVE_PDU).expect("hex");
+
+        let mut a = bound();
+        // What the negotiate leaves behind: the computer whose key signs this client's PDUs.
+        a.schannel = Some(PendingSchannel {
+            auth_context_id: 1,
+            computer: "SAMBA".to_string(),
+            flags: 0x0001,
+        });
+        a.seal = Some(SealedChannel {
+            key,
+            next_in: 0,
+            next_out: 0,
+        });
+
+        let lookups = std::cell::Cell::new(0usize);
+        let key_for = |computer: &str| {
+            lookups.set(lookups.get() + 1);
+            (computer == "SAMBA").then_some(key)
+        };
+
+        let mut data = &request[..];
+        let Some(Step::Call(call)) = a.next_step(&mut data, &key_for) else {
+            panic!("a signed request is a call");
+        };
+        assert_eq!(
+            lookups.get(),
+            1,
+            "the key is looked up by the negotiated name"
+        );
+        assert_eq!(call.opnum, 21, "netr_LogonGetCapabilities");
+        assert_eq!(
+            &call.stub[..4],
+            &[0x17, 0x00, 0x00, 0x00],
+            "the stub the client sealed, with its padding gone"
+        );
+
+        let answers = a.reply(&call, Ok(vec![0xAA; 4]));
+        assert_eq!(answers.len(), 1);
+        let answer = &answers[0];
+        let frag = usize::from(u16::from_le_bytes([answer[8], answer[9]]));
+        let auth_len = usize::from(u16::from_le_bytes([answer[10], answer[11]]));
+        assert_eq!(auth_len, crate::rpc::schannel::SIG_LEN_AES);
+        let trailer_at = frag - auth_len - 8;
+        assert_eq!(answer[trailer_at], 68, "NETLOGON auth type");
+
+        // Opens with this server as the responder: counter 0, initiator bit clear.
+        let mut payload = answer[24..trailer_at].to_vec();
+        crate::rpc::schannel::unseal(&key, 0, false, &answer[trailer_at + 8..], &mut payload)
+            .expect("the answer opens under the channel");
+        assert_eq!(payload, vec![0xAA; 4]);
+    }
+
+    /// An unsigned call on a sealed channel is refused rather than served.
+    #[test]
+    fn a_sealed_channel_refuses_an_unsigned_call() {
+        let mut a = bound();
+        a.schannel = Some(PendingSchannel {
+            auth_context_id: 1,
+            computer: "SAMBA".to_string(),
+            flags: 0x0001,
+        });
+        a.seal = Some(SealedChannel {
+            key: [7; 32],
+            next_in: 0,
+            next_out: 0,
+        });
+
+        let request = request_pdu(9, PFC_FIRST_FRAG, 0, 21, &[0; 16]);
+        let mut data = &request[..];
+        let Some(Step::Send(answer)) = a.next_step(&mut data, &|_| Some([7; 32])) else {
+            panic!("an unsigned call is refused");
+        };
+        assert_eq!(answer[2], PTYPE_FAULT, "a fault, not a call");
     }
 }

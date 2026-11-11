@@ -685,7 +685,7 @@ pub mod fuzzing {
         let mut assoc = Association::default();
         let mut max_frag = MAX_FRAG;
         for mut piece in data.chunks(chunk) {
-            while let Some(step) = assoc.next_step(&mut piece) {
+            while let Some(step) = assoc.next_step(&mut piece, &|_| None) {
                 let sent = match step {
                     Step::Send(pdu) => vec![pdu],
                     Step::Call(call) => {

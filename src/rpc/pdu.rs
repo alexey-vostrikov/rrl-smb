@@ -415,12 +415,20 @@ pub(crate) fn response(
     alloc_hint: u32,
     context_id: u16,
     stub: &[u8],
+    auth: Option<&AuthReply<'_>>,
 ) -> Vec<u8> {
     let mut out = header(PTYPE_RESPONSE, flags, call_id);
     out.extend_from_slice(&alloc_hint.to_le_bytes());
     out.extend_from_slice(&context_id.to_le_bytes());
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(stub);
+    if let Some(auth) = auth {
+        out.extend_from_slice(&[auth.auth_type, auth.auth_level, auth.auth_pad_length, 0]);
+        out.extend_from_slice(&auth.auth_context_id.to_le_bytes());
+        out.extend_from_slice(auth.token);
+        let auth_len = u16::try_from(auth.token.len()).expect("a token shorter than 64k");
+        out[10..12].copy_from_slice(&auth_len.to_le_bytes());
+    }
     finish(out)
 }
 
@@ -579,7 +587,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_response_carries_its_stub_after_24_bytes() {
-        let pdu = response(4, PFC_FIRST_FRAG, 3, 1, b"abc");
+        let pdu = response(4, PFC_FIRST_FRAG, 3, 1, b"abc", None);
         assert_eq!(pdu.len(), 27);
         let hdr = Header::read(&pdu).unwrap();
         assert_eq!((hdr.ptype, hdr.flags, hdr.call_id), (PTYPE_RESPONSE, 1, 4));
