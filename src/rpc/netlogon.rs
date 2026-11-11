@@ -124,13 +124,13 @@ pub(crate) async fn serve(
 /// first four of the challenge for a pointer.
 fn request_challenge(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    let server_name_present = reader.pointer().unwrap_or(false);
-    // The computer name is a conformant string and is not used here: the challenge belongs to the
-    // pipe, and a name that disagreed with the account would be caught by the authenticate call.
+    // `server_name` is a unique pointer, so its string is **deferred**: it travels after everything
+    // that sits inline, and reading it here would consume the computer name and then the challenge
+    // itself. Only the pointer's presence is inline, and it says nothing this call needs.
+    let _server_name = reader.pointer();
+    // `computer_name` is inline, not deferred: it belongs to the call, and the challenge does not
+    // depend on it - a name that disagreed with the account is caught by the authenticate call.
     let _computer = reader.string();
-    if server_name_present && reader.string().is_none() {
-        return Err(malformed());
-    }
     let Some(client) = reader.bytes(8) else {
         return Err(malformed());
     };
@@ -208,13 +208,12 @@ fn authenticate3(
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    let server_name_present = reader.pointer().unwrap_or(false);
+    // Deferred, as in `ServerReqChallenge`: the pointer is inline, the string is not.
+    let _server_name = reader.pointer();
     let Some(account_units) = reader.string() else {
         return Err(malformed());
     };
-    if server_name_present && reader.string().is_none() {
-        return Err(malformed());
-    }
+    // `secure_channel_type` is a `v1_enum`, so it is a full word and not a half one.
     let _secure_channel_type = reader.u32().ok_or_else(malformed)?;
     let Some(computer_units) = reader.string() else {
         return Err(malformed());
@@ -425,10 +424,13 @@ mod tests {
     /// the server name.
     fn request(client: &[u8; 8]) -> Vec<u8> {
         let mut stub = Vec::new();
+        // The pointer, then the computer name, then the challenge: everything inline, in the order
+        // the call declares it.
         stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
         string(&mut stub, "SAMBA");
-        string(&mut stub, "samba.ad.example.com");
         stub.extend_from_slice(client);
+        // Deferred, and therefore last: `server_name`'s string.
+        string(&mut stub, "samba.ad.example.com");
         stub
     }
 
