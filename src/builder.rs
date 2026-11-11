@@ -335,6 +335,7 @@ pub struct SmbServerBuilder {
     dns_domain: Option<String>,
     /// The domain's SID, answered by `lsarpc` beside that name.
     domain_sid: Option<Vec<u8>>,
+    machine_secrets: Option<std::sync::Arc<dyn crate::server::MachineSecrets>>,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
     domain_netbios: Option<String>,
     max_read_size: u32,
@@ -391,6 +392,7 @@ impl SmbServerBuilder {
             netbios_name: None,
             dns_domain: None,
             domain_sid: None,
+            machine_secrets: None,
             domain_netbios: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
@@ -444,6 +446,20 @@ impl SmbServerBuilder {
     /// after every other answer was right.
     pub fn domain_sid(mut self, sid: impl Into<Vec<u8>>) -> Self {
         self.domain_sid = Some(sid.into());
+        self
+    }
+
+    /// Where the machine accounts' NT hashes come from.
+    ///
+    /// Without it `netlogon` cannot prove a machine password, and a member's join stops at
+    /// `netr_ServerAuthenticate3` with a status that says so. With it, the secure channel is checked
+    /// the way a domain checks one: the hash is all this crate needs, and the directory that owns
+    /// the account keeps it.
+    pub fn machine_secrets(
+        mut self,
+        secrets: std::sync::Arc<dyn crate::server::MachineSecrets>,
+    ) -> Self {
+        self.machine_secrets = Some(secrets);
         self
     }
 
@@ -787,6 +803,7 @@ impl SmbServerBuilder {
             netbios_name: netbios,
             dns_domain: self.dns_domain.clone(),
             domain_sid: self.domain_sid.clone(),
+            machine_secrets: self.machine_secrets.clone(),
             domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
