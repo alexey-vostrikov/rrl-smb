@@ -978,12 +978,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#20c04eb6212a22149cf7e49e1fe21850a3af042c"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#8e9acec24ac20b755aca00c2f99ca9048ef762a0"
 dependencies = [
  "aes 0.9.4",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "md-5 0.11.0",
+ "md4",
  "sha1",
  "sha2 0.11.1",
  "thiserror 2.0.21",
@@ -1172,6 +1173,7 @@ dependencies = [
  "mdns-sd",
  "quick-xml",
  "rc4",
+ "rrl-crypto",
  "rustix",
  "sha2 0.10.9",
  "socket2",
