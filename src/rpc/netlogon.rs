@@ -211,18 +211,24 @@ fn authenticate3(
     // Deferred, as in `ServerReqChallenge`: the pointer is inline, the string is not.
     let _server_name = reader.pointer();
     let Some(account_units) = reader.string() else {
-        return Err(malformed());
+        return Err(malformed_at("account_name"));
     };
     // `secure_channel_type` is a `v1_enum`, so it is a full word and not a half one.
-    let _secure_channel_type = reader.u32().ok_or_else(malformed)?;
+    let _secure_channel_type = reader
+        .u32()
+        .ok_or_else(|| malformed_at("secure_channel_type"))?;
     let Some(computer_units) = reader.string() else {
-        return Err(malformed());
+        return Err(malformed_at("computer_name"));
     };
     let Some(client_credential) = reader.bytes(8) else {
-        return Err(malformed());
+        return Err(malformed_at("client_credential"));
     };
-    let client_credential: [u8; 8] = client_credential.try_into().map_err(|_| malformed())?;
-    let client_flags = reader.u32().ok_or_else(malformed)?;
+    let client_credential: [u8; 8] = client_credential
+        .try_into()
+        .map_err(|_| malformed_at("client_credential"))?;
+    let client_flags = reader
+        .u32()
+        .ok_or_else(|| malformed_at("negotiate_flags"))?;
 
     let account = String::from_utf16_lossy(&account_units);
     let computer = String::from_utf16_lossy(&computer_units);
@@ -386,6 +392,12 @@ fn reply(server_credential: &[u8; 8], flags: u32, rid: u32, status: u32) -> Vec<
 /// The same shape, for a refusal: nothing was agreed, so the fields are zero and the status says why.
 fn refusal(flags: u32, rid: u32, status: u32) -> Vec<u8> {
     reply(&[0u8; 8], flags, rid, status)
+}
+
+/// The stub is not the shape this call has, and the field that stopped it is named.
+fn malformed_at(field: &str) -> Fault {
+    tracing::warn!(field, "netlogon: the request stub ends before this field");
+    malformed()
 }
 
 /// The stub is not the shape this call has.
