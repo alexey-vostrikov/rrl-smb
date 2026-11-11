@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed. This crate is embedded in a daemon that ships to a stand: the
+# revision CI resolves has to be the revision the daemon gets.
 
 # cargo-mutants writes its report beside the crate
 /mutants.out
