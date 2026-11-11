@@ -76,24 +76,6 @@ pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
 #[derive(Debug, Default)]
 pub(crate) struct Session {
     challenge: Option<Challenge>,
-    channel: Option<ProvedChannel>,
-}
-
-/// What a proved channel remembers about its two credentials.
-///
-/// Every call after `netr_ServerAuthenticate3` carries an authenticator, and the pair is fixed **at
-/// the authenticate**: the client sends the half it computed from its own challenge and expects the
-/// half this server computed from its own. Neither side derives a new one per call, so remembering
-/// them is the whole mechanism.
-#[derive(Debug, Clone, Copy)]
-struct ProvedChannel {
-    /// What the client sends, and what this server checks every later call against.
-    client: [u8; 8],
-    /// What this server must send back.
-    server: [u8; 8],
-    /// The flags both sides agreed to. `netr_LogonGetCapabilities` must answer with exactly these:
-    /// Samba's client compares them for equality and calls any difference a downgrade.
-    flags: u32,
 }
 
 /// The pair of eight-octet values a secure channel is built on.
@@ -107,11 +89,6 @@ impl Session {
     /// The pair the last `ServerReqChallenge` established, for the call that proves it.
     pub(crate) fn challenge(&self) -> Option<Challenge> {
         self.challenge
-    }
-
-    /// The channel `netr_ServerAuthenticate3` proved, for the calls that follow it.
-    fn channel(&self) -> Option<ProvedChannel> {
-        self.channel
     }
 }
 
@@ -138,7 +115,7 @@ pub(crate) async fn serve(
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
         OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, session, stub),
-        OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(session, stub),
+        OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(server, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => {
             // Said out loud because the client's own report names the step and not the cause: it
             // says the domain could not be reached, which is what a failed call looks like from the
@@ -201,15 +178,20 @@ fn password_set2(
 /// eight of timestamp each - and `query_level`. What follows them is a
 /// `dcerpc_sec_verification_trailer`, not more arguments: three commands carrying the NDR transfer
 /// syntax, which read as a GUID and a syntax id if the fields are guessed wrong.
-fn logon_get_capabilities(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     let Some(_server_name) = reader.string() else {
         return Err(malformed_hex("server_name", stub));
     };
-    // A unique pointer: absent means the client did not name itself, which this call does not need.
-    if reader.pointer() == Some(true) && reader.string().is_none() {
-        return Err(malformed_hex("computer_name", stub));
-    }
+    // The computer name is how the channel is found: this call arrives on a pipe that never saw the
+    // challenge, and the name is the key the channel was proved under.
+    let computer = match reader.pointer() {
+        Some(true) => match reader.string() {
+            Some(units) => Some(String::from_utf16_lossy(&units).trim().to_string()),
+            None => return Err(malformed_hex("computer_name", stub)),
+        },
+        _ => None,
+    };
     let Some(credential) = reader.bytes(8) else {
         return Err(malformed_hex("credential", stub));
     };
@@ -226,8 +208,14 @@ fn logon_get_capabilities(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>,
         return Err(malformed_hex("query_level", stub));
     };
 
-    let Some(channel) = session.channel() else {
-        tracing::warn!("netlogon: capabilities asked for before a channel was proved");
+    let channel = computer
+        .as_deref()
+        .and_then(|computer| server.channel(computer));
+    let Some(channel) = channel else {
+        tracing::warn!(
+            computer = computer.as_deref().unwrap_or("<none>"),
+            "netlogon: capabilities asked for before a channel was proved"
+        );
         return Ok(capabilities_reply(
             None,
             query_level,
@@ -237,7 +225,7 @@ fn logon_get_capabilities(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>,
     // The client's half of the pair, compared in constant time: it is a secret of this channel, and
     // a comparison that stops at the first differing octet is a comparison that answers questions
     // about the ones it did compare.
-    if !rrl_crypto::ct_eq(&channel.client, &credential) {
+    if !rrl_crypto::ct_eq(&channel.client_credential, &credential) {
         tracing::warn!("netlogon: capabilities asked for with the wrong credential");
         return Ok(capabilities_reply(
             None,
@@ -274,10 +262,14 @@ fn logon_get_capabilities(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>,
 ///
 /// `time_t` travels as eight octets - the client's own stubs show eight - and the client reads only
 /// the eight octets of `.cred`, so the timestamp is the current time and nothing depends on it.
-fn capabilities_reply(channel: Option<&ProvedChannel>, query_level: u32, status: u32) -> Vec<u8> {
+fn capabilities_reply(
+    channel: Option<&crate::server::ChannelState>,
+    query_level: u32,
+    status: u32,
+) -> Vec<u8> {
     let zero = [0u8; 8];
     let (credential, flags) = match channel {
-        Some(channel) => (channel.server, channel.flags),
+        Some(channel) => (channel.server_credential, channel.flags),
         None => (zero, 0),
     };
     let now = std::time::SystemTime::now()
@@ -514,8 +506,9 @@ fn authenticate3(
         }
     };
 
-    // The channel's key, kept for the pipes that come after this one: a client re-signs with it
-    // there without repeating the challenge, so a key held in this pipe alone would refuse them.
+    // The whole channel, kept for the calls that come after this one - on this pipe or another: a
+    // client re-signs with the key and re-sends the credential without repeating the challenge, so
+    // a channel held in this pipe alone would refuse them.
     let channel_key = if aes {
         session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server)
     } else {
@@ -527,14 +520,16 @@ fn authenticate3(
         ));
         key
     };
-    server.remember_channel(&computer, channel_key);
-
     let flags = server_flags(client_flags);
-    session.channel = Some(ProvedChannel {
-        client: client_credential,
-        server: answer,
-        flags,
-    });
+    server.remember_channel(
+        &computer,
+        crate::server::ChannelState {
+            key: channel_key,
+            client_credential,
+            server_credential: answer,
+            flags,
+        },
+    );
     tracing::info!(
         account = %account,
         computer = %computer,
@@ -1123,16 +1118,28 @@ mod tests {
         stub
     }
 
-    /// A session whose channel was proved at the authenticate.
-    fn proved(client: [u8; 8], server: [u8; 8], flags: u32) -> Session {
-        Session {
-            challenge: None,
-            channel: Some(ProvedChannel {
-                client,
-                server,
+    /// A server state holding the channel the authenticate proved.
+    ///
+    /// Built directly rather than through the builder, like the `lsarpc` tests: the channel lives on
+    /// the state because the call that reads it arrives on another pipe.
+    fn proved(client: [u8; 8], server: [u8; 8], flags: u32) -> ServerState {
+        let state = ServerState::new(
+            crate::server::ServerConfig::for_test(),
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        );
+        state.remember_channel(
+            "SAMBA",
+            crate::server::ChannelState {
+                key: [0x44; 32],
+                client_credential: client,
+                server_credential: server,
                 flags,
-            }),
-        }
+            },
+        );
+        state
     }
 
     /// The answer carries the half the client holds, and the flags it negotiated - exactly.
@@ -1142,9 +1149,9 @@ mod tests {
     #[test]
     fn the_capabilities_answer_carries_the_half_the_client_expects() {
         let flags = 0x0102_0003;
-        let mut session = proved([0x11; 8], [0x22; 8], flags);
-        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 1))
-            .expect("answered");
+        let state = proved([0x11; 8], [0x22; 8], flags);
+        let reply =
+            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 1)).expect("answered");
 
         assert_eq!(reply.len(), 28, "16 + discriminant + capabilities + status");
         assert_eq!(
@@ -1171,9 +1178,9 @@ mod tests {
     /// A credential that is not the channel's is refused, and the refusal is still the right shape.
     #[test]
     fn capabilities_with_the_wrong_credential_are_refused() {
-        let mut session = proved([0x11; 8], [0x22; 8], 0x0102_0003);
-        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x33; 8], 1))
-            .expect("answered");
+        let state = proved([0x11; 8], [0x22; 8], 0x0102_0003);
+        let reply =
+            logon_get_capabilities(&state, &capabilities_stub(&[0x33; 8], 1)).expect("answered");
 
         assert_eq!(reply.len(), 28, "a refusal is the same shape");
         assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
@@ -1191,9 +1198,9 @@ mod tests {
     /// Level 2 is not answered, and is not answered as though it were level 1.
     #[test]
     fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
-        let mut session = proved([0x11; 8], [0x22; 8], 0x0102_0003);
-        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 2))
-            .expect("answered");
+        let state = proved([0x11; 8], [0x22; 8], 0x0102_0003);
+        let reply =
+            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 2)).expect("answered");
 
         assert_eq!(reply.len(), 28);
         assert_eq!(
@@ -1210,9 +1217,15 @@ mod tests {
     /// Before any authenticate there is no channel, and the call says so rather than inventing one.
     #[test]
     fn capabilities_before_a_channel_is_proved_are_refused() {
-        let mut session = Session::default();
-        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 1))
-            .expect("answered");
+        let state = ServerState::new(
+            crate::server::ServerConfig::for_test(),
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        );
+        let reply =
+            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 1)).expect("answered");
 
         assert_eq!(reply.len(), 28);
         assert_eq!(
