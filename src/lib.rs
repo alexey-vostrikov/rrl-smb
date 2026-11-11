@@ -434,7 +434,8 @@ pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{
-    ConfigError, ConfigHandle, MachineAccount, MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
+    ConfigError, ConfigHandle, ChannelState, MachineAccount, MachinePasswords, MachineSecrets,
+    ShareMode, ShutdownHandle, SmbServer,
 };
 pub use stream::{StreamInfo, StreamName};
 
