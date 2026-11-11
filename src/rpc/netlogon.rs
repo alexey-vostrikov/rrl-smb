@@ -127,9 +127,16 @@ fn request_challenge(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>, Faul
     // `server_name` is a unique pointer, so its string is **deferred**: it travels after everything
     // that sits inline, and reading it here would consume the computer name and then the challenge
     // itself. Only the pointer's presence is inline, and it says nothing this call needs.
-    let _server_name = reader.pointer();
-    // `computer_name` is inline, not deferred: it belongs to the call, and the challenge does not
-    // depend on it - a name that disagreed with the account is caught by the authenticate call.
+    let server_name_present = reader.pointer().unwrap_or(false);
+    // `server_name` travels **inline**, in front of everything else: measured from a live client's
+    // stub, where the first conformant string after the pointer is the UNC `\\samba.ad.…`. A parser
+    // that expected the string in the deferred section read the computer name as the server name
+    // and then took the challenge for a length.
+    if server_name_present && reader.string().is_none() {
+        return Err(malformed_hex("server_name", stub));
+    }
+    // `computer_name` is inline too, and this call does not need it - a name that disagreed with the
+    // account is caught by the authenticate call.
     let _computer = reader.string();
     let Some(client) = reader.bytes(8) else {
         return Err(malformed());
@@ -213,9 +220,11 @@ fn authenticate3(
     let Some(account_units) = reader.string() else {
         return Err(malformed_at("account_name"));
     };
-    // `secure_channel_type` is a `v1_enum`, so it is a full word and not a half one.
+    // `secure_channel_type` is a **half** word: the enum carries no `v1_enum`, and reading it as a
+    // full one puts every field after it two octets out. Measured: the client sends `0200`, the
+    // machine-account channel type.
     let _secure_channel_type = reader
-        .u32()
+        .u16()
         .ok_or_else(|| malformed_at("secure_channel_type"))?;
     let Some(computer_units) = reader.string() else {
         return Err(malformed_hex("computer_name", stub));
@@ -452,10 +461,11 @@ mod tests {
         // The pointer, then the computer name, then the challenge: everything inline, in the order
         // the call declares it.
         stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        // `server_name` first, and inline: a live client's stub puts the UNC string directly after
+        // the pointer, before the computer name.
+        string(&mut stub, "\\samba.ad.example.com");
         string(&mut stub, "SAMBA");
         stub.extend_from_slice(client);
-        // Deferred, and therefore last: `server_name`'s string.
-        string(&mut stub, "samba.ad.example.com");
         stub
     }
 
