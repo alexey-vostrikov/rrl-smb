@@ -266,7 +266,11 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             computer = computer.as_deref().unwrap_or("<none>"),
             "netlogon: capabilities asked for before a channel was proved"
         );
-        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
     };
     // The client's half of the pair, compared in constant time: it is a secret of this channel, and
     // a comparison that stops at the first differing octet is a comparison that answers questions
@@ -276,7 +280,11 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             sequence,
             "netlogon: capabilities asked for with a credential the chain does not produce"
         );
-        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
     }
     // The step has already moved the channel on, so what it holds now is what this call answers
     // with: the flags are the ones both sides negotiated, and the credential is the second half the
@@ -285,7 +293,11 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         .as_deref()
         .and_then(|computer| server.channel(computer))
     else {
-        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
     };
     let _ = server_credential;
     if query_level != 1 {
@@ -297,29 +309,40 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         );
         // Nothing is handed back for a level this server does not answer: a credential or a
         // capability beside a refusal is an answer, and this is not one.
-        return Ok(capabilities_reply(None, NTSTATUS_NOT_SUPPORTED));
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_NOT_SUPPORTED,
+        ));
     }
 
     tracing::info!(
         capabilities = format_args!("{:#010x}", channel.flags),
         "netlogon: capabilities answered"
     );
-    Ok(capabilities_reply(Some(&channel), NTSTATUS_SUCCESS))
+    Ok(capabilities_reply(
+        Some(&channel),
+        query_level,
+        NTSTATUS_SUCCESS,
+    ))
 }
 
-/// The reply stub: the server's half of the pair, then the capabilities, then the status.
+/// The reply stub, in the order a live client reads it: the server's half of the pair, the union's
+/// discriminant, the capabilities, and the status.
 ///
-/// Two things are absent that a reader of the IDL would expect to find:
+/// The discriminant is present and it is the `query_level` the call was made at. Measured twice: a
+/// reply without it is refused with `ndr_pull_netr_Capabilities: ndr_pull_error(Bad Switch): Bad
+/// switch value 0`, because the client reads the word after the credential as the switch. It is
+/// `[in]` in the IDL and still travels - a switched union cannot be read without knowing its arm.
 ///
-/// * the union's discriminant. `query_level` is `[in]`, so the server does not echo it - the client
-///   knows which arm it asked for, and a word written here shifts the capabilities into the status.
-/// * a second timestamp for the inbound authenticator, for the mirror reason: it is `[in,out]`, and
-///   only its out half travels, which is the credential.
-///
-/// The timestamp the server DOES send is zero, as `netlogon_creds_server_step_check` sets it: nothing
-/// reads it, and a clock in a reply is a difference between two machines waiting to be mistaken for
-/// a credential.
-fn capabilities_reply(channel: Option<&crate::server::ChannelState>, status: u32) -> Vec<u8> {
+/// The authenticator's timestamp is **not** sent: only its `cred` travels back, eight octets, the
+/// mirror of the request. The first attempt wrote a full sixteen and the client went looking for the
+/// switch one word later than it was.
+fn capabilities_reply(
+    channel: Option<&crate::server::ChannelState>,
+    query_level: u32,
+    status: u32,
+) -> Vec<u8> {
     let zero = [0u8; 8];
     let (credential, flags) = match channel {
         Some(channel) => (channel.server_credential, channel.flags),
@@ -327,7 +350,7 @@ fn capabilities_reply(channel: Option<&crate::server::ChannelState>, status: u32
     };
     let mut writer = NdrWriter::new();
     writer.raw(&credential);
-    writer.raw(&[0u8; 8]);
+    writer.u32(query_level);
     writer.u32(flags);
     writer.u32(status);
     writer.finish()
@@ -1290,8 +1313,8 @@ mod tests {
 
         assert_eq!(
             reply.len(),
-            24,
-            "credential, timestamp, capabilities, status"
+            20,
+            "credential, the union's discriminant, capabilities, status"
         );
         assert_eq!(
             &reply[..8],
@@ -1299,17 +1322,17 @@ mod tests {
             "the server's half of the chain, not the client's"
         );
         assert_eq!(
-            &reply[8..16],
-            &[0u8; 8],
-            "the timestamp nothing reads, and the client is not told otherwise"
+            u32::from_le_bytes(reply[8..12].try_into().expect("switch")),
+            1,
+            "the union's arm: without it a client refuses the reply with `Bad Switch value 0`"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
             0x610f_ffff,
             "the flags both sides negotiated, and nothing else"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
             NTSTATUS_SUCCESS
         );
     }
@@ -1324,15 +1347,15 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 24, "a refusal is the same shape");
+        assert_eq!(reply.len(), 20, "a refusal is the same shape");
         assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
             0,
             "no capability is claimed to a caller that did not prove the channel"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
     }
@@ -1347,14 +1370,19 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 24);
+        assert_eq!(reply.len(), 20);
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[8..12].try_into().expect("switch")),
+            2,
+            "the level the call was made at, echoed - a client told 1 reads the arm it did not ask for"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
             0,
             "a level this server does not answer carries no capability"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
             NTSTATUS_NOT_SUPPORTED
         );
     }
@@ -1375,9 +1403,9 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 24);
+        assert_eq!(reply.len(), 20);
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
     }
