@@ -191,6 +191,17 @@ fn signature_header(sealed: bool) -> [u8; 8] {
 /// octet - in both directions. That is the whole difference between the two functions below, and
 /// getting it wrong is invisible in one direction: a single function that feeds back its output
 /// encrypts correctly and decrypts to garbage, which reads as a wrong key.
+/// AES-128-CFB8 in place, for the callers outside this file that need the mode without the
+/// sealing rules around it - a password blob is encrypted with the session key and a zero IV, which
+/// is the same cipher and none of the same framing.
+pub(crate) fn cfb8(key: &[u8], iv: &[u8; 16], data: &mut [u8], decrypt: bool) {
+    if decrypt {
+        cfb8_decrypt(key, iv, data);
+    } else {
+        cfb8_encrypt(key, iv, data);
+    }
+}
+
 fn cfb8_encrypt(key: &[u8], iv: &[u8; 16], data: &mut [u8]) {
     use aes::cipher::{BlockEncrypt, KeyInit};
 

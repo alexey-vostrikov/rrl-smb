@@ -336,6 +336,7 @@ pub struct SmbServerBuilder {
     /// The domain's SID, answered by `lsarpc` beside that name.
     domain_sid: Option<Vec<u8>>,
     machine_secrets: Option<std::sync::Arc<dyn crate::server::MachineSecrets>>,
+    machine_passwords: Option<std::sync::Arc<dyn crate::server::MachinePasswords>>,
     netlogon_des: bool,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
     domain_netbios: Option<String>,
@@ -394,6 +395,7 @@ impl SmbServerBuilder {
             dns_domain: None,
             domain_sid: None,
             machine_secrets: None,
+            machine_passwords: None,
             netlogon_des: false,
             domain_netbios: None,
             max_read_size: 1024 * 1024,
@@ -457,6 +459,18 @@ impl SmbServerBuilder {
     /// `netr_ServerAuthenticate3` with a status that says so. With it, the secure channel is checked
     /// the way a domain checks one: the hash is all this crate needs, and the directory that owns
     /// the account keeps it.
+    /// Where a machine's new password is written when the join sets one.
+    ///
+    /// Without it `netr_ServerPasswordSet2` refuses the call instead of acknowledging a write it did
+    /// not make: a success it cannot keep is worse than a failure the client can report.
+    pub fn machine_passwords(
+        mut self,
+        passwords: std::sync::Arc<dyn crate::server::MachinePasswords>,
+    ) -> Self {
+        self.machine_passwords = Some(passwords);
+        self
+    }
+
     pub fn machine_secrets(
         mut self,
         secrets: std::sync::Arc<dyn crate::server::MachineSecrets>,
@@ -815,6 +829,7 @@ impl SmbServerBuilder {
             dns_domain: self.dns_domain.clone(),
             domain_sid: self.domain_sid.clone(),
             machine_secrets: self.machine_secrets.clone(),
+            machine_passwords: self.machine_passwords.clone(),
             netlogon_des: self.netlogon_des,
             domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,
