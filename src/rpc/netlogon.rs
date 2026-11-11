@@ -284,6 +284,21 @@ fn authenticate3(
 
     let key = session_key(&machine.nt_hash, &challenge.client, &challenge.server);
     let expected = credential(&challenge.client, &key);
+    // TEMP-DIAG: every input and both outputs, so the arithmetic can be redone outside.
+    if std::env::var_os("NETLOGON_DIAG").is_some() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        tracing::warn!(
+            account = %account,
+            nt_hash = %hex(&machine.nt_hash),
+            rid = machine.rid,
+            client_challenge = %hex(&challenge.client),
+            server_challenge = %hex(&challenge.server),
+            session_key = %hex(&key),
+            got = %hex(&client_credential),
+            want = %hex(&expected),
+            "netlogon-diag"
+        );
+    }
     if !constant_time_eq(&expected, &client_credential) {
         tracing::warn!(
             account = %account,
