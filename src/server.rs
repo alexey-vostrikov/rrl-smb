@@ -193,6 +193,25 @@ pub trait MachineSecrets: Send + Sync + std::fmt::Debug {
     fn machine(&self, account: &str) -> Option<MachineAccount>;
 }
 
+/// A secure channel that has been proved: what signs its PDUs, and the pair of credentials its
+/// `netr_Authenticator`s carry.
+///
+/// The two credentials are fixed at `netr_ServerAuthenticate3` and never re-derived - the client
+/// sends the half it computed from its own challenge and expects the half this server computed from
+/// its own - so the whole channel is remembered together rather than recomputed per call.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelState {
+    /// The session key the channel's PDUs are signed with.
+    pub key: [u8; 32],
+    /// The credential the client sends.
+    pub client_credential: [u8; 8],
+    /// The credential this server answers with.
+    pub server_credential: [u8; 8],
+    /// The flags both sides negotiated. `netr_LogonGetCapabilities` must answer with exactly these:
+    /// Samba's client compares them for equality and calls any difference a downgrade.
+    pub flags: u32,
+}
+
 /// What a machine account's secure channel is checked against.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MachineAccount {
@@ -450,29 +469,41 @@ pub struct ServerState {
     /// PDUs there with the key it established on the first one: the credentials are the machine's,
     /// cached on its side, and a key that lived in one pipe would refuse the second. Keyed by the
     /// computer name the channel negotiated, upper-cased.
-    pub(crate) schannel_keys: std::sync::RwLock<std::collections::HashMap<String, [u8; 32]>>,
+    pub(crate) schannel_channels:
+        std::sync::RwLock<std::collections::HashMap<String, ChannelState>>,
 }
 
 impl ServerState {
-    /// Records the key a secure channel established, so that a later pipe to the same machine can
-    /// check what it signs.
-    pub(crate) fn remember_channel(&self, computer: &str, key: [u8; 32]) {
-        let mut keys = match self.schannel_keys.write() {
-            Ok(keys) => keys,
+    /// Records a proved secure channel, so that a later call - on this pipe or another - can be
+    /// checked against it.
+    ///
+    /// Process-wide and keyed by the computer name, because a channel outlives the pipe it was
+    /// proved on: Samba opens a **new** netlogon pipe for `netr_LogonGetCapabilities` and sends it
+    /// signed and authenticated without repeating the challenge, exactly as its own server reads
+    /// the credential state from a store keyed by computer name rather than from the pipe.
+    /// Measured: with the channel held per pipe, that call arrives with no channel at all.
+    pub(crate) fn remember_channel(&self, computer: &str, state: ChannelState) {
+        let mut channels = match self.schannel_channels.write() {
+            Ok(channels) => channels,
             // A poisoned lock means a panic while a caller held it; the map behind it is still a
             // whole map, and refusing every channel for ever is the worse answer.
             Err(poisoned) => poisoned.into_inner(),
         };
-        keys.insert(computer.to_ascii_uppercase(), key);
+        channels.insert(computer.to_ascii_uppercase(), state);
     }
 
-    /// The key of the channel `computer` established, when it has one.
-    pub(crate) fn channel_key(&self, computer: &str) -> Option<[u8; 32]> {
-        let keys = match self.schannel_keys.read() {
-            Ok(keys) => keys,
+    /// The channel `computer` proved, when it has one.
+    pub(crate) fn channel(&self, computer: &str) -> Option<ChannelState> {
+        let channels = match self.schannel_channels.read() {
+            Ok(channels) => channels,
             Err(poisoned) => poisoned.into_inner(),
         };
-        keys.get(&computer.to_ascii_uppercase()).copied()
+        channels.get(&computer.to_ascii_uppercase()).copied()
+    }
+
+    /// The signing key of the channel `computer` proved, when it has one.
+    pub(crate) fn channel_key(&self, computer: &str) -> Option<[u8; 32]> {
+        self.channel(computer).map(|state| state.key)
     }
 
     pub fn new(config: ServerConfig, users: ServerUsers, shares: Vec<Arc<ShareBindings>>) -> Self {
@@ -493,7 +524,7 @@ impl ServerState {
             max_opens_per_connection: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             ),
-            schannel_keys: std::sync::RwLock::new(std::collections::HashMap::new()),
+            schannel_channels: std::sync::RwLock::new(std::collections::HashMap::new()),
             max_locks_per_open: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),
