@@ -203,6 +203,9 @@ pub trait MachineSecrets: Send + Sync + std::fmt::Debug {
 pub struct ChannelState {
     /// The session key the channel's PDUs are signed with.
     pub key: [u8; 32],
+    /// The seed the credential chain advances from (MS-NRPC 3.1.4.1.3): the client credential as
+    /// the authenticate left it, and after each step the value both halves were computed from.
+    pub seed: [u8; 8],
     /// The credential the client sends.
     pub client_credential: [u8; 8],
     /// The credential this server answers with.
@@ -499,6 +502,23 @@ impl ServerState {
             Err(poisoned) => poisoned.into_inner(),
         };
         channels.get(&computer.to_ascii_uppercase()).copied()
+    }
+
+    /// Advances `computer`'s channel one step, under the lock, and returns what `step` made of it.
+    ///
+    /// The chain has to move on every call - the client computes the next pair before it sends - so
+    /// a reader that took a copy would answer with a credential the client has already left behind.
+    /// `None` when there is no channel to advance.
+    pub(crate) fn advance_channel<R>(
+        &self,
+        computer: &str,
+        step: impl FnOnce(&mut ChannelState) -> R,
+    ) -> Option<R> {
+        let mut channels = match self.schannel_channels.write() {
+            Ok(channels) => channels,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        channels.get_mut(&computer.to_ascii_uppercase()).map(step)
     }
 
     /// The signing key of the channel `computer` proved, when it has one.

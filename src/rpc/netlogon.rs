@@ -161,6 +161,41 @@ fn password_set2(
     })
 }
 
+/// Advances the credential chain one step, and returns the pair the step produced.
+///
+/// MS-NRPC 3.1.4.1.3, and Samba's `netlogon_creds_step` is the shape of it: the sequence number is
+/// the `timestamp` the CALLER sent - not a counter this server keeps - and each step derives both
+/// credentials from the seed, then moves the seed on. A channel that held one fixed pair would
+/// answer the first call correctly and every one after it wrongly, which is exactly what the stand
+/// showed: the credential at `netr_ServerAuthenticate3` and the one at `netr_LogonGetCapabilities`
+/// differ, and neither is an encryption of the other.
+///
+/// The arithmetic is little-endian on the seed's first word and leaves the second alone, because
+/// that is what `SIVAL` does in the reference implementation; read big-endian, the addition lands in
+/// the wrong half and every later credential is wrong.
+fn advance_credential(
+    channel: &mut crate::server::ChannelState,
+    sequence: u32,
+) -> ([u8; 8], [u8; 8]) {
+    let low = u32::from_le_bytes(
+        channel.seed[..4]
+            .try_into()
+            .expect("four octets of the seed"),
+    )
+    .wrapping_add(sequence);
+    let mut seed = channel.seed;
+    seed[..4].copy_from_slice(&low.to_le_bytes());
+    let client = credential_aes(&seed, &channel.key);
+
+    seed[..4].copy_from_slice(&low.wrapping_add(1).to_le_bytes());
+    let server = credential_aes(&seed, &channel.key);
+
+    channel.seed = seed;
+    channel.client_credential = client;
+    channel.server_credential = server;
+    (client, server)
+}
+
 /// `netr_LogonGetCapabilities`: what this server supports, said under the channel's own proof.
 ///
 /// Samba's `libnet_join` cannot finish without this call, and refuses three different answers with
@@ -198,9 +233,17 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
     let credential: [u8; 8] = credential
         .try_into()
         .map_err(|_| malformed_at("credential"))?;
-    let Some(_client_timestamp) = reader.bytes(8) else {
+    // The authenticator's second half is the sequence number the chain steps by: the reference
+    // implementation sets `creds->sequence` from it and never from its own count, so a server that
+    // kept a counter of its own would answer with a credential the client is not holding.
+    let Some(client_timestamp) = reader.bytes(8) else {
         return Err(malformed_hex("credential.timestamp", stub));
     };
+    let sequence = u32::from_le_bytes(
+        client_timestamp[..4]
+            .try_into()
+            .expect("four octets of the timestamp"),
+    );
     let Some(_return_authenticator) = reader.bytes(16) else {
         return Err(malformed_hex("return_authenticator", stub));
     };
@@ -208,10 +251,13 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         return Err(malformed_hex("query_level", stub));
     };
 
-    let channel = computer
-        .as_deref()
-        .and_then(|computer| server.channel(computer));
-    let Some(channel) = channel else {
+    // The chain moves under the lock, because it must move on every call: the client computes the
+    // next pair before it sends, so a reader that took a copy of the channel would answer with a
+    // credential already left behind - and the call after it would be wrong too.
+    let stepped = computer.as_deref().and_then(|computer| {
+        server.advance_channel(computer, |channel| advance_credential(channel, sequence))
+    });
+    let Some((expected_client, server_credential)) = stepped else {
         tracing::warn!(
             computer = computer.as_deref().unwrap_or("<none>"),
             "netlogon: capabilities asked for before a channel was proved"
@@ -225,14 +271,31 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
     // The client's half of the pair, compared in constant time: it is a secret of this channel, and
     // a comparison that stops at the first differing octet is a comparison that answers questions
     // about the ones it did compare.
-    if !rrl_crypto::ct_eq(&channel.client_credential, &credential) {
-        tracing::warn!("netlogon: capabilities asked for with the wrong credential");
+    if !rrl_crypto::ct_eq(&expected_client, &credential) {
+        tracing::warn!(
+            sequence,
+            "netlogon: capabilities asked for with a credential the chain does not produce"
+        );
         return Ok(capabilities_reply(
             None,
             query_level,
             NTSTATUS_ACCESS_DENIED,
         ));
     }
+    // The step has already moved the channel on, so what it holds now is what this call answers
+    // with: the flags are the ones both sides negotiated, and the credential is the second half the
+    // chain just produced.
+    let Some(channel) = computer
+        .as_deref()
+        .and_then(|computer| server.channel(computer))
+    else {
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
+    };
+    let _ = server_credential;
     if query_level != 1 {
         // The union has arms for 1 and 2 and this server has nothing to say at 2. Samba's own server
         // answers the same way, and a fault is what the client already handles for an old server.
@@ -525,6 +588,9 @@ fn authenticate3(
         &computer,
         crate::server::ChannelState {
             key: channel_key,
+            // The chain starts where the authenticate left it: the client's own half is the seed,
+            // exactly as `netlogon_creds_first_step` sets it.
+            seed: client_credential,
             client_credential,
             server_credential: answer,
             flags,
@@ -783,7 +849,7 @@ mod tests {
 
     /// A stub padded to four, the way NDR lays one out: the next referent starts on a boundary.
     fn pad(stub: &mut Vec<u8>) {
-        while stub.len() % 4 != 0 {
+        while !stub.len().is_multiple_of(4) {
             stub.push(0);
         }
     }
@@ -1106,23 +1172,54 @@ mod tests {
     /// is behind a referent, then the client's authenticator, the empty one it expects back, and
     /// the level. A parser that expected the server name behind a referent reads the first string's
     /// maximum count as that referent and then looks for the name eight octets early.
-    fn capabilities_stub(credential: &[u8; 8], query_level: u32) -> Vec<u8> {
+    fn capabilities_stub(credential: &[u8; 8], sequence: u32, query_level: u32) -> Vec<u8> {
         let mut stub = Vec::new();
         string(&mut stub, "\\\\samba.ad.example.com");
         stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
         string(&mut stub, "SAMBA");
         stub.extend_from_slice(credential);
-        stub.extend_from_slice(&[0u8; 8]);
+        // The authenticator's second half: the sequence the chain steps by, then two words of
+        // nothing, because `time_t` is eight octets.
+        let mut stamp = sequence.to_le_bytes().to_vec();
+        stamp.extend_from_slice(&[0u8; 4]);
+        stub.extend_from_slice(&stamp);
         stub.extend_from_slice(&[0u8; 16]);
         stub.extend_from_slice(&query_level.to_le_bytes());
         stub
     }
 
-    /// A server state holding the channel the authenticate proved.
+    /// One live channel, from a join that reached the capabilities call.
+    ///
+    /// Held as octets rather than recomputed so that the test is an oracle and not a mirror: the
+    /// session key, the credential the client sent at `netr_ServerAuthenticate3` (which is also the
+    /// chain's seed), the sequence it sent with the capabilities call, and both halves that call
+    /// produced. The expected values come from an independent computation over these octets.
+    const LIVE_KEY: &str = "9bb79993694b31a684786abbaabdaec7b57d8beaa426a85470f6a59a182791fa";
+    const LIVE_SEED: &str = "d31ebd87cf8e814d";
+    const LIVE_SEQUENCE: u32 = 1_794_403_242;
+    const LIVE_CLIENT: &str = "61c0b6c4c89e7180";
+    const LIVE_SERVER: &str = "6211ad7dd60011b9";
+    const LIVE_NEXT_SEED: &str = "7e8ab1f2cf8e814d";
+
+    fn octets(text: &str) -> [u8; 8] {
+        hex::decode(text)
+            .expect("hex")
+            .try_into()
+            .expect("eight octets")
+    }
+
+    fn live_key() -> [u8; 32] {
+        hex::decode(LIVE_KEY)
+            .expect("hex")
+            .try_into()
+            .expect("32 octets")
+    }
+
+    /// A state holding the live channel, with the flags that join negotiated.
     ///
     /// Built directly rather than through the builder, like the `lsarpc` tests: the channel lives on
     /// the state because the call that reads it arrives on another pipe.
-    fn proved(client: [u8; 8], server: [u8; 8], flags: u32) -> ServerState {
+    fn proved() -> ServerState {
         let state = ServerState::new(
             crate::server::ServerConfig::for_test(),
             crate::server::ServerUsers {
@@ -1133,31 +1230,85 @@ mod tests {
         state.remember_channel(
             "SAMBA",
             crate::server::ChannelState {
-                key: [0x44; 32],
-                client_credential: client,
-                server_credential: server,
-                flags,
+                key: live_key(),
+                seed: octets(LIVE_SEED),
+                client_credential: octets(LIVE_SEED),
+                server_credential: octets("891125d2c1847fe9"),
+                flags: 0x610f_ffff,
             },
         );
         state
     }
 
-    /// The answer carries the half the client holds, and the flags it negotiated - exactly.
+    /// The chain reproduces both halves a live client and a live server exchanged.
+    ///
+    /// This is the test that settles what a credential is. It is not a constant derived at the
+    /// authenticate: the client steps it before every call, from a seed the previous step left
+    /// behind, keyed by the sequence number it sends. A server that answered with the authenticate's
+    /// value - or with an encryption of it - is refused, measured, with `ACCESS_DENIED`.
+    #[test]
+    fn the_credential_chain_reproduces_a_live_step() {
+        let mut channel = crate::server::ChannelState {
+            key: live_key(),
+            seed: octets(LIVE_SEED),
+            client_credential: octets(LIVE_SEED),
+            server_credential: octets("891125d2c1847fe9"),
+            flags: 0x610f_ffff,
+        };
+        let (client, server) = advance_credential(&mut channel, LIVE_SEQUENCE);
+
+        assert_eq!(client, octets(LIVE_CLIENT), "the half the client sent");
+        assert_eq!(server, octets(LIVE_SERVER), "the half the server owed it");
+        assert_eq!(
+            channel.seed,
+            octets(LIVE_NEXT_SEED),
+            "the seed the next call steps from"
+        );
+    }
+
+    /// A second call steps again, from the seed the first left: the chain is a chain, not a pair.
+    #[test]
+    fn each_call_advances_the_chain() {
+        let mut channel = crate::server::ChannelState {
+            key: live_key(),
+            seed: octets(LIVE_SEED),
+            client_credential: octets(LIVE_SEED),
+            server_credential: octets("891125d2c1847fe9"),
+            flags: 0x610f_ffff,
+        };
+        let (first_client, _) = advance_credential(&mut channel, LIVE_SEQUENCE);
+        let (second_client, _) = advance_credential(&mut channel, LIVE_SEQUENCE + 1);
+
+        assert_eq!(first_client, octets(LIVE_CLIENT));
+        assert_ne!(
+            second_client, first_client,
+            "the same credential twice is a replay this server would accept"
+        );
+        assert_eq!(
+            channel.seed[4..],
+            octets(LIVE_NEXT_SEED)[4..],
+            "the second word of the seed is carried, not stepped"
+        );
+    }
+
+    /// The answer carries the half the chain produced, and the flags it negotiated - exactly.
     ///
     /// Samba's client compares `server_capabilities` against `creds->negotiate_flags` for equality
     /// and refuses anything else as a downgrade, so a superset is as wrong as a zero.
     #[test]
     fn the_capabilities_answer_carries_the_half_the_client_expects() {
-        let flags = 0x0102_0003;
-        let state = proved([0x11; 8], [0x22; 8], flags);
-        let reply =
-            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 1)).expect("answered");
+        let state = proved();
+        let reply = logon_get_capabilities(
+            &state,
+            &capabilities_stub(&octets(LIVE_CLIENT), LIVE_SEQUENCE, 1),
+        )
+        .expect("answered");
 
         assert_eq!(reply.len(), 28, "16 + discriminant + capabilities + status");
         assert_eq!(
             &reply[..8],
-            &[0x22; 8],
-            "the server's own half, not the client's"
+            &octets(LIVE_SERVER),
+            "the server's half of the chain, not the client's"
         );
         assert_eq!(
             u32::from_le_bytes(reply[16..20].try_into().expect("level")),
@@ -1166,7 +1317,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(reply[20..24].try_into().expect("capabilities")),
-            flags,
+            0x610f_ffff,
             "the flags both sides negotiated, and nothing else"
         );
         assert_eq!(
@@ -1175,12 +1326,15 @@ mod tests {
         );
     }
 
-    /// A credential that is not the channel's is refused, and the refusal is still the right shape.
+    /// A credential the chain does not produce is refused, and the refusal is still the right shape.
     #[test]
     fn capabilities_with_the_wrong_credential_are_refused() {
-        let state = proved([0x11; 8], [0x22; 8], 0x0102_0003);
-        let reply =
-            logon_get_capabilities(&state, &capabilities_stub(&[0x33; 8], 1)).expect("answered");
+        let state = proved();
+        let reply = logon_get_capabilities(
+            &state,
+            &capabilities_stub(&octets("0000000000000001"), LIVE_SEQUENCE, 1),
+        )
+        .expect("answered");
 
         assert_eq!(reply.len(), 28, "a refusal is the same shape");
         assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
@@ -1198,9 +1352,12 @@ mod tests {
     /// Level 2 is not answered, and is not answered as though it were level 1.
     #[test]
     fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
-        let state = proved([0x11; 8], [0x22; 8], 0x0102_0003);
-        let reply =
-            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 2)).expect("answered");
+        let state = proved();
+        let reply = logon_get_capabilities(
+            &state,
+            &capabilities_stub(&octets(LIVE_CLIENT), LIVE_SEQUENCE, 2),
+        )
+        .expect("answered");
 
         assert_eq!(reply.len(), 28);
         assert_eq!(
@@ -1224,8 +1381,11 @@ mod tests {
             },
             Vec::new(),
         );
-        let reply =
-            logon_get_capabilities(&state, &capabilities_stub(&[0x11; 8], 1)).expect("answered");
+        let reply = logon_get_capabilities(
+            &state,
+            &capabilities_stub(&octets(LIVE_CLIENT), LIVE_SEQUENCE, 1),
+        )
+        .expect("answered");
 
         assert_eq!(reply.len(), 28);
         assert_eq!(
