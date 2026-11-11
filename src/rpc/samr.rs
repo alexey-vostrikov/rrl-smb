@@ -39,6 +39,11 @@ const SAMR_CONNECT_AFTER_W2K: u32 = 3;
 /// MS-ERREF: the call is understood and this server does not do it.
 const NTSTATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const NTSTATUS_SUCCESS: u32 = 0x0000_0000;
+/// `STATUS_NONE_MAPPED`: none of the names resolved. An error, not a warning: a client that read
+/// RID 0 with success would treat account zero as the account it asked for.
+const STATUS_NONE_MAPPED: u32 = 0xC000_0073;
+/// `STATUS_SOME_NOT_MAPPED`: a warning, not an error - some names resolved and some did not.
+const STATUS_SOME_NOT_MAPPED: u32 = 0x0000_0107;
 
 /// `samr_Connect` (opnum 0): the oldest form, still asked for by some clients.
 pub(crate) const OPNUM_CONNECT: u16 = 0;
@@ -46,6 +51,9 @@ pub(crate) const OPNUM_CONNECT: u16 = 0;
 pub(crate) const OPNUM_CLOSE: u16 = 1;
 /// `samr_LookupDomain` (opnum 5): the SID of a domain, by name.
 pub(crate) const OPNUM_LOOKUP_DOMAIN: u16 = 5;
+/// `samr_LookupNames` (0x11): a name to a RID and a name type. What a join calls on the machine
+/// account it has just created, before it can set that account's password.
+pub(crate) const OPNUM_LOOKUP_NAMES: u16 = 17;
 /// `samr_OpenDomain` (opnum 7).
 pub(crate) const OPNUM_OPEN_DOMAIN: u16 = 7;
 /// `samr_CreateUser2` (opnum 50): where the machine account would be created.
@@ -81,6 +89,7 @@ pub(crate) fn dispatch(
         OPNUM_CLOSE => close_handle(stub),
         OPNUM_OPEN_DOMAIN => open_domain(stub),
         OPNUM_LOOKUP_DOMAIN => lookup_domain(config, stub),
+        OPNUM_LOOKUP_NAMES => lookup_names(config, stub),
         OPNUM_CREATE_USER2 => create_user2(stub),
         other => {
             // The number goes to the log: a client reports only "the procedure number is out of
@@ -95,6 +104,123 @@ pub(crate) fn dispatch(
                 did_not_execute: true,
             })
         }
+    }
+}
+
+/// `samr_LookupNames` (opnum 0x11): `[in] policy_handle domain`, `[in] uint32 num_names`,
+/// `[in,size_is(1000),length_is(num_names)] lsa_String names[]`, out `samr_Ids rids`,
+/// out `samr_Ids types`.
+///
+/// The caller is a join: it has just created the account and needs its RID before it can set that
+/// account's password. The type reported is **`SID_NAME_USER`** for a machine account, not
+/// `SID_NAME_COMPUTER`: Samba's `libnet_join.c` refuses anything else at this exact call, with the
+/// comment "We *must* do this.... don't ask...", and answers `INVALID_WORKSTATION` even when the RID
+/// is right.
+fn lookup_names(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    /// `SID_NAME_USER`. A machine account is a user account to SAMR, whatever the directory thinks.
+    const SID_NAME_USER: u32 = 1;
+    /// `SID_NAME_UNKNOWN`: a name this server could not resolve.
+    const SID_NAME_UNKNOWN: u32 = 0;
+
+    let mut reader = NdrReader::new(stub);
+    let Some(_handle) = reader.bytes(20) else {
+        return Err(malformed_at("domain_handle"));
+    };
+    let Some(count) = reader.u32() else {
+        return Err(malformed_at("num_names"));
+    };
+    // The conformant-varying array's own header. `size_is(1000)` is the maximum the interface
+    // allows; the offset is zero for an array that was not sliced; the third word is what is
+    // actually there.
+    let Some(max) = reader.u32() else {
+        return Err(malformed_at("names.max_count"));
+    };
+    let Some(_offset) = reader.u32() else {
+        return Err(malformed_at("names.offset"));
+    };
+    let Some(present) = reader.u32() else {
+        return Err(malformed_at("names.actual_count"));
+    };
+    // The count and the array must agree, and a count beyond the array's maximum is a client that
+    // disagrees with the interface about the shape of the call.
+    if present != count || count > max {
+        return Err(malformed_at("names.actual_count"));
+    }
+
+    // One referent per name, then the strings themselves in the deferred section.
+    for _ in 0..count {
+        match reader.pointer() {
+            Some(true) => {}
+            _ => return Err(malformed_at("names[].name")),
+        }
+    }
+
+    let mut names = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(units) = reader.string() else {
+            return Err(malformed_at("names[].name"));
+        };
+        names.push(String::from_utf16_lossy(&units).trim().to_string());
+    }
+
+    // The RID and the type, per name. A name the directory does not serve keeps RID 0 and
+    // `SID_NAME_UNKNOWN`, and the status says so - zero with success would read as an account.
+    let mut rids = Vec::with_capacity(names.len());
+    let mut types = Vec::with_capacity(names.len());
+    let mut mapped = 0usize;
+    for name in &names {
+        match config
+            .machine_secrets
+            .as_ref()
+            .and_then(|secrets| secrets.machine(name))
+        {
+            Some(account) => {
+                rids.push(account.rid);
+                types.push(SID_NAME_USER);
+                mapped += 1;
+            }
+            None => {
+                rids.push(0);
+                types.push(SID_NAME_UNKNOWN);
+            }
+        }
+    }
+
+    let status = if mapped == names.len() && mapped > 0 {
+        NTSTATUS_SUCCESS
+    } else if mapped == 0 {
+        STATUS_NONE_MAPPED
+    } else {
+        // Some of the names resolved: a warning, and the client reads the array.
+        STATUS_SOME_NOT_MAPPED
+    };
+
+    let mut writer = NdrWriter::new();
+    write_samr_ids(&mut writer, &rids);
+    write_samr_ids(&mut writer, &types);
+    writer.u32(status);
+    Ok(writer.finish())
+}
+
+/// The stub ended before a field this call reads.
+fn malformed_at(field: &str) -> Fault {
+    tracing::warn!(field, "samr: the request stub ends before this field");
+    Fault {
+        status: 0x0002_0004, // NT_STATUS_INFO_LENGTH_MISMATCH
+        did_not_execute: true,
+    }
+}
+
+/// One `samr_Ids`: a count, and a conformant array of that many words behind a pointer.
+fn write_samr_ids(writer: &mut NdrWriter, ids: &[u32]) {
+    writer.pointer(true);
+    writer.u32(u32::try_from(ids.len()).unwrap_or(u32::MAX));
+    writer.pointer(true);
+    // A conformant array carries its maximum before the values; no offset, because
+    // `[size_is(count)]` without `length_is` is not varying.
+    writer.u32(u32::try_from(ids.len()).unwrap_or(u32::MAX));
+    for id in ids {
+        writer.u32(*id);
     }
 }
 
@@ -464,5 +590,196 @@ mod tests {
         let fault = dispatch(&config(), 40, &[]).expect_err("no handler");
 
         assert_eq!(fault.status, NCA_OP_RNG_ERROR);
+    }
+
+    /// A directory with one machine account, and nothing else.
+    #[derive(Debug)]
+    struct OneMachine {
+        name: String,
+        rid: u32,
+    }
+
+    impl crate::server::MachineSecrets for OneMachine {
+        fn machine(&self, account: &str) -> Option<crate::server::MachineAccount> {
+            if account.eq_ignore_ascii_case(&self.name) {
+                Some(crate::server::MachineAccount {
+                    nt_hash: [0x5a; 16],
+                    rid: self.rid,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    fn config_with_machine(name: &str, rid: u32) -> ServerConfig {
+        let mut config = config();
+        config.machine_secrets = Some(std::sync::Arc::new(OneMachine {
+            name: name.to_string(),
+            rid,
+        }));
+        config
+    }
+
+    /// The stub Samba sends: a domain handle, one or more names, and each name behind its pointer.
+    fn lookup_names_stub(names: &[&str]) -> Vec<u8> {
+        let count = u32::try_from(names.len()).expect("a small count");
+        let mut stub = Vec::new();
+        stub.extend_from_slice(&samr_handle());
+        stub.extend_from_slice(&count.to_le_bytes());
+        // The conformant-varying array: the maximum the interface allows, the offset, and how many
+        // are actually there.
+        stub.extend_from_slice(&1000u32.to_le_bytes());
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        stub.extend_from_slice(&count.to_le_bytes());
+        for _ in names {
+            stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        }
+        for name in names {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let length = u32::try_from(units.len() + 1).expect("a short name");
+            stub.extend_from_slice(&length.to_le_bytes());
+            stub.extend_from_slice(&0u32.to_le_bytes());
+            stub.extend_from_slice(&length.to_le_bytes());
+            for unit in units {
+                stub.extend_from_slice(&unit.to_le_bytes());
+            }
+            stub.extend_from_slice(&0u16.to_le_bytes());
+            while !stub.len().is_multiple_of(4) {
+                stub.push(0);
+            }
+        }
+        stub
+    }
+
+    /// The two `samr_Ids` a reply carries, read back so a test asserts on values rather than on
+    /// offsets. Returns the count, the ids, and where the struct ended.
+    fn samr_ids(reply: &[u8], at: usize) -> (usize, Vec<u32>, usize) {
+        let word = |offset: usize| {
+            u32::from_le_bytes(
+                reply[offset..offset + 4]
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("four octets at {offset} of {}", reply.len())),
+            )
+        };
+        assert_ne!(word(at), 0, "an out struct travels behind a pointer");
+        let count = word(at + 4) as usize;
+        assert_ne!(word(at + 8), 0, "the ids array travels behind a pointer");
+        let max = word(at + 12) as usize;
+        let ids = (0..max).map(|i| word(at + 16 + 4 * i)).collect();
+        (count, ids, at + 16 + 4 * max)
+    }
+
+    /// A machine account is found by the name a join asks for, and reported as a **user**.
+    ///
+    /// The name type is measured, not guessed: Samba's `libnet_join.c` refuses anything but
+    /// `SID_NAME_USER` at the lookup it makes right after creating the account, with the comment
+    /// "We *must* do this.... don't ask...", and answers `INVALID_WORKSTATION` even when the RID is
+    /// right. Reporting `SID_NAME_COMPUTER` - what AD calls a machine - fails the join.
+    #[test]
+    fn a_machine_account_is_looked_up_by_name_and_reported_as_a_user() {
+        let config = config_with_machine("SAMBA$", 1000);
+        let body = dispatch(&config, OPNUM_LOOKUP_NAMES, &lookup_names_stub(&["SAMBA$"]))
+            .expect("answered");
+
+        let (rids_count, rids, after_rids) = samr_ids(&body, 0);
+        assert_eq!(rids_count, 1, "one name asked, one RID answered");
+        assert_eq!(rids, vec![1000]);
+
+        let (types_count, types, after_types) = samr_ids(&body, after_rids);
+        assert_eq!(types_count, 1);
+        assert_eq!(
+            types,
+            vec![1],
+            "SID_NAME_USER, which is what a join demands"
+        );
+
+        assert_eq!(
+            u32::from_le_bytes(
+                body[after_types..after_types + 4]
+                    .try_into()
+                    .expect("status")
+            ),
+            NTSTATUS_SUCCESS
+        );
+    }
+
+    /// A name this server does not serve is reported as unmapped, not as somebody's RID.
+    #[test]
+    fn an_unknown_name_maps_to_nothing() {
+        let config = config_with_machine("SAMBA$", 1000);
+        let body = dispatch(&config, OPNUM_LOOKUP_NAMES, &lookup_names_stub(&["GHOST$"]))
+            .expect("answered");
+
+        let (_, rids, after_rids) = samr_ids(&body, 0);
+        assert_eq!(rids, vec![0], "an unmapped name has no RID");
+        let (_, types, after_types) = samr_ids(&body, after_rids);
+        assert_eq!(types, vec![0], "SID_NAME_UNKNOWN");
+        assert_eq!(
+            u32::from_le_bytes(
+                body[after_types..after_types + 4]
+                    .try_into()
+                    .expect("status")
+            ),
+            STATUS_NONE_MAPPED,
+            "no name mapped is the status that says so"
+        );
+    }
+
+    /// A server with no directory behind it maps nothing, and says so rather than answering zero
+    /// with success - which a client reads as "the account exists with RID 0".
+    #[test]
+    fn without_a_directory_no_name_maps() {
+        let config = config();
+        assert!(config.machine_secrets.is_none(), "the fixture has none");
+        let body = dispatch(&config, OPNUM_LOOKUP_NAMES, &lookup_names_stub(&["SAMBA$"]))
+            .expect("answered");
+
+        let (_, rids, after_rids) = samr_ids(&body, 0);
+        assert_eq!(rids, vec![0]);
+        let (_, _, after_types) = samr_ids(&body, after_rids);
+        assert_eq!(
+            u32::from_le_bytes(
+                body[after_types..after_types + 4]
+                    .try_into()
+                    .expect("status")
+            ),
+            STATUS_NONE_MAPPED
+        );
+    }
+
+    /// Two names, one served and one not: the array keeps its order, and the status is the warning
+    /// that says half of it worked.
+    ///
+    /// A single-name fixture cannot tell "maps each name" from "maps the first and copies it", and
+    /// `STATUS_SOME_NOT_MAPPED` is unreachable with one name - which is how a branch that returns
+    /// it came to sit untested.
+    #[test]
+    fn a_partly_mapped_request_answers_both_slots() {
+        let config = config_with_machine("SAMBA$", 1000);
+        let body = dispatch(
+            &config,
+            OPNUM_LOOKUP_NAMES,
+            &lookup_names_stub(&["SAMBA$", "GHOST$"]),
+        )
+        .expect("answered");
+
+        let (rids_count, rids, after_rids) = samr_ids(&body, 0);
+        assert_eq!(rids_count, 2);
+        assert_eq!(
+            rids,
+            vec![1000, 0],
+            "the RID stays in the position asked for"
+        );
+        let (_, types, after_types) = samr_ids(&body, after_rids);
+        assert_eq!(types, vec![1, 0]);
+        assert_eq!(
+            u32::from_le_bytes(
+                body[after_types..after_types + 4]
+                    .try_into()
+                    .expect("status")
+            ),
+            STATUS_SOME_NOT_MAPPED
+        );
     }
 }
