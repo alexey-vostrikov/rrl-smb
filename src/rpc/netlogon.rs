@@ -370,13 +370,18 @@ fn authenticate3(
 /// session key, which [`credential_aes`] computes.
 const SUPPORTS_AES: u32 = 0x0100_0000;
 
+/// `NETLOGON_NEG_PASSWORD_SET2` (0x00020000): `netr_ServerPasswordSet2` is served. Samba requires
+/// it of an AD domain and answers `DOWNGRADE_DETECTED` without it - measured: a join aborted right
+/// after `ServerAuthenticate3` while the credential itself matched.
+const PASSWORD_SET2: u32 = 0x0002_0000;
+
 fn server_flags(client: u32) -> u32 {
     /// `NETLOGON_NEG_STRONG_KEYS` (0x00004000): a 128-bit session key.
     const STRONG_KEYS: u32 = 0x0000_4000;
     /// `NETLOGON_NEG_AUTHENTICATED_RPC` (0x40000000): the channel is checked, not anonymous.
     const AUTHENTICATED_RPC: u32 = 0x4000_0000;
 
-    client & (STRONG_KEYS | SUPPORTS_AES | AUTHENTICATED_RPC)
+    client & (STRONG_KEYS | SUPPORTS_AES | AUTHENTICATED_RPC | PASSWORD_SET2)
 }
 
 /// `HMAC_MD5(nt_hash, MD5(Z(4) || client_challenge || server_challenge))`.
