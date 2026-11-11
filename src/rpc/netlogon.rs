@@ -484,9 +484,14 @@ mod tests {
     #[test]
     fn a_stub_that_stops_before_the_challenge_is_a_protocol_error() {
         let mut session = Session::default();
-        let full = request(&[0; 8]);
-        let fault = request_challenge(&mut session, &full[..full.len() - 4])
-            .expect_err("four octets are not eight");
+        // The pointer and the computer name, and then nothing: the challenge has not arrived, and a
+        // server that filled it with zeros would answer a challenge nobody sent.
+        let mut stub = Vec::new();
+        stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        string(&mut stub, "SAMBA");
+        stub.extend_from_slice(&[0u8; 4]);
+
+        let fault = request_challenge(&mut session, &stub).expect_err("four octets are not eight");
         assert_eq!(fault.status, crate::rpc::pdu::NCA_PROTO_ERROR);
         assert!(session.challenge().is_none(), "nothing half-stored");
     }
