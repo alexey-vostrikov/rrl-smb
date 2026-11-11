@@ -39,6 +39,10 @@ cap-primitives = "~3.4"
 
 # RustCrypto family
 hmac  = "0.12"
+# netlogon's credential: two DES passes over one block (MS-NRPC 3.1.4.4.1). Also named under
+# dev-dependencies for the NTLM tests, which is where it lived before a secure channel needed it in
+# the library itself.
+des   = "0.9"
 sha2  = "0.10"
 md-5  = "0.10"
 md4   = "0.10"
@@ -61,6 +65,8 @@ cap-std = { workspace = true, optional = true }
 hmac.workspace = true
 sha2.workspace = true
 md-5.workspace = true
+# netlogon's credential: two DES passes over one block (MS-NRPC 3.1.4.4.1).
+des.workspace = true
 md4.workspace = true
 aes.workspace = true
 cmac.workspace = true

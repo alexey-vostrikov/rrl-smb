@@ -179,6 +179,40 @@ impl ShareBindings {
 // ServerConfig / ServerUsers / ServerState
 // ---------------------------------------------------------------------------
 
+/// What a machine account is, for the two calls that must state it.
+///
+/// A secure channel is proved with the machine password, and the password reaches this crate as an
+/// NT hash and nothing else: MD4 of its UTF-16LE form, the value a directory stores so that a
+/// logon can be checked without keeping anything reversible. This crate is a library and holds no
+/// directory, so it asks whoever owns the accounts.
+///
+/// `None` means "no such account", which is a refusal and not a guess: answering with the wrong
+/// hash would authenticate a client against a password nobody set.
+pub trait MachineSecrets: Send + Sync + std::fmt::Debug {
+    /// The hash and RID of `account`, or `None` when this server does not serve it.
+    fn machine(&self, account: &str) -> Option<MachineAccount>;
+}
+
+/// What a machine account's secure channel is checked against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MachineAccount {
+    /// MD4 of the password in UTF-16LE, little endian: what `unicodePwd` becomes.
+    pub nt_hash: [u8; 16],
+    /// The account's RID, which `netr_ServerAuthenticate3` reports and a member stores.
+    pub rid: u32,
+}
+
+impl std::fmt::Debug for MachineAccount {
+    /// The hash never prints: a debug line is read in a terminal, a terminal is logged, and the
+    /// hash is the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineAccount")
+            .field("nt_hash", &"<redacted>")
+            .field("rid", &self.rid)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
@@ -208,6 +242,11 @@ pub struct ServerConfig {
     pub max_write_size: u32,
     pub server_guid: Uuid,
     pub limits: Limits,
+    /// Where the machine accounts' NT hashes come from, for the secure channel a join establishes.
+    ///
+    /// Absent means this server cannot prove a machine password, and `netlogon` says so instead of
+    /// accepting any: a file-sharing server with no domain behind it is the ordinary case.
+    pub machine_secrets: Option<Arc<dyn MachineSecrets>>,
     /// IPC$ serves the srvsvc pipe, so clients can list the shares.
     pub share_listing: bool,
     /// The model string of `AAPL` replies; `None` when the server ignores
@@ -237,6 +276,7 @@ impl ServerConfig {
             max_write_size: 1 << 20,
             server_guid: Uuid::from_u128(0x4718_b1fd_2307_7646_ac58_827a_af7d_daaf),
             limits: Limits::default(),
+            machine_secrets: None,
             share_listing: true,
             apple_model: None,
             #[cfg(feature = "discovery")]
