@@ -247,6 +247,13 @@ pub struct ServerConfig {
     /// Absent means this server cannot prove a machine password, and `netlogon` says so instead of
     /// accepting any: a file-sharing server with no domain behind it is the ordinary case.
     pub machine_secrets: Option<Arc<dyn MachineSecrets>>,
+    /// Serve the secure channel of a client that offers no AES, which means DES.
+    ///
+    /// Off by default, and deliberately a setting rather than a build feature: DES is a 56-bit
+    /// cipher and it exists here for one call (`ComputeNetlogonCredential` on a legacy channel).
+    /// With it off, a client that does not offer `NETLOGON_NEG_SUPPORTS_AES` is refused with
+    /// `NOT_SUPPORTED` and a line naming the setting, instead of being told its password is wrong.
+    pub netlogon_des: bool,
     /// IPC$ serves the srvsvc pipe, so clients can list the shares.
     pub share_listing: bool,
     /// The model string of `AAPL` replies; `None` when the server ignores
@@ -277,6 +284,7 @@ impl ServerConfig {
             server_guid: Uuid::from_u128(0x4718_b1fd_2307_7646_ac58_827a_af7d_daaf),
             limits: Limits::default(),
             machine_secrets: None,
+            netlogon_des: false,
             share_listing: true,
             apple_model: None,
             #[cfg(feature = "discovery")]

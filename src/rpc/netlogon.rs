@@ -284,17 +284,29 @@ fn authenticate3(
 
     // Which credential the client computed is decided by the flags, not by preference: with
     // `NETLOGON_NEG_SUPPORTS_AES` it uses a 32-octet HMAC-SHA256 session key and AES-128-CFB8,
-    // without it the 16-octet HMAC-MD5 key and two DES passes. Both are checked here so that a
-    // client that negotiated either can open a channel.
+    // without it the 16-octet HMAC-MD5 key and two DES passes.
     let aes = client_flags & SUPPORTS_AES != 0;
-    let expected = if aes {
-        credential_aes(
-            &challenge.client,
-            &session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server),
-        )
-    } else {
-        let key = session_key(&machine.nt_hash, &challenge.client, &challenge.server);
-        credential(&challenge.client, &key)
+    let des = server.config.netlogon_des;
+    let Some(expected) = expected_credential(
+        &machine.nt_hash,
+        aes,
+        des,
+        &challenge.client,
+        &challenge.server,
+    ) else {
+        // Fail fast and loudly. Answering with the AES flags and then checking DES - or the
+        // reverse - is a channel that refuses a correct password with no way to tell why.
+        tracing::warn!(
+            account = %account,
+            client_flags = format_args!("{client_flags:#010x}"),
+            "netlogon: the client offered no AES channel and netlogon_des is off; \
+             refusing the channel"
+        );
+        return Ok(refusal(
+            server_flags(client_flags),
+            0,
+            NTSTATUS_NOT_SUPPORTED,
+        ));
     };
     // TEMP-DIAG: every input and both outputs, so the arithmetic can be redone outside.
     if std::env::var_os("NETLOGON_DIAG").is_some() {
@@ -324,17 +336,16 @@ fn authenticate3(
         ));
     }
 
-    let answer = if aes {
-        credential_aes(
-            &challenge.server,
-            &session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server),
-        )
-    } else {
-        credential(
-            &challenge.server,
-            &session_key(&machine.nt_hash, &challenge.client, &challenge.server),
-        )
-    };
+    // The same computation over the server's challenge: a client that could not derive it would
+    // have opened a channel with a server it cannot authenticate in return.
+    let answer = expected_credential(
+        &machine.nt_hash,
+        aes,
+        des,
+        &challenge.server,
+        &challenge.client,
+    )
+    .expect("the same flags and the same setting decided the client credential a line earlier");
     let flags = server_flags(client_flags);
     tracing::info!(
         account = %account,
@@ -398,6 +409,31 @@ fn credential(input: &[u8; 8], session_key: &[u8; 16]) -> [u8; 8] {
         cipher.encrypt_block(&mut block);
     }
     block.into()
+}
+
+/// The credential a client computed, or `None` when this server does not serve that channel.
+///
+/// AES needs nothing beyond what every build has. DES is a 56-bit cipher kept for one call, and
+/// whether to serve it is a deployment decision rather than a build one: `ServerConfig::netlogon_des`
+/// turns it on, and with it off a client that offers no AES is refused instead of being handed a
+/// channel nobody derived a credential for.
+fn expected_credential(
+    nt_hash: &[u8; 16],
+    aes: bool,
+    des: bool,
+    input: &[u8; 8],
+    other: &[u8; 8],
+) -> Option<[u8; 8]> {
+    if aes {
+        return Some(credential_aes(
+            input,
+            &session_key_aes(nt_hash, input, other),
+        ));
+    }
+    if !des {
+        return None;
+    }
+    Some(credential(input, &session_key(nt_hash, input, other)))
 }
 
 /// The 32-octet session key of an AES secure channel: `HMAC_SHA256(nt_hash, client || server)`.
