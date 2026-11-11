@@ -147,8 +147,23 @@ fn lookup_names(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec
         return Err(malformed_at("names.actual_count", stub));
     }
 
-    // One referent per name, then the strings themselves in the deferred section.
+    // An `lsa_String` is not a bare pointer, whatever the IDL's wording suggests: it is a
+    // two-octet length in **octets**, a two-octet size, and the pointer, then the characters in
+    // the deferred section. Measured from a live stub of 68 octets holding one name:
+    //
+    //   0c00 0c00 00000200   "samba$" is twelve octets, behind a referent
+    //   06000000 00000000 06000000  then six UTF-16 units - length counts octets, the array counts
+    //                              units, and both are right
+    //
+    // Reading it as a bare pointer consumed the length and the size as that pointer and then
+    // looked for a string header eight octets early.
     for _ in 0..count {
+        let Some(_length) = reader.u16() else {
+            return Err(malformed_at("names[].length", stub));
+        };
+        let Some(_size) = reader.u16() else {
+            return Err(malformed_at("names[].size", stub));
+        };
         match reader.pointer() {
             Some(true) => {}
             _ => return Err(malformed_at("names[].name", stub)),
@@ -642,21 +657,23 @@ mod tests {
         stub.extend_from_slice(&1000u32.to_le_bytes());
         stub.extend_from_slice(&0u32.to_le_bytes());
         stub.extend_from_slice(&count.to_le_bytes());
-        for _ in names {
+        for name in names {
+            // `lsa_String`: the length in octets, the size, then the referent.
+            let octets = u16::try_from(name.len() * 2).expect("a short name");
+            stub.extend_from_slice(&octets.to_le_bytes());
+            stub.extend_from_slice(&octets.to_le_bytes());
             stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
         }
         for name in names {
+            // The characters as a conformant-varying array of units, with no terminator: a live
+            // client's name is six units for "samba$", not seven.
             let units: Vec<u16> = name.encode_utf16().collect();
-            let length = u32::try_from(units.len() + 1).expect("a short name");
+            let length = u32::try_from(units.len()).expect("a short name");
             stub.extend_from_slice(&length.to_le_bytes());
             stub.extend_from_slice(&0u32.to_le_bytes());
             stub.extend_from_slice(&length.to_le_bytes());
             for unit in units {
                 stub.extend_from_slice(&unit.to_le_bytes());
-            }
-            stub.extend_from_slice(&0u16.to_le_bytes());
-            while !stub.len().is_multiple_of(4) {
-                stub.push(0);
             }
         }
         stub
