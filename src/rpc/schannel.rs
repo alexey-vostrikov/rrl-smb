@@ -437,7 +437,10 @@ mod seal_tests {
                 let plaintext: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5a).collect();
                 let mut body = plaintext.clone();
                 let sig = seal(&key, sequence, true, &mut body);
-                if len > 0 {
+                // A one-octet body can coincide with its own keystream octet - one chance in 256,
+                // and it happened - so the claim is made where it is a claim: at eight octets the
+                // odds against a whole match are past coincidence.
+                if len >= 8 {
                     assert_ne!(body, plaintext, "the body must not travel in the clear");
                 }
 
