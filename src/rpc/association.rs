@@ -9,9 +9,9 @@ use tracing::debug;
 
 use super::pdu::{
     self, Body, ContextElem, ContextResult, FAULT_ACCESS_DENIED, Header, LSARPC, MAX_FRAG,
-    NCA_PROTO_ERROR, NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, PFC_DID_NOT_EXECUTE, PFC_FIRST_FRAG,
-    PFC_LAST_FRAG, PTYPE_ALTER_CONTEXT, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND, PTYPE_BIND_ACK,
-    RESPONSE_HEADER_LEN, Request, SAMR, SRVSVC, SyntaxId,
+    NCA_PROTO_ERROR, NCA_SERVER_TOO_BUSY, NCA_UNK_IF, NDR, NETLOGON, PFC_DID_NOT_EXECUTE,
+    PFC_FIRST_FRAG, PFC_LAST_FRAG, PTYPE_ALTER_CONTEXT, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND,
+    PTYPE_BIND_ACK, RESPONSE_HEADER_LEN, Request, SAMR, SRVSVC, SyntaxId,
 };
 
 /// Largest request stub one call may reassemble.
@@ -419,6 +419,7 @@ impl Association {
                 if c.abstract_syntax != SRVSVC
                     && c.abstract_syntax != LSARPC
                     && c.abstract_syntax != SAMR
+                    && c.abstract_syntax != NETLOGON
                 {
                     return reject(ABSTRACT_SYNTAX_NOT_SUPPORTED);
                 }
