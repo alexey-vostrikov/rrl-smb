@@ -233,31 +233,44 @@ impl ShiftIn for [u8; 16] {
     }
 }
 
-/// The signature for `data` at `sequence`, and the sealed body.
+/// The signature for `data`, and the body sealed under it.
 ///
 /// The order is the protocol's and each step depends on the one before: the checksum covers the
-/// *plaintext*, the sequence number is encrypted under the checksum, and only then is the body
-/// sealed under the sequence number. Doing them in another order produces a blob the client
-/// rejects without saying why.
-pub(crate) fn seal(session_key: &[u8; 32], sequence: u64, data: &mut [u8]) -> [u8; SIG_LEN_AES] {
+/// **plaintext**, the sequence blob is encrypted under that checksum, and the body is sealed under
+/// the *plaintext* sequence blob - the two use the same state, and swapping them produces a blob
+/// the client rejects without saying why.
+///
+/// `counter` is this side's own counter, zero for the first PDU and one more for each after. The
+/// sequence number is **not** carried in a form anyone can read back: the receiver builds it from
+/// its own counter and compares. `initiator` sets the top bit of the high word - true for the side
+/// that opened the channel, false for the responder.
+pub(crate) fn seal(
+    session_key: &[u8; 32],
+    counter: u64,
+    initiator: bool,
+    data: &mut [u8],
+) -> [u8; SIG_LEN_AES] {
     let header = signature_header(true);
     let mut confounder = [0u8; 8];
     getrandom::fill(&mut confounder).expect("the OS has randomness");
 
-    // 1. The checksum, over the plaintext.
+    let seq_plain = sequence_blob(counter, initiator);
+
+    // 1. The checksum, over the plaintext. The HMAC key is the session key's FIRST HALF: the
+    //    protocol grew a 32-octet key for AES and then hashed with sixteen of them, which is
+    //    measured - a 32-octet key gives a digest the client never produces.
     let checksum = hmac_sha256_prefix(session_key, &[&header, &confounder, data]);
-    // 2. The sequence number, encrypted under that checksum.
-    let seq_num = encrypt_sequence(session_key, &checksum, sequence);
-    // 3. The body, sealed under the sequence number and the confounder. The confounder is the
-    //    first eight octets of that stream, so what the signature carries is the SEALED one -
-    //    Samba encrypts it in place and copies the result. Storing the plaintext instead leaves a
-    //    reader with eight octets that do not advance the cipher the way the sender's did, and the
-    //    body then opens to garbage under every signature that verifies.
-    let sealed_confounder = transform_body(true, session_key, &seq_num, &confounder, data);
+
+    // 2. The body, sealed under the plaintext sequence blob. The confounder is the stream's first
+    //    eight octets and what the signature carries is its SEALED form.
+    let sealed_confounder = transform_body(true, session_key, &seq_plain, &confounder, data);
+
+    // 3. The sequence blob, encrypted under the checksum.
+    let seq_wire = crypt_sequence(session_key, &checksum, &seq_plain);
 
     let mut sig = [0u8; SIG_LEN_AES];
     sig[0..8].copy_from_slice(&header);
-    sig[8..16].copy_from_slice(&seq_num);
+    sig[8..16].copy_from_slice(&seq_wire);
     sig[16..24].copy_from_slice(&checksum);
     sig[24..32].copy_from_slice(&sealed_confounder);
     sig
@@ -265,11 +278,13 @@ pub(crate) fn seal(session_key: &[u8; 32], sequence: u64, data: &mut [u8]) -> [u
 
 /// Checks a signature and opens the body in place.
 ///
-/// `sequence` is what this server expects next; a signature whose sequence number does not decode
-/// to it belongs to another message in the stream, which is how a replayed PDU is refused.
+/// `counter` and `initiator` are what this server expects for this PDU - its own bookkeeping, not
+/// anything read out of the signature. A sequence number that does not match means the PDU is not
+/// the one expected next, which is how a replayed or reordered message is refused.
 pub(crate) fn unseal(
     session_key: &[u8; 32],
-    sequence: u64,
+    counter: u64,
+    initiator: bool,
     sig: &[u8],
     data: &mut [u8],
 ) -> Result<(), Error> {
@@ -283,27 +298,22 @@ pub(crate) fn unseal(
     }
     let sealed = u16::from_le_bytes([header[2], header[3]]) == SEAL_AES;
     let checksum: [u8; 8] = sig[16..24].try_into().map_err(|_| Error::Truncated)?;
-    // What the signature carries is the sealed confounder; the checksum was taken over the
-    // plaintext one, so it is recovered by running the same stream.
-    let mut confounder: [u8; 8] = sig[24..32].try_into().map_err(|_| Error::Truncated)?;
+    let seq_wire: [u8; 8] = sig[8..16].try_into().map_err(|_| Error::Truncated)?;
+    let seq_plain = sequence_blob(counter, initiator);
 
-    // The sequence number comes back through the checksum, which is why it can be checked at all.
-    let seq_field: [u8; 8] = sig[8..16].try_into().map_err(|_| Error::Truncated)?;
-    let seq_num = decrypt_sequence(session_key, &checksum, &seq_field);
-    if seq_num != sequence.to_le_bytes() {
+    // The sequence is checked before the body is opened: it needs only the checksum, which travels
+    // in the clear, and a PDU from another position in the stream should not be unwrapped at all.
+    if crypt_sequence(session_key, &checksum, &seq_plain) != seq_wire {
         return Err(Error::Sequence);
     }
 
+    let mut confounder: [u8; 8] = sig[24..32].try_into().map_err(|_| Error::Truncated)?;
     if sealed {
-        confounder = transform_body(false, session_key, &seq_field, &confounder, data);
+        confounder = transform_body(false, session_key, &seq_plain, &confounder, data);
     }
 
-    // The checksum covers the plaintext, and the sequence number it was bound to is the one just
-    // recovered, so a signature cannot be moved onto a different message in the stream.
-    //
-    // A signature that is only signed - no seal - carries no confounder at all: Samba hashes the
-    // header and the data and nothing between them. Including zeros where the sender included
-    // nothing is the difference between a verified message and a refused one.
+    // A signature that is only signed carries no confounder at all: Samba hashes the header and the
+    // data with nothing between them.
     let expected = if sealed {
         hmac_sha256_prefix(session_key, &[&header, &confounder, data])
     } else {
@@ -315,12 +325,35 @@ pub(crate) fn unseal(
     Ok(())
 }
 
+/// `low32` then `high32`, both **big-endian**, with the initiator bit on the high word.
+///
+/// Samba writes this with `RSIVAL`, and the R-prefixed macros there are the reverse-order ones - the
+/// opposite of the little-endian `SIVAL`. Measured: the plaintext of a live client's first PDU is
+/// `00000000 80000000`, which is be32(0) then be32(0x80000000). Read little-endian the same octets
+/// are a counter of 549755813888, which is nobody's first packet.
+fn sequence_blob(counter: u64, initiator: bool) -> [u8; 8] {
+    let low = (counter & 0xFFFF_FFFF) as u32;
+    let mut high = (counter >> 32) as u32;
+    if initiator {
+        high |= 0x8000_0000;
+    }
+    let mut blob = [0u8; 8];
+    blob[0..4].copy_from_slice(&low.to_be_bytes());
+    blob[4..8].copy_from_slice(&high.to_be_bytes());
+    blob
+}
+
 /// HMAC-SHA256 over the concatenation of `parts`, truncated to the 8 octets the blob carries.
-fn hmac_sha256_prefix(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 8] {
+///
+/// The key is the session key's first sixteen octets, not all thirty-two: the protocol went to a
+/// 32-octet key for AES and then hashed with half of it, and a 32-octet HMAC key gives a digest the
+/// client never sends. Measured against a live signature.
+fn hmac_sha256_prefix(session_key: &[u8; 32], parts: &[&[u8]]) -> [u8; 8] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key");
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(&session_key[..16]).expect("any key length");
     for part in parts {
         mac.update(part);
     }
@@ -328,33 +361,19 @@ fn hmac_sha256_prefix(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 8] {
     full[..8].try_into().expect("eight octets")
 }
 
-/// The sealed sequence number: AES-128-CFB8 with the checksum as the IV, in both halves.
-fn encrypt_sequence(session_key: &[u8; 32], checksum: &[u8; 8], sequence: u64) -> [u8; 8] {
+/// The sequence blob through AES-128-CFB8 with the checksum twice as the IV.
+///
+/// One function for both directions because the plaintext here is always the same blob and the mode
+/// is its own inverse for a keystream XOR - the caller decides which side it is on.
+fn crypt_sequence(session_key: &[u8; 32], checksum: &[u8; 8], blob: &[u8; 8]) -> [u8; 8] {
     let mut iv = [0u8; 16];
     iv[0..8].copy_from_slice(checksum);
     iv[8..16].copy_from_slice(checksum);
-    let mut out = sequence.to_le_bytes();
+    let mut out = *blob;
     cfb8_encrypt(&session_key[..16], &iv, &mut out);
     out
 }
 
-/// The inverse of [`encrypt_sequence`]: the same mode, so the same function.
-fn decrypt_sequence(session_key: &[u8; 32], checksum: &[u8; 8], ciphertext: &[u8]) -> [u8; 8] {
-    let mut iv = [0u8; 16];
-    iv[0..8].copy_from_slice(checksum);
-    iv[8..16].copy_from_slice(checksum);
-    let mut out: [u8; 8] = ciphertext.try_into().expect("eight octets");
-    cfb8_decrypt(&session_key[..16], &iv, &mut out);
-    out
-}
-
-/// Seals or opens `data` in place: AES-128-CFB8, the sequence number twice as the IV, and a key
-/// that is the
-/// session key's first half with every octet inverted in its high nibble.
-///
-/// The `^ 0xF0` is measured, not chosen: Samba's `netsec_do_seal` does exactly this for the AES
-/// branch, and a key without it produces a body the client cannot open while every other step of
-/// the signature checks out.
 fn transform_body(
     encrypt: bool,
     session_key: &[u8; 32],
@@ -372,7 +391,7 @@ fn transform_body(
 
     // One stream over the confounder and then the body, in that order: the confounder is the
     // stream's first eight octets and the body continues it, so the two cannot be transformed
-    // separately - the second depends on the cipher state the first leaves behind.
+    // apart - the second depends on the cipher state the first leaves behind.
     let mut both = Vec::with_capacity(8 + data.len());
     both.extend_from_slice(confounder);
     both.extend_from_slice(data);
@@ -417,12 +436,12 @@ mod seal_tests {
             for len in [0usize, 1, 8, 33, 216] {
                 let plaintext: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5a).collect();
                 let mut body = plaintext.clone();
-                let sig = seal(&key, sequence, &mut body);
+                let sig = seal(&key, sequence, true, &mut body);
                 if len > 0 {
                     assert_ne!(body, plaintext, "the body must not travel in the clear");
                 }
 
-                unseal(&key, sequence, &sig, &mut body)
+                unseal(&key, sequence, true, &sig, &mut body)
                     .unwrap_or_else(|err| panic!("seq {sequence} len {len}: {err:?}"));
                 assert_eq!(body, plaintext, "seq {sequence} len {len}");
             }
@@ -436,7 +455,7 @@ mod seal_tests {
         let plaintext = b"the stub a client signed".to_vec();
 
         let mut body = plaintext.clone();
-        let sig = seal(&key, 5, &mut body);
+        let sig = seal(&key, 5, true, &mut body);
 
         // One bit anywhere in the signature: the checksum, the sequence or the header.
         for index in 0..32 {
@@ -444,7 +463,7 @@ mod seal_tests {
             damaged[index] ^= 0x01;
             let mut copy = body.clone();
             assert!(
-                unseal(&key, 5, &damaged, &mut copy).is_err(),
+                unseal(&key, 5, true, &damaged, &mut copy).is_err(),
                 "octet {index} of the signature was not checked"
             );
         }
@@ -453,7 +472,7 @@ mod seal_tests {
         // not 6, so this is a replay and not a fresh PDU.
         let mut copy = body.clone();
         assert_eq!(
-            unseal(&key, 6, &sig, &mut copy),
+            unseal(&key, 6, true, &sig, &mut copy),
             Err(Error::Sequence),
             "a signature must not move onto another message"
         );
@@ -464,7 +483,7 @@ mod seal_tests {
         let mut copy = body.clone();
         copy[0] ^= 0x01;
         assert!(
-            unseal(&key, 5, &sig, &mut copy).is_err(),
+            unseal(&key, 5, true, &sig, &mut copy).is_err(),
             "a body altered under a valid signature must be refused"
         );
     }
@@ -473,11 +492,77 @@ mod seal_tests {
     #[test]
     fn a_truncated_signature_is_refused() {
         let mut body = b"x".to_vec();
-        let sig = seal(&key(), 1, &mut body);
+        let sig = seal(&key(), 1, true, &mut body);
         let mut copy = body.clone();
         assert_eq!(
-            unseal(&key(), 1, &sig[..31], &mut copy),
+            unseal(&key(), 1, true, &sig[..31], &mut copy),
             Err(Error::Truncated)
+        );
+    }
+
+    /// A request Samba signed on a live join, and the channel key it signed with.
+    ///
+    /// This is the test that says the implementation is the protocol rather than merely consistent
+    /// with itself. The round trip below would pass with the sequence blob read little-endian, with
+    /// the HMAC keyed by all 32 octets, and with a plaintext confounder in the signature - all
+    /// three were wrong, and each of them passes a self-consistent test. Only these octets, made by
+    /// another implementation, tell them apart.
+    ///
+    /// Contents: opnum 21 (`netr_LogonGetCapabilities`), counter 0 from the initiator, twelve
+    /// octets of authentication padding.
+    const LIVE_PDU: &str = "05000003100000002801380009000000c400000000001500ba09310f57de40c2b715f2ebe00031e360fa62e6e8dfbc219e5c1a5ea85ac7f9f19afa0d98e001b061cfb9c13a6915bb3d7bde124faabe4f5c0645e7ebb888fde3952c7cea57ab499c06356fe382b454a95b1c0e80d95ab1df176f8d07b251dffa00eb041af91b83ce9e6dd4b63d4674d1556f91f76a9b4ad2cd36f76873b53d9454c2b78f744f1ca6ee1d9a2c082ce4f31f780c853ef8e24df73a51196a36f8564afdc5c6ab78814b4bc10a41713fce47b10961a2d75fc3493efaecdd2ce304f3c69d7be623f99fb3c76f917a3bbdc344060c000100000013001a00ffff00001f830473f4d604d8282f52c2ef6da1301daa27ca945343aa000000000000000000000000000000000000000000000000";
+    const LIVE_KEY: &str = "d351cce0cd557a90bbaa07c5d2e2216136e1b83b1e20b669b586777fa25bcdeb";
+
+    #[test]
+    fn a_signature_a_live_client_made_verifies() {
+        let key: [u8; 32] = hex::decode(LIVE_KEY)
+            .expect("hex")
+            .try_into()
+            .expect("32 octets");
+        let pdu = hex::decode(LIVE_PDU).expect("hex");
+        assert_eq!(pdu.len(), 296, "one whole PDU");
+
+        let frag = usize::from(u16::from_le_bytes([pdu[8], pdu[9]]));
+        let auth_len = usize::from(u16::from_le_bytes([pdu[10], pdu[11]]));
+        assert_eq!(frag, pdu.len());
+        assert_eq!(auth_len, SIG_LEN_AES);
+
+        let trailer_at = frag - auth_len - 8;
+        assert_eq!(
+            pdu[trailer_at], 68,
+            "auth_type NETLOGON, the service this pipe uses"
+        );
+        let sig = &pdu[trailer_at + 8..];
+
+        // The payload is the stub INCLUDING its authentication padding: the padding sits between
+        // the stub and the sec_trailer, and the client's checksum covers it.
+        let mut payload = pdu[24..trailer_at].to_vec();
+
+        unseal(&key, 0, true, sig, &mut payload)
+            .expect("a signature a live client made must verify");
+
+        // What it opens to: a netr_LogonGetCapabilities stub, whose first field is the handle the
+        // caller already holds and whose second is a small query level.
+        assert_eq!(&payload[..4], &[0x17, 0x00, 0x00, 0x00], "query level 23");
+        assert!(
+            payload
+                .windows(12)
+                .any(|w| w == b"\\\x00s\x00a\x00m\x00b\x00a\x00"),
+            "the stub names the server it is asking about"
+        );
+    }
+
+    /// The sequence blob's byte order is the whole difference between a counter of zero and one of
+    /// 549755813888, so it is asserted rather than described.
+    #[test]
+    fn the_sequence_blob_is_big_endian_with_the_initiator_bit() {
+        assert_eq!(sequence_blob(0, true), [0, 0, 0, 0, 0x80, 0, 0, 0]);
+        assert_eq!(sequence_blob(0, false), [0; 8]);
+        assert_eq!(sequence_blob(1, false), [0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            sequence_blob(0x0000_0001_0000_0002, true),
+            [0, 0, 0, 2, 0x80, 0, 0, 1],
+            "low word first, then the high word with the bit"
         );
     }
 }
