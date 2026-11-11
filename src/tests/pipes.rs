@@ -407,7 +407,7 @@ async fn a_pipe_this_server_does_not_serve_is_refused_by_name() {
     // The control for the test above: the list of known pipes must still refuse what it does not
     // serve, or "every name opens" would pass while the server accepted anything at all.
     let state = server();
-    for name in ["samr2", "netlogon", ""] {
+    for name in ["samr2", "winreg", ""] {
         let mut peer = Peer::on_ipc(&state, false).await;
         let (_, reply) = peer
             .request(&state, Command::Create, &create_body(name))

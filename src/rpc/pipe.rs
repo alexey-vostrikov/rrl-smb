@@ -75,6 +75,10 @@ pub(crate) struct Pipe {
 
 struct State {
     assoc: Association,
+    /// The challenge this pipe's netlogon conversation is built on (MS-NRPC 3.1.4.1). Per pipe,
+    /// because two pipes are two challenges: a `ServerReqChallenge` answered on one may not
+    /// authenticate a call on another.
+    netlogon: crate::rpc::netlogon::Session,
     /// Reply messages not read yet, oldest first.
     outbox: VecDeque<Vec<u8>>,
     /// Bytes in `outbox`.
@@ -114,6 +118,7 @@ impl Pipe {
             caller,
             state: Mutex::new(State {
                 assoc: Association::default(),
+                netlogon: crate::rpc::netlogon::Session::default(),
                 outbox: VecDeque::new(),
                 queued: 0,
                 budget: Arc::clone(budget),
@@ -230,6 +235,16 @@ impl Pipe {
                         Some(syntax) if syntax == crate::rpc::pdu::SAMR => {
                             crate::rpc::samr::serve(server, &self.caller, call.opnum, &call.stub)
                                 .await
+                        }
+                        Some(syntax) if syntax == crate::rpc::pdu::NETLOGON => {
+                            crate::rpc::netlogon::serve(
+                                server,
+                                &self.caller,
+                                &mut state.netlogon,
+                                call.opnum,
+                                &call.stub,
+                            )
+                            .await
                         }
                         Some(syntax) if syntax == crate::rpc::pdu::SRVSVC => {
                             srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await

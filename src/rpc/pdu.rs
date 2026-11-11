@@ -94,6 +94,17 @@ pub(crate) const SAMR: SyntaxId = SyntaxId {
     version: 1,
 };
 
+/// netlogon, 12345678-1234-abcd-ef00-0123456789ab, version 1.0: the interface a member's secure
+/// channel is built through. Version **1**, like `samr` and unlike `lsarpc`: a member asks for 1.0
+/// and a server that answered 0.0 would see every bind refused.
+pub(crate) const NETLOGON: SyntaxId = SyntaxId {
+    uuid: [
+        0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0xcd, 0xab, 0xef, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xab,
+    ],
+    version: 1,
+};
+
 /// First half of a bind time feature negotiation syntax, 6cb71c2c-9812-4540
 /// (MS-RPCE 3.3.1.5.3). The other eight bytes are the feature bitmask.
 const FEATURE_PREFIX: [u8; 8] = [0x2c, 0x1c, 0xb7, 0x6c, 0x12, 0x98, 0x40, 0x45];
