@@ -327,17 +327,21 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
     ))
 }
 
-/// The reply stub, in the order a live client reads it: the server's half of the pair, the union's
-/// discriminant, the capabilities, and the status.
+/// The reply stub, in the order a live client reads it.
 ///
-/// The discriminant is present and it is the `query_level` the call was made at. Measured twice: a
-/// reply without it is refused with `ndr_pull_netr_Capabilities: ndr_pull_error(Bad Switch): Bad
-/// switch value 0`, because the client reads the word after the credential as the switch. It is
-/// `[in]` in the IDL and still travels - a switched union cannot be read without knowing its arm.
+/// Four fields, and two layouts were tried before this one, each refused with a number naming where
+/// the discriminator is **not**:
 ///
-/// The authenticator's timestamp is **not** sent: only its `cred` travels back, eight octets, the
-/// mirror of the request. The first attempt wrote a full sixteen and the client went looking for the
-/// switch one word later than it was.
+/// * `cred`, `timestamp` (eight octets), capabilities, status - twenty-four octets - was refused with
+///   `Bad switch value 0`: the client read the switch from inside the zero timestamp, so it wants
+///   the switch four octets earlier than that layout put it;
+/// * `cred`, the level as a four-octet word, capabilities, status - twenty octets - was refused with
+///   `Bad switch value 1090666496`, which is `0x41024000`: the flags it negotiated, read as a switch.
+///
+/// Together they put the switch at offset **twelve**: eight octets of credential, then a four-octet
+/// `time_t` (this struct's timestamp is half the width of the request's), then the switch, the arm
+/// and the status. The level is `[in]` in the IDL and travels anyway - a switched union cannot be
+/// read without knowing its arm.
 fn capabilities_reply(
     channel: Option<&crate::server::ChannelState>,
     query_level: u32,
@@ -350,6 +354,9 @@ fn capabilities_reply(
     };
     let mut writer = NdrWriter::new();
     writer.raw(&credential);
+    // The authenticator's timestamp, four octets wide here and zero: the reference server sets it so,
+    // and nothing reads it.
+    writer.u32(0);
     writer.u32(query_level);
     writer.u32(flags);
     writer.u32(status);
@@ -1052,7 +1059,7 @@ mod tests {
     #[test]
     fn a_refusal_has_the_shape_of_the_call() {
         let reply = refusal(0x4000_4000, 0, NTSTATUS_ACCESS_DENIED);
-        assert_eq!(reply.len(), 20);
+        assert_eq!(reply.len(), 20, "eight octets, two words, then the status");
         assert_eq!(reply[..8], [0u8; 8], "no server credential was derived");
         assert_eq!(
             u32::from_le_bytes(reply[16..].try_into().expect("status")),
@@ -1313,8 +1320,8 @@ mod tests {
 
         assert_eq!(
             reply.len(),
-            20,
-            "credential, the union's discriminant, capabilities, status"
+            24,
+            "credential, timestamp, the union's discriminant, capabilities, status"
         );
         assert_eq!(
             &reply[..8],
@@ -1322,17 +1329,22 @@ mod tests {
             "the server's half of the chain, not the client's"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[8..12].try_into().expect("switch")),
-            1,
-            "the union's arm: without it a client refuses the reply with `Bad Switch value 0`"
+            &reply[8..12],
+            &[0u8; 4],
+            "the authenticator's timestamp: nothing reads it"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[12..16].try_into().expect("switch")),
+            1,
+            "the union's arm, at the offset the client reads it from"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
             0x610f_ffff,
             "the flags both sides negotiated, and nothing else"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_SUCCESS
         );
     }
@@ -1347,15 +1359,15 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 20, "a refusal is the same shape");
+        assert_eq!(reply.len(), 24, "a refusal is the same shape");
         assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
         assert_eq!(
-            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
             0,
             "no capability is claimed to a caller that did not prove the channel"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
     }
@@ -1370,19 +1382,19 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 20);
+        assert_eq!(reply.len(), 24);
         assert_eq!(
-            u32::from_le_bytes(reply[8..12].try_into().expect("switch")),
+            u32::from_le_bytes(reply[12..16].try_into().expect("switch")),
             2,
             "the level the call was made at, echoed - a client told 1 reads the arm it did not ask for"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[12..16].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
             0,
             "a level this server does not answer carries no capability"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_NOT_SUPPORTED
         );
     }
@@ -1403,9 +1415,9 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 20);
+        assert_eq!(reply.len(), 24);
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
     }
