@@ -97,6 +97,7 @@ pub(crate) async fn serve(
     opnum: u16,
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
+    tracing::debug!(opnum, len = stub.len(), "netlogon: call");
     match opnum {
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
