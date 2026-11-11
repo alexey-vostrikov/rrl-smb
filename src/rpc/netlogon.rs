@@ -287,65 +287,38 @@ fn authenticate3(
     // without it the 16-octet HMAC-MD5 key and two DES passes.
     let aes = client_flags & SUPPORTS_AES != 0;
     let des = server.config.netlogon_des;
-    let Some(expected) = expected_credential(
-        &machine.nt_hash,
-        aes,
-        des,
-        &challenge.client,
-        &challenge.server,
-    ) else {
-        // Fail fast and loudly. Answering with the AES flags and then checking DES - or the
-        // reverse - is a channel that refuses a correct password with no way to tell why.
-        tracing::warn!(
-            account = %account,
-            client_flags = format_args!("{client_flags:#010x}"),
-            "netlogon: the client offered no AES channel and netlogon_des is off; \
-             refusing the channel"
-        );
-        return Ok(refusal(
-            server_flags(client_flags),
-            0,
-            NTSTATUS_NOT_SUPPORTED,
-        ));
+    let answer = match verdict(&machine.nt_hash, aes, des, &challenge, &client_credential) {
+        Verdict::Accepted(answer) => answer,
+        Verdict::Unsupported => {
+            // Fail fast and loudly. Answering with the AES flags and then checking DES - or the
+            // reverse - is a channel that refuses a correct password with no way to tell why.
+            tracing::warn!(
+                account = %account,
+                client_flags = format_args!("{client_flags:#010x}"),
+                "netlogon: the client offered no AES channel and netlogon_des is off; \
+                 refusing the channel"
+            );
+            return Ok(refusal(
+                server_flags(client_flags),
+                0,
+                NTSTATUS_NOT_SUPPORTED,
+            ));
+        }
+        Verdict::Wrong => {
+            tracing::warn!(
+                account = %account,
+                computer = %computer,
+                aes = aes,
+                "netlogon: the machine's credential does not match its password"
+            );
+            return Ok(refusal(
+                server_flags(client_flags),
+                0,
+                NTSTATUS_ACCESS_DENIED,
+            ));
+        }
     };
-    // TEMP-DIAG: every input and both outputs, so the arithmetic can be redone outside.
-    if std::env::var_os("NETLOGON_DIAG").is_some() {
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        tracing::warn!(
-            account = %account,
-            nt_hash = %hex(&machine.nt_hash),
-            rid = machine.rid,
-            client_challenge = %hex(&challenge.client),
-            server_challenge = %hex(&challenge.server),
-            aes = aes,
-            got = %hex(&client_credential),
-            want = %hex(&expected),
-            "netlogon-diag"
-        );
-    }
-    if !constant_time_eq(&expected, &client_credential) {
-        tracing::warn!(
-            account = %account,
-            computer = %computer,
-            "netlogon: the machine's credential does not match its password"
-        );
-        return Ok(refusal(
-            server_flags(client_flags),
-            0,
-            NTSTATUS_ACCESS_DENIED,
-        ));
-    }
 
-    // The same computation over the server's challenge: a client that could not derive it would
-    // have opened a channel with a server it cannot authenticate in return.
-    let answer = expected_credential(
-        &machine.nt_hash,
-        aes,
-        des,
-        &challenge.server,
-        &challenge.client,
-    )
-    .expect("the same flags and the same setting decided the client credential a line earlier");
     let flags = server_flags(client_flags);
     tracing::info!(
         account = %account,
@@ -411,29 +384,74 @@ fn credential(input: &[u8; 8], session_key: &[u8; 16]) -> [u8; 8] {
     block.into()
 }
 
+/// What this server answers to the credential a client sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// It matches the account's password; this is the value to answer with.
+    Accepted([u8; 8]),
+    /// The client offered no AES channel and this server does not serve the DES one.
+    Unsupported,
+    /// It does not match: the channel is refused, and the password is not the reason to guess at.
+    Wrong,
+}
+
+/// The decision, on its own: no pipe, no state, no logging.
+fn verdict(
+    nt_hash: &[u8; 16],
+    aes: bool,
+    des: bool,
+    challenge: &Challenge,
+    sent: &[u8; 8],
+) -> Verdict {
+    // The client's value is derived from its own half of the pair; this server's answer is the
+    // same computation over its own half. Both come from `expected_credential`, so the flags and
+    // the setting decide one arithmetic, not two that could disagree.
+    let Some(expected) = expected_credential(nt_hash, aes, des, challenge, &challenge.client)
+    else {
+        return Verdict::Unsupported;
+    };
+    if !rrl_crypto::ct_eq(&expected, sent) {
+        return Verdict::Wrong;
+    }
+    Verdict::Accepted(
+        expected_credential(nt_hash, aes, des, challenge, &challenge.server)
+            .expect("the same flags and the same setting decided the client credential"),
+    )
+}
+
 /// The credential a client computed, or `None` when this server does not serve that channel.
 ///
 /// AES needs nothing beyond what every build has. DES is a 56-bit cipher kept for one call, and
 /// whether to serve it is a deployment decision rather than a build one: `ServerConfig::netlogon_des`
 /// turns it on, and with it off a client that offers no AES is refused instead of being handed a
 /// channel nobody derived a credential for.
+/// The two halves name the challenge the value is computed over; the session key is always the
+/// same one, derived from `client || server` in that order (MS-NRPC 3.1.4.1.2).
+///
+/// Passing the halves in swapped to get the answer's credential was wrong: it derived a *different*
+/// session key, so this server answered with a value the client could not reproduce. It went unseen
+/// while the client's own credential was being refused for another reason - the first refusal hid
+/// the second - and a test on the answer alone found it.
 fn expected_credential(
     nt_hash: &[u8; 16],
     aes: bool,
     des: bool,
+    challenge: &Challenge,
     input: &[u8; 8],
-    other: &[u8; 8],
 ) -> Option<[u8; 8]> {
     if aes {
         return Some(credential_aes(
             input,
-            &session_key_aes(nt_hash, input, other),
+            &session_key_aes(nt_hash, &challenge.client, &challenge.server),
         ));
     }
     if !des {
         return None;
     }
-    Some(credential(input, &session_key(nt_hash, input, other)))
+    Some(credential(
+        input,
+        &session_key(nt_hash, &challenge.client, &challenge.server),
+    ))
 }
 
 /// The 32-octet session key of an AES secure channel: `HMAC_SHA256(nt_hash, client || server)`.
@@ -502,14 +520,6 @@ fn des_key(seven: &[u8]) -> [u8; 8] {
 }
 
 /// Whether two eight-octet credentials are equal, in time that does not depend on where they differ.
-fn constant_time_eq(left: &[u8; 8], right: &[u8; 8]) -> bool {
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right) {
-        difference |= a ^ b;
-    }
-    difference == 0
-}
-
 /// A `ServerAuthenticate3` reply: the out parameters in order, then the status.
 fn reply(server_credential: &[u8; 8], flags: u32, rid: u32, status: u32) -> Vec<u8> {
     let mut writer = NdrWriter::new();
@@ -783,5 +793,95 @@ mod tests {
         );
         // The server's answer is the same computation over its own challenge.
         assert_ne!(credential_aes(&server, &key), [0u8; 8]);
+    }
+
+    /// The three answers this server can give a credential, each on its own input.
+    ///
+    /// Written because a mutation showed the check was not covered at all: forcing the
+    /// comparison to succeed left every test in the crate green, which means nothing exercised
+    /// the path a wrong password takes. The stand found it first, as `ACCESS_DENIED` for a client
+    /// whose account and hash were both right - the wrong answer for the wrong reason.
+    #[test]
+    fn a_credential_is_accepted_refused_or_refused_for_lack_of_a_cipher() {
+        let nt_hash: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let challenge = Challenge {
+            client: [0x11; 8],
+            server: [0x22; 8],
+        };
+
+        // The DES channel, when the deployment turns it on: the client's own value opens it, and
+        // the server's is what comes back.
+        let des_key_16 = session_key(&nt_hash, &challenge.client, &challenge.server);
+        let client_credential = credential(&challenge.client, &des_key_16);
+        let server_credential = credential(&challenge.server, &des_key_16);
+        assert_eq!(
+            verdict(&nt_hash, false, true, &challenge, &client_credential),
+            Verdict::Accepted(server_credential),
+        );
+
+        // One bit anywhere in it is another password.
+        for index in 0..8 {
+            let mut wrong = client_credential;
+            wrong[index] ^= 0x01;
+            assert_eq!(
+                verdict(&nt_hash, false, true, &challenge, &wrong),
+                Verdict::Wrong,
+                "octet {index} of the credential was not compared"
+            );
+        }
+
+        // A different account's password is refused even when the client's own arithmetic is
+        // right: the value it sent belongs to a key this server never derived.
+        let mut other_hash = nt_hash;
+        other_hash[0] ^= 0x01;
+        let other_key = session_key(&other_hash, &challenge.client, &challenge.server);
+        assert_eq!(
+            verdict(
+                &nt_hash,
+                false,
+                true,
+                &challenge,
+                &credential(&challenge.client, &other_key)
+            ),
+            Verdict::Wrong,
+            "a credential made from another account's hash must not open this one"
+        );
+
+        // The same, on the AES channel, which is what a current client uses.
+        let aes_key = session_key_aes(&nt_hash, &challenge.client, &challenge.server);
+        let aes_client = credential_aes(&challenge.client, &aes_key);
+        let aes_server = credential_aes(&challenge.server, &aes_key);
+        assert_eq!(
+            verdict(&nt_hash, true, false, &challenge, &aes_client),
+            Verdict::Accepted(aes_server),
+            "the AES channel needs no DES setting to be served"
+        );
+        let mut aes_wrong = aes_client;
+        aes_wrong[0] ^= 0x80;
+        assert_eq!(
+            verdict(&nt_hash, true, false, &challenge, &aes_wrong),
+            Verdict::Wrong
+        );
+
+        // A client that offers no AES, against a deployment that does not serve DES: refused for
+        // the setting, not for the password.
+        assert_eq!(
+            verdict(&nt_hash, false, false, &challenge, &client_credential),
+            Verdict::Unsupported,
+            "with DES off the answer must name the setting, not the credential"
+        );
+
+        // And the AES credential is not accepted on the DES channel or the other way round: the
+        // flags decide which arithmetic ran, and the two never produce the same eight octets.
+        assert_eq!(
+            verdict(&nt_hash, false, true, &challenge, &aes_client),
+            Verdict::Wrong,
+            "an AES credential must not open a DES channel"
+        );
+        assert_eq!(
+            verdict(&nt_hash, true, false, &challenge, &client_credential),
+            Verdict::Wrong,
+            "a DES credential must not open an AES channel"
+        );
     }
 }

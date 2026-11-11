@@ -14,8 +14,8 @@
 //! NT response to derive a session key.
 
 use hmac::{Hmac, Mac};
-use md4::{Digest, Md4};
 use md5::Md5;
+use md5::digest::Digest as _;
 use rc4::Rc4;
 use rc4::cipher::{KeyInit, StreamCipher};
 
@@ -150,13 +150,13 @@ fn utf16le_to_string(bytes: &[u8]) -> String {
 }
 
 /// MD4 of UTF-16LE password - the "NT hash".
+///
+/// The computation lives in `rrl_crypto::nt` (RRL-7.1), where the directory that derives an
+/// account's keys also takes it from. Two implementations of one primitive is two answers waiting
+/// to disagree, and the two copies had already done so once: a machine's password arrives as 120
+/// random octets rather than text.
 pub fn nt_hash(password: &str) -> [u8; 16] {
-    let mut h = Md4::new();
-    h.update(utf16le(password));
-    let out = h.finalize();
-    let mut o = [0u8; 16];
-    o.copy_from_slice(&out);
-    o
+    rrl_crypto::nt::hash_password(password)
 }
 
 /// `NTOWFv2(password, user, domain) = HMAC_MD5(NT_hash(password), UTF-16LE(UPPER(user) || domain))`.
@@ -172,16 +172,9 @@ pub fn ntowf_v2(nt_hash_bytes: &[u8; 16], user: &str, domain: &str) -> [u8; 16] 
     out
 }
 
-/// Constant-time 16-byte comparison.
+/// Constant-time comparison, from the crypto layer (RRL-7.2).
 fn ct_eq_16(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    rrl_crypto::ct_eq(a, b)
 }
 
 // --- Read helpers for NTLMSSP fields -----------------------------------------

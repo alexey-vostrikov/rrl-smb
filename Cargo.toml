@@ -45,7 +45,6 @@ hmac  = "0.12"
 des   = "0.9"
 sha2  = "0.10"
 md-5  = "0.10"
-md4   = "0.10"
 aes   = "0.8"
 cmac  = "0.7"
 rc4   = "0.2"
@@ -67,11 +66,14 @@ sha2.workspace = true
 md-5.workspace = true
 # netlogon's credential: two DES passes over one block (MS-NRPC 3.1.4.4.1).
 des.workspace = true
-md4.workspace = true
 aes.workspace = true
 cmac.workspace = true
 rc4.workspace = true
 aes-gcm.workspace = true
+# The crypto layer every crate of this family shares. NT hash, constant-time comparison, and in
+# time the KDFs: a primitive implemented twice is a primitive that will disagree with itself, and
+# the two copies here had already done so once on the secure channel.
+rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 ccm.workspace = true
 socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
@@ -120,6 +122,10 @@ discovery = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The tests derive an NT hash independently of the code they check, so that a broken derivation
+# cannot agree with itself. Not a dependency of the library: the library takes the hash from
+# `rrl-crypto` (RRL-7.1).
+md4 = "0.10"
 tracing-subscriber = "0.3"
 tempfile = "3"
 hex = "0.4"
