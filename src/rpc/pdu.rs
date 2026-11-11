@@ -212,6 +212,39 @@ pub(crate) enum Body<'a> {
 pub(crate) struct Pdu<'a> {
     pub header: Header,
     pub body: Body<'a>,
+    /// The authentication verifier, when the PDU carried one.
+    pub auth: Option<AuthVerifier<'a>>,
+}
+
+/// `sec_trailer` and the token behind it (MS-RPCE 2.2.2.11).
+///
+/// The trailer is eight octets and the token is `header.auth_length` long; both sit at the end of
+/// the PDU, after the body. A PDU without authentication has neither, and the two cases are
+/// different from "authenticated with an empty token".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthVerifier<'a> {
+    /// `auth_type`: which authentication service the token belongs to.
+    pub auth_type: u8,
+    /// `auth_level`: none, connect, call, packet integrity or packet privacy.
+    pub auth_level: u8,
+    /// Octets to strip from the body's end before it is parsed - the body is padded to a
+    /// four-octet boundary, and the padding is counted here rather than in the body.
+    pub auth_pad_length: u8,
+    /// Which authentication context the token is for.
+    pub auth_context_id: u32,
+    /// The token itself.
+    pub token: &'a [u8],
+}
+
+impl AuthVerifier<'_> {
+    /// `RPC_C_AUTHN_NETLOGON`: schannel, the authentication Samba's netlogon pipe asks for.
+    pub(crate) const TYPE_NETLOGON: u8 = 68;
+    /// `RPC_C_AUTHN_WINNT`: NTLMSSP.
+    pub(crate) const TYPE_NTLM: u8 = 10;
+    /// `RPC_C_AUTHN_GSS_NEGOTIATE`: SPNEGO, what a Kerberos session uses.
+    pub(crate) const TYPE_GSS_NEGOTIATE: u8 = 9;
+    /// `RPC_C_AUTHN_LEVEL_PKT_PRIVACY`: signed and encrypted.
+    pub(crate) const LEVEL_PRIVACY: u8 = 6;
 }
 
 /// Parses `pdu`, which holds exactly one PDU, or returns `None` when it is
@@ -236,6 +269,19 @@ pub(crate) fn parse(pdu: &[u8]) -> Option<Pdu<'_>> {
         return None;
     }
     let body = &pdu[..end];
+    // The verifier, when there is one: the eight-octet `sec_trailer` then the token.
+    let auth = if header.auth_length == 0 {
+        None
+    } else {
+        let trailer = &pdu[end..end + SEC_TRAILER_LEN];
+        Some(AuthVerifier {
+            auth_type: trailer[0],
+            auth_level: trailer[1],
+            auth_pad_length: trailer[2],
+            auth_context_id: u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]),
+            token: &pdu[end + SEC_TRAILER_LEN..],
+        })
+    };
     let body = match header.ptype {
         PTYPE_BIND => Body::Bind(parse_bind(body)?),
         PTYPE_ALTER_CONTEXT => Body::AlterContext(parse_bind(body)?),
@@ -244,7 +290,7 @@ pub(crate) fn parse(pdu: &[u8]) -> Option<Pdu<'_>> {
         PTYPE_ORPHANED => Body::Orphaned,
         other => Body::Unexpected(other),
     };
-    Some(Pdu { header, body })
+    Some(Pdu { header, body, auth })
 }
 
 /// The body of a bind or alter_context in `pdu`, which ends where the body
@@ -582,5 +628,71 @@ pub(crate) mod tests {
             let pdu = finish(header(ptype, 3, 1));
             assert_eq!(parse(&pdu).expect("parses").body, body);
         }
+    }
+
+    /// A bind Samba sent on its netlogon pipe, taken from a live join.
+    ///
+    /// The IDL carries no authentication token, so the shape is measured: `sec_trailer` at the end
+    /// of the PDU, eight octets, then `auth_length` octets of token. What this fixes is that the
+    /// trailer is found from the OUTSIDE - the body ends where the verifier begins - which is why
+    /// a body parser that read to `frag_length` would swallow eight octets of trailer and a
+    /// seventeen-octet token as if they were arguments.
+    #[test]
+    fn an_authenticated_bind_has_its_verifier_at_the_end() {
+        const CAPTURED: &str = "05000b07100000006100110008000000b810b810000000000100000000000100785634123412cdabef0001234567cffb01000000045d888aeb1cc9119fe808002b104860020000004406000001000000000000000300000041440053414d424100";
+
+        let bytes = hex::decode(CAPTURED).expect("hex");
+        assert_eq!(bytes.len(), 97, "the capture is one PDU");
+
+        let pdu = parse(&bytes).expect("a whole PDU");
+        assert_eq!(pdu.header.ptype, PTYPE_BIND);
+        assert_eq!(pdu.header.auth_length, 17);
+        assert_eq!(pdu.header.flags & 0x07, 0x07, "first, last, header signing");
+
+        let auth = pdu.auth.as_ref().expect("an authenticated bind");
+        assert_eq!(
+            auth.auth_type,
+            AuthVerifier::TYPE_NETLOGON,
+            "68: the Netlogon service, which is what schannel on this pipe is - not NTLMSSP"
+        );
+        assert_eq!(
+            auth.auth_level,
+            AuthVerifier::LEVEL_PRIVACY,
+            "6: signed and encrypted, which Samba requires of an AD domain"
+        );
+        assert_eq!(auth.auth_pad_length, 0);
+        assert_eq!(auth.auth_context_id, 1);
+        assert_eq!(auth.token.len(), 17, "the token is auth_length octets");
+
+        // And the body is what is left: one context on the netlogon interface, NDR32.
+        let Body::Bind(bind) = &pdu.body else {
+            panic!("a bind, not {:?}", pdu.body);
+        };
+        assert_eq!(bind.contexts.len(), 1);
+        assert_eq!(bind.max_xmit_frag, 4280);
+    }
+
+    /// A PDU with no verifier parses as one, and `auth` is absent rather than empty.
+    ///
+    /// The distinction matters: "no authentication" and "authentication with an empty token" lead a
+    /// server down different paths, and treating the first as the second is how a channel is
+    /// accepted with nothing checked.
+    #[test]
+    fn a_pdu_without_a_verifier_has_no_auth() {
+        const CAPTURED: &str = "05000b07100000006100110008000000b810b810000000000100000000000100785634123412cdabef0001234567cffb01000000045d888aeb1cc9119fe808002b104860020000004406000001000000000000000300000041440053414d424100";
+        // The same bind with its verifier taken off: the body ends at 72, so the PDU is that much
+        // and `auth_length` says zero. Built from the capture rather than from a helper, because a
+        // helper written from the same reading as the parser would agree with it by construction.
+        let mut bytes = hex::decode(CAPTURED).expect("hex");
+        bytes.truncate(72);
+        bytes[8..10].copy_from_slice(&72u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&0u16.to_le_bytes());
+
+        let pdu = parse(&bytes).expect("a whole PDU");
+        assert!(pdu.auth.is_none(), "no verifier means no verifier");
+        assert!(
+            matches!(pdu.body, Body::Bind(_)),
+            "and the body still parses"
+        );
     }
 }
