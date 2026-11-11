@@ -444,9 +444,37 @@ pub struct ServerState {
     pub(crate) leases: Arc<crate::files::LeaseTable>,
     /// Every durable open, and the ones kept after their session ended.
     pub(crate) durable: Arc<DurableTable>,
+    /// The session key of each machine whose secure channel was established.
+    ///
+    /// Process-wide and not per pipe, because a client opens a new netlogon pipe and signs its
+    /// PDUs there with the key it established on the first one: the credentials are the machine's,
+    /// cached on its side, and a key that lived in one pipe would refuse the second. Keyed by the
+    /// computer name the channel negotiated, upper-cased.
+    pub(crate) schannel_keys: std::sync::RwLock<std::collections::HashMap<String, [u8; 32]>>,
 }
 
 impl ServerState {
+    /// Records the key a secure channel established, so that a later pipe to the same machine can
+    /// check what it signs.
+    pub(crate) fn remember_channel(&self, computer: &str, key: [u8; 32]) {
+        let mut keys = match self.schannel_keys.write() {
+            Ok(keys) => keys,
+            // A poisoned lock means a panic while a caller held it; the map behind it is still a
+            // whole map, and refusing every channel for ever is the worse answer.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        keys.insert(computer.to_ascii_uppercase(), key);
+    }
+
+    /// The key of the channel `computer` established, when it has one.
+    pub(crate) fn channel_key(&self, computer: &str) -> Option<[u8; 32]> {
+        let keys = match self.schannel_keys.read() {
+            Ok(keys) => keys,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        keys.get(&computer.to_ascii_uppercase()).copied()
+    }
+
     pub fn new(config: ServerConfig, users: ServerUsers, shares: Vec<Arc<ShareBindings>>) -> Self {
         let durable = Arc::new(DurableTable::new(
             config.limits.durable_handle_timeout,
@@ -465,6 +493,7 @@ impl ServerState {
             max_opens_per_connection: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             ),
+            schannel_keys: std::sync::RwLock::new(std::collections::HashMap::new()),
             max_locks_per_open: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),

@@ -366,6 +366,21 @@ fn authenticate3(
         }
     };
 
+    // The channel's key, kept for the pipes that come after this one: a client re-signs with it
+    // there without repeating the challenge, so a key held in this pipe alone would refuse them.
+    let channel_key = if aes {
+        session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server)
+    } else {
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(&session_key(
+            &machine.nt_hash,
+            &challenge.client,
+            &challenge.server,
+        ));
+        key
+    };
+    server.remember_channel(&computer, channel_key);
+
     let flags = server_flags(client_flags);
     tracing::info!(
         account = %account,
