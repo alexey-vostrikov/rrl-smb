@@ -61,6 +61,9 @@ pub(crate) const OPNUM_SERVER_REQ_CHALLENGE: u16 = 4;
 pub(crate) const OPNUM_SERVER_AUTHENTICATE3: u16 = 26;
 /// `netr_LogonGetDomainInfo` (opnum 29): the domain's description of itself.
 pub(crate) const OPNUM_LOGON_GET_DOMAIN_INFO: u16 = 29;
+/// `netr_LogonGetCapabilities`. A join cannot finish without it: Samba's `libnet_join` proves its
+/// secure channel here, and treats a missing call as a downgrade whenever AES was negotiated.
+pub(crate) const OPNUM_LOGON_GET_CAPABILITIES: u16 = 21;
 /// `netr_ServerPasswordSet2` (opnum 46): the machine password a join picks, encrypted under the
 /// channel's session key.
 pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
@@ -73,6 +76,24 @@ pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
 #[derive(Debug, Default)]
 pub(crate) struct Session {
     challenge: Option<Challenge>,
+    channel: Option<ProvedChannel>,
+}
+
+/// What a proved channel remembers about its two credentials.
+///
+/// Every call after `netr_ServerAuthenticate3` carries an authenticator, and the pair is fixed **at
+/// the authenticate**: the client sends the half it computed from its own challenge and expects the
+/// half this server computed from its own. Neither side derives a new one per call, so remembering
+/// them is the whole mechanism.
+#[derive(Debug, Clone, Copy)]
+struct ProvedChannel {
+    /// What the client sends, and what this server checks every later call against.
+    client: [u8; 8],
+    /// What this server must send back.
+    server: [u8; 8],
+    /// The flags both sides agreed to. `netr_LogonGetCapabilities` must answer with exactly these:
+    /// Samba's client compares them for equality and calls any difference a downgrade.
+    flags: u32,
 }
 
 /// The pair of eight-octet values a secure channel is built on.
@@ -86,6 +107,11 @@ impl Session {
     /// The pair the last `ServerReqChallenge` established, for the call that proves it.
     pub(crate) fn challenge(&self) -> Option<Challenge> {
         self.challenge
+    }
+
+    /// The channel `netr_ServerAuthenticate3` proved, for the calls that follow it.
+    fn channel(&self) -> Option<ProvedChannel> {
+        self.channel
     }
 }
 
@@ -112,6 +138,7 @@ pub(crate) async fn serve(
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
         OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, session, stub),
+        OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(session, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => {
             // Said out loud because the client's own report names the step and not the cause: it
             // says the domain could not be reached, which is what a failed call looks like from the
@@ -155,6 +182,117 @@ fn password_set2(
         status: NCA_OP_RNG_ERROR,
         did_not_execute: true,
     })
+}
+
+/// `netr_LogonGetCapabilities`: what this server supports, said under the channel's own proof.
+///
+/// Samba's `libnet_join` cannot finish without this call, and refuses three different answers with
+/// the same sentence about a possible attempt to compromise security (`libcli/auth/netlogon_creds_cli.c`):
+///
+/// * a call that is missing, when AES was negotiated - it reads that as a downgrade;
+/// * a `return_authenticator.cred` that is not the half this server computed at the authenticate;
+/// * `server_capabilities` that is not **exactly** the flags both sides negotiated.
+///
+/// The last one is compared for equality and not by mask, so echoing anything else - a superset, a
+/// subset, the value a real DC would send - is a downgrade as far as the client is concerned.
+///
+/// Layout, measured from a live stub: `server_name` in place (a top-level string, so no referent),
+/// `computer_name` behind a referent, then the two authenticators - eight octets of credential and
+/// eight of timestamp each - and `query_level`. What follows them is a
+/// `dcerpc_sec_verification_trailer`, not more arguments: three commands carrying the NDR transfer
+/// syntax, which read as a GUID and a syntax id if the fields are guessed wrong.
+fn logon_get_capabilities(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(_server_name) = reader.string() else {
+        return Err(malformed_hex("server_name", stub));
+    };
+    // A unique pointer: absent means the client did not name itself, which this call does not need.
+    if reader.pointer() == Some(true) && reader.string().is_none() {
+        return Err(malformed_hex("computer_name", stub));
+    }
+    let Some(credential) = reader.bytes(8) else {
+        return Err(malformed_hex("credential", stub));
+    };
+    let credential: [u8; 8] = credential
+        .try_into()
+        .map_err(|_| malformed_at("credential"))?;
+    let Some(_client_timestamp) = reader.bytes(8) else {
+        return Err(malformed_hex("credential.timestamp", stub));
+    };
+    let Some(_return_authenticator) = reader.bytes(16) else {
+        return Err(malformed_hex("return_authenticator", stub));
+    };
+    let Some(query_level) = reader.u32() else {
+        return Err(malformed_hex("query_level", stub));
+    };
+
+    let Some(channel) = session.channel() else {
+        tracing::warn!("netlogon: capabilities asked for before a channel was proved");
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
+    };
+    // The client's half of the pair, compared in constant time: it is a secret of this channel, and
+    // a comparison that stops at the first differing octet is a comparison that answers questions
+    // about the ones it did compare.
+    if !rrl_crypto::ct_eq(&channel.client, &credential) {
+        tracing::warn!("netlogon: capabilities asked for with the wrong credential");
+        return Ok(capabilities_reply(
+            None,
+            query_level,
+            NTSTATUS_ACCESS_DENIED,
+        ));
+    }
+    if query_level != 1 {
+        // The union has arms for 1 and 2 and this server has nothing to say at 2. Samba's own server
+        // answers the same way, and a fault is what the client already handles for an old server.
+        tracing::warn!(
+            query_level,
+            "netlogon: capabilities asked for at a level this server does not answer"
+        );
+        return Ok(capabilities_reply(
+            Some(&channel),
+            query_level,
+            NTSTATUS_NOT_SUPPORTED,
+        ));
+    }
+
+    tracing::info!(
+        capabilities = format_args!("{:#010x}", channel.flags),
+        "netlogon: capabilities answered"
+    );
+    Ok(capabilities_reply(
+        Some(&channel),
+        query_level,
+        NTSTATUS_SUCCESS,
+    ))
+}
+
+/// The reply stub: the server's half of the pair, then the union, then the status.
+///
+/// `time_t` travels as eight octets - the client's own stubs show eight - and the client reads only
+/// the eight octets of `.cred`, so the timestamp is the current time and nothing depends on it.
+fn capabilities_reply(channel: Option<&ProvedChannel>, query_level: u32, status: u32) -> Vec<u8> {
+    let zero = [0u8; 8];
+    let (credential, flags) = match channel {
+        Some(channel) => (channel.server, channel.flags),
+        None => (zero, 0),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let mut writer = NdrWriter::new();
+    writer.raw(&credential);
+    writer.u32(u32::try_from(now & 0xFFFF_FFFF).unwrap_or(0));
+    writer.u32(u32::try_from(now >> 32).unwrap_or(0));
+    // The union's discriminant is the query level the client asked at; the arm answers only level 1.
+    writer.u32(query_level);
+    writer.u32(flags);
+    writer.u32(status);
+    writer.finish()
 }
 
 /// `netr_ServerReqChallenge`: remember the client's half, answer with this server's.
@@ -392,6 +530,11 @@ fn authenticate3(
     server.remember_channel(&computer, channel_key);
 
     let flags = server_flags(client_flags);
+    session.channel = Some(ProvedChannel {
+        client: client_credential,
+        server: answer,
+        flags,
+    });
     tracing::info!(
         account = %account,
         computer = %computer,
@@ -959,6 +1102,122 @@ mod tests {
             verdict(&nt_hash, true, false, &challenge, &client_credential),
             Verdict::Wrong,
             "a DES credential must not open an AES channel"
+        );
+    }
+
+    /// The capabilities call as a live client builds it.
+    ///
+    /// Measured: `server_name` is in place - a top-level string, so no referent - `computer_name`
+    /// is behind a referent, then the client's authenticator, the empty one it expects back, and
+    /// the level. A parser that expected the server name behind a referent reads the first string's
+    /// maximum count as that referent and then looks for the name eight octets early.
+    fn capabilities_stub(credential: &[u8; 8], query_level: u32) -> Vec<u8> {
+        let mut stub = Vec::new();
+        string(&mut stub, "\\\\samba.ad.example.com");
+        stub.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        string(&mut stub, "SAMBA");
+        stub.extend_from_slice(credential);
+        stub.extend_from_slice(&[0u8; 8]);
+        stub.extend_from_slice(&[0u8; 16]);
+        stub.extend_from_slice(&query_level.to_le_bytes());
+        stub
+    }
+
+    /// A session whose channel was proved at the authenticate.
+    fn proved(client: [u8; 8], server: [u8; 8], flags: u32) -> Session {
+        Session {
+            challenge: None,
+            channel: Some(ProvedChannel {
+                client,
+                server,
+                flags,
+            }),
+        }
+    }
+
+    /// The answer carries the half the client holds, and the flags it negotiated - exactly.
+    ///
+    /// Samba's client compares `server_capabilities` against `creds->negotiate_flags` for equality
+    /// and refuses anything else as a downgrade, so a superset is as wrong as a zero.
+    #[test]
+    fn the_capabilities_answer_carries_the_half_the_client_expects() {
+        let flags = 0x0102_0003;
+        let mut session = proved([0x11; 8], [0x22; 8], flags);
+        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 1))
+            .expect("answered");
+
+        assert_eq!(reply.len(), 28, "16 + discriminant + capabilities + status");
+        assert_eq!(
+            &reply[..8],
+            &[0x22; 8],
+            "the server's own half, not the client's"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[16..20].try_into().expect("level")),
+            1,
+            "the union's discriminant is the level asked at"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[20..24].try_into().expect("capabilities")),
+            flags,
+            "the flags both sides negotiated, and nothing else"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            NTSTATUS_SUCCESS
+        );
+    }
+
+    /// A credential that is not the channel's is refused, and the refusal is still the right shape.
+    #[test]
+    fn capabilities_with_the_wrong_credential_are_refused() {
+        let mut session = proved([0x11; 8], [0x22; 8], 0x0102_0003);
+        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x33; 8], 1))
+            .expect("answered");
+
+        assert_eq!(reply.len(), 28, "a refusal is the same shape");
+        assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
+        assert_eq!(
+            u32::from_le_bytes(reply[20..24].try_into().expect("capabilities")),
+            0,
+            "no capability is claimed to a caller that did not prove the channel"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            NTSTATUS_ACCESS_DENIED
+        );
+    }
+
+    /// Level 2 is not answered, and is not answered as though it were level 1.
+    #[test]
+    fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
+        let mut session = proved([0x11; 8], [0x22; 8], 0x0102_0003);
+        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 2))
+            .expect("answered");
+
+        assert_eq!(reply.len(), 28);
+        assert_eq!(
+            u32::from_le_bytes(reply[16..20].try_into().expect("level")),
+            2,
+            "a client told about level 1 would read the arm it did not ask for"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
+
+    /// Before any authenticate there is no channel, and the call says so rather than inventing one.
+    #[test]
+    fn capabilities_before_a_channel_is_proved_are_refused() {
+        let mut session = Session::default();
+        let reply = logon_get_capabilities(&mut session, &capabilities_stub(&[0x11; 8], 1))
+            .expect("answered");
+
+        assert_eq!(reply.len(), 28);
+        assert_eq!(
+            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            NTSTATUS_ACCESS_DENIED
         );
     }
 }
