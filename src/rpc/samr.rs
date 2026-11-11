@@ -237,9 +237,16 @@ fn malformed_at(field: &str, stub: &[u8]) -> Fault {
 }
 
 /// One `samr_Ids`: a count, and a conformant array of that many words behind a pointer.
+///
+/// The struct itself gets **no referent**, even though the IDL declares it `[out,ref] samr_Ids *`:
+/// NDR marshals a `[ref]` pointer's pointee in place, and a referent here shifts every field by one
+/// word. Measured against a live client, which reads the referent as part of `count`, finds
+/// `0x00020000` where a count belongs, and refuses the reply with
+/// `ndr_pull_samr_Ids: Range Error: value out of range` - `count` is ranged 0..1024. The same
+/// finding as `policy_handle` below, and the same cause.
 fn write_samr_ids(writer: &mut NdrWriter, ids: &[u32]) {
-    writer.pointer(true);
     writer.u32(u32::try_from(ids.len()).unwrap_or(u32::MAX));
+    // The array is a plain pointer inside the struct, so this one *does* carry a referent.
     writer.pointer(true);
     // A conformant array carries its maximum before the values; no offset, because
     // `[size_is(count)]` without `length_is` is not varying.
@@ -689,12 +696,13 @@ mod tests {
                     .unwrap_or_else(|_| panic!("four octets at {offset} of {}", reply.len())),
             )
         };
-        assert_ne!(word(at), 0, "an out struct travels behind a pointer");
-        let count = word(at + 4) as usize;
-        assert_ne!(word(at + 8), 0, "the ids array travels behind a pointer");
-        let max = word(at + 12) as usize;
-        let ids = (0..max).map(|i| word(at + 16 + 4 * i)).collect();
-        (count, ids, at + 16 + 4 * max)
+        // No referent for the struct: a `[ref]` pointee is marshalled in place. The array inside
+        // it is a plain pointer and does carry one.
+        let count = word(at) as usize;
+        assert_ne!(word(at + 4), 0, "the ids array travels behind a pointer");
+        let max = word(at + 8) as usize;
+        let ids = (0..max).map(|i| word(at + 12 + 4 * i)).collect();
+        (count, ids, at + 12 + 4 * max)
     }
 
     /// A machine account is found by the name a join asks for, and reported as a **user**.
