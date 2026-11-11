@@ -248,14 +248,18 @@ pub(crate) fn seal(session_key: &[u8; 32], sequence: u64, data: &mut [u8]) -> [u
     let checksum = hmac_sha256_prefix(session_key, &[&header, &confounder, data]);
     // 2. The sequence number, encrypted under that checksum.
     let seq_num = encrypt_sequence(session_key, &checksum, sequence);
-    // 3. The body, sealed under the sequence number and the confounder.
-    seal_body(session_key, &seq_num, &confounder, data);
+    // 3. The body, sealed under the sequence number and the confounder. The confounder is the
+    //    first eight octets of that stream, so what the signature carries is the SEALED one -
+    //    Samba encrypts it in place and copies the result. Storing the plaintext instead leaves a
+    //    reader with eight octets that do not advance the cipher the way the sender's did, and the
+    //    body then opens to garbage under every signature that verifies.
+    let sealed_confounder = transform_body(true, session_key, &seq_num, &confounder, data);
 
     let mut sig = [0u8; SIG_LEN_AES];
     sig[0..8].copy_from_slice(&header);
     sig[8..16].copy_from_slice(&seq_num);
     sig[16..24].copy_from_slice(&checksum);
-    sig[24..32].copy_from_slice(&confounder);
+    sig[24..32].copy_from_slice(&sealed_confounder);
     sig
 }
 
@@ -278,8 +282,10 @@ pub(crate) fn unseal(
         return Err(Error::SignatureAlgorithm);
     }
     let sealed = u16::from_le_bytes([header[2], header[3]]) == SEAL_AES;
-    let checksum: [u8; 8] = sig[16..24].try_into().expect("eight octets");
-    let confounder: [u8; 8] = sig[24..32].try_into().expect("eight octets");
+    let checksum: [u8; 8] = sig[16..24].try_into().map_err(|_| Error::Truncated)?;
+    // What the signature carries is the sealed confounder; the checksum was taken over the
+    // plaintext one, so it is recovered by running the same stream.
+    let mut confounder: [u8; 8] = sig[24..32].try_into().map_err(|_| Error::Truncated)?;
 
     // The sequence number comes back through the checksum, which is why it can be checked at all.
     let seq_field: [u8; 8] = sig[8..16].try_into().map_err(|_| Error::Truncated)?;
@@ -289,12 +295,20 @@ pub(crate) fn unseal(
     }
 
     if sealed {
-        unseal_body(session_key, &seq_field, &confounder, data);
+        confounder = transform_body(false, session_key, &seq_field, &confounder, data);
     }
 
     // The checksum covers the plaintext, and the sequence number it was bound to is the one just
     // recovered, so a signature cannot be moved onto a different message in the stream.
-    let expected = hmac_sha256_prefix(session_key, &[&header, &confounder, data]);
+    //
+    // A signature that is only signed - no seal - carries no confounder at all: Samba hashes the
+    // header and the data and nothing between them. Including zeros where the sender included
+    // nothing is the difference between a verified message and a refused one.
+    let expected = if sealed {
+        hmac_sha256_prefix(session_key, &[&header, &confounder, data])
+    } else {
+        hmac_sha256_prefix(session_key, &[&header, data])
+    };
     if !rrl_crypto::ct_eq(&expected, &checksum) {
         return Err(Error::Checksum);
     }
@@ -341,21 +355,13 @@ fn decrypt_sequence(session_key: &[u8; 32], checksum: &[u8; 8], ciphertext: &[u8
 /// The `^ 0xF0` is measured, not chosen: Samba's `netsec_do_seal` does exactly this for the AES
 /// branch, and a key without it produces a body the client cannot open while every other step of
 /// the signature checks out.
-fn seal_body(session_key: &[u8; 32], seq_num: &[u8; 8], confounder: &[u8; 8], data: &mut [u8]) {
-    transform_body(true, session_key, seq_num, confounder, data);
-}
-
-fn unseal_body(session_key: &[u8; 32], seq_num: &[u8; 8], confounder: &[u8; 8], data: &mut [u8]) {
-    transform_body(false, session_key, seq_num, confounder, data);
-}
-
 fn transform_body(
     encrypt: bool,
     session_key: &[u8; 32],
     seq_num: &[u8; 8],
     confounder: &[u8; 8],
     data: &mut [u8],
-) {
+) -> [u8; 8] {
     let mut key = [0u8; 16];
     for (i, octet) in key.iter_mut().enumerate() {
         *octet = session_key[i] ^ 0xF0;
@@ -364,8 +370,9 @@ fn transform_body(
     iv[0..8].copy_from_slice(seq_num);
     iv[8..16].copy_from_slice(seq_num);
 
-    // The confounder travels ahead of the body, so it is encrypted under the same stream and the
-    // client prepends it back.
+    // One stream over the confounder and then the body, in that order: the confounder is the
+    // stream's first eight octets and the body continues it, so the two cannot be transformed
+    // separately - the second depends on the cipher state the first leaves behind.
     let mut both = Vec::with_capacity(8 + data.len());
     both.extend_from_slice(confounder);
     both.extend_from_slice(data);
@@ -375,6 +382,7 @@ fn transform_body(
         cfb8_decrypt(&key, &iv, &mut both);
     }
     data.copy_from_slice(&both[8..]);
+    both[..8].try_into().expect("eight octets")
 }
 
 #[cfg(test)]
@@ -392,17 +400,16 @@ mod seal_tests {
     /// the checksum covering the plaintext rather than the ciphertext. Get any of them wrong on
     /// both sides alike and the round trip still passes - which is why the stand, not this, decides
     /// whether the client agrees.
-    /// NOT PASSING YET: the round trip holds for an empty body and fails with a checksum
-    /// mismatch on any body with octets in it.
+    /// What this server seals, this server opens - and the body comes back unchanged.
     ///
-    /// What is already fixed and measured: the feedback in CFB8 is the ciphertext octet in both
-    /// directions, so encryption and decryption cannot share one function - with a single function
-    /// the round trip failed on the sequence number, which is how this was found.
+    /// A round trip is the least a symmetric implementation can be asked. What it caught here: the
+    /// feedback in CFB8 is the ciphertext octet in both directions, so one function cannot serve
+    /// both, and the confounder is the stream's FIRST eight octets, so what the signature carries
+    /// has to be its sealed form - with the plaintext there, the reader's cipher diverges from the
+    /// writer's at octet one and the body opens to garbage under a signature that verifies.
     ///
-    /// What is still wrong is somewhere in the confounder/body interaction of `transform_body`, and
-    /// it is ignored rather than deleted so the next session starts from the measurement instead of
-    /// the claim. Nothing uses `seal` yet, so this unblocks no behaviour.
-    #[ignore = "round trip fails for non-empty bodies; see the doc comment"]
+    /// It cannot say the client agrees; only the stand can. What it does say is that the two sides
+    /// of this file are the same protocol.
     #[test]
     fn a_sealed_pdu_opens_again() {
         let key = key();

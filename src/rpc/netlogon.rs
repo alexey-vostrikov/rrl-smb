@@ -319,6 +319,21 @@ fn authenticate3(
     // without it the 16-octet HMAC-MD5 key and two DES passes.
     let aes = client_flags & SUPPORTS_AES != 0;
     let des = server.config.netlogon_des;
+    // The channel's own key, which schannel signs every later PDU with. Gated: a key in a log is a
+    // key everybody who can read the log has.
+    if std::env::var_os("NETLOGON_KEY_DUMP").is_some() {
+        let key = if aes {
+            session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server).to_vec()
+        } else {
+            session_key(&machine.nt_hash, &challenge.client, &challenge.server).to_vec()
+        };
+        tracing::warn!(
+            account = %account,
+            session_key = %key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            encrypt = aes,
+            "netlogon-key"
+        );
+    }
     let answer = match verdict(&machine.nt_hash, aes, des, &challenge, &client_credential) {
         Verdict::Accepted(answer) => answer,
         Verdict::Unsupported => {
