@@ -61,6 +61,9 @@ pub(crate) const OPNUM_SERVER_REQ_CHALLENGE: u16 = 4;
 pub(crate) const OPNUM_SERVER_AUTHENTICATE3: u16 = 26;
 /// `netr_LogonGetDomainInfo` (opnum 29): the domain's description of itself.
 pub(crate) const OPNUM_LOGON_GET_DOMAIN_INFO: u16 = 29;
+/// `netr_ServerPasswordSet2` (opnum 46): the machine password a join picks, encrypted under the
+/// channel's session key.
+pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
 
 /// What one netlogon pipe remembers.
 ///
@@ -97,6 +100,7 @@ pub(crate) async fn serve(
     match opnum {
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
+        OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, session, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => {
             // Said out loud because the client's own report names the step and not the cause: it
             // says the domain could not be reached, which is what a failed call looks like from the
@@ -113,6 +117,33 @@ pub(crate) async fn serve(
             did_not_execute: true,
         }),
     }
+}
+
+/// `netr_ServerPasswordSet2`: the new machine password, encrypted under the session key.
+///
+/// MS-NRPC 3.1.4.4.3: `netr_CryptPassword` is 512 octets of ciphertext and a four-octet length, and
+/// the whole 516 is run through the channel's cipher - AES-128-CFB8 or RC4 - with the session key.
+/// The plaintext is the password in UTF-16LE, zero-padded to 512, and the length says how much of
+/// it is real.
+fn password_set2(
+    server: &ServerState,
+    session: &mut Session,
+    stub: &[u8],
+) -> Result<Vec<u8>, Fault> {
+    // The stub first: a client's argument order here is not the IDL's wording, and the hex is what
+    // settles it. Behind `NETLOGON_DUMP` so that an ordinary run stays quiet.
+    if std::env::var_os("NETLOGON_DUMP").is_some() {
+        tracing::warn!(
+            len = stub.len(),
+            hex = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "netlogon: ServerPasswordSet2 stub"
+        );
+    }
+    let _ = (server, session);
+    Err(Fault {
+        status: NCA_OP_RNG_ERROR,
+        did_not_execute: true,
+    })
 }
 
 /// `netr_ServerReqChallenge`: remember the client's half, answer with this server's.
