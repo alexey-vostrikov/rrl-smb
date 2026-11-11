@@ -433,7 +433,9 @@ pub use files::{
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
-pub use server::{ConfigError, ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+pub use server::{
+    ConfigError, ConfigHandle, MachineAccount, MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
+};
 pub use stream::{StreamInfo, StreamName};
 
 pub mod wire {
