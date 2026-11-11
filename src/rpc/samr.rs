@@ -124,41 +124,41 @@ fn lookup_names(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec
 
     let mut reader = NdrReader::new(stub);
     let Some(_handle) = reader.bytes(20) else {
-        return Err(malformed_at("domain_handle"));
+        return Err(malformed_at("domain_handle", stub));
     };
     let Some(count) = reader.u32() else {
-        return Err(malformed_at("num_names"));
+        return Err(malformed_at("num_names", stub));
     };
     // The conformant-varying array's own header. `size_is(1000)` is the maximum the interface
     // allows; the offset is zero for an array that was not sliced; the third word is what is
     // actually there.
     let Some(max) = reader.u32() else {
-        return Err(malformed_at("names.max_count"));
+        return Err(malformed_at("names.max_count", stub));
     };
     let Some(_offset) = reader.u32() else {
-        return Err(malformed_at("names.offset"));
+        return Err(malformed_at("names.offset", stub));
     };
     let Some(present) = reader.u32() else {
-        return Err(malformed_at("names.actual_count"));
+        return Err(malformed_at("names.actual_count", stub));
     };
     // The count and the array must agree, and a count beyond the array's maximum is a client that
     // disagrees with the interface about the shape of the call.
     if present != count || count > max {
-        return Err(malformed_at("names.actual_count"));
+        return Err(malformed_at("names.actual_count", stub));
     }
 
     // One referent per name, then the strings themselves in the deferred section.
     for _ in 0..count {
         match reader.pointer() {
             Some(true) => {}
-            _ => return Err(malformed_at("names[].name")),
+            _ => return Err(malformed_at("names[].name", stub)),
         }
     }
 
     let mut names = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let Some(units) = reader.string() else {
-            return Err(malformed_at("names[].name"));
+            return Err(malformed_at("names[].name", stub));
         };
         names.push(String::from_utf16_lossy(&units).trim().to_string());
     }
@@ -202,9 +202,19 @@ fn lookup_names(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec
     Ok(writer.finish())
 }
 
-/// The stub ended before a field this call reads.
-fn malformed_at(field: &str) -> Fault {
-    tracing::warn!(field, "samr: the request stub ends before this field");
+/// The stub ended before a field this call reads, with the octets that were there.
+///
+/// The hex is what turned `names[].name` from a guess into a measurement: a client's array of
+/// `lsa_String` does not put each name where the IDL's wording suggests, and the offsets in a dump
+/// say where they are.
+fn malformed_at(field: &str, stub: &[u8]) -> Fault {
+    let head = &stub[..stub.len().min(96)];
+    tracing::warn!(
+        field,
+        len = stub.len(),
+        hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "samr: the request stub ends before this field"
+    );
     Fault {
         status: 0x0002_0004, // NT_STATUS_INFO_LENGTH_MISMATCH
         did_not_execute: true,
