@@ -244,7 +244,11 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             .try_into()
             .expect("four octets of the timestamp"),
     );
-    let Some(_return_authenticator) = reader.bytes(16) else {
+    // `return_authenticator` is `[in,out,ref]`, and only its IN half travels: eight octets of
+    // credential, with the timestamp the server fills left off the wire. Measured - read as sixteen,
+    // the reader lands eight octets past `query_level` and takes the verification trailer's first
+    // words for a level (a live run read 0x7138bb42 there).
+    let Some(_return_authenticator) = reader.bytes(8) else {
         return Err(malformed_hex("return_authenticator", stub));
     };
     let Some(query_level) = reader.u32() else {
@@ -262,11 +266,7 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             computer = computer.as_deref().unwrap_or("<none>"),
             "netlogon: capabilities asked for before a channel was proved"
         );
-        return Ok(capabilities_reply(
-            None,
-            query_level,
-            NTSTATUS_ACCESS_DENIED,
-        ));
+        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
     };
     // The client's half of the pair, compared in constant time: it is a secret of this channel, and
     // a comparison that stops at the first differing octet is a comparison that answers questions
@@ -276,11 +276,7 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             sequence,
             "netlogon: capabilities asked for with a credential the chain does not produce"
         );
-        return Ok(capabilities_reply(
-            None,
-            query_level,
-            NTSTATUS_ACCESS_DENIED,
-        ));
+        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
     }
     // The step has already moved the channel on, so what it holds now is what this call answers
     // with: the flags are the ones both sides negotiated, and the credential is the second half the
@@ -289,11 +285,7 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         .as_deref()
         .and_then(|computer| server.channel(computer))
     else {
-        return Ok(capabilities_reply(
-            None,
-            query_level,
-            NTSTATUS_ACCESS_DENIED,
-        ));
+        return Ok(capabilities_reply(None, NTSTATUS_ACCESS_DENIED));
     };
     let _ = server_credential;
     if query_level != 1 {
@@ -303,48 +295,39 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
             query_level,
             "netlogon: capabilities asked for at a level this server does not answer"
         );
-        return Ok(capabilities_reply(
-            Some(&channel),
-            query_level,
-            NTSTATUS_NOT_SUPPORTED,
-        ));
+        // Nothing is handed back for a level this server does not answer: a credential or a
+        // capability beside a refusal is an answer, and this is not one.
+        return Ok(capabilities_reply(None, NTSTATUS_NOT_SUPPORTED));
     }
 
     tracing::info!(
         capabilities = format_args!("{:#010x}", channel.flags),
         "netlogon: capabilities answered"
     );
-    Ok(capabilities_reply(
-        Some(&channel),
-        query_level,
-        NTSTATUS_SUCCESS,
-    ))
+    Ok(capabilities_reply(Some(&channel), NTSTATUS_SUCCESS))
 }
 
-/// The reply stub: the server's half of the pair, then the union, then the status.
+/// The reply stub: the server's half of the pair, then the capabilities, then the status.
 ///
-/// `time_t` travels as eight octets - the client's own stubs show eight - and the client reads only
-/// the eight octets of `.cred`, so the timestamp is the current time and nothing depends on it.
-fn capabilities_reply(
-    channel: Option<&crate::server::ChannelState>,
-    query_level: u32,
-    status: u32,
-) -> Vec<u8> {
+/// Two things are absent that a reader of the IDL would expect to find:
+///
+/// * the union's discriminant. `query_level` is `[in]`, so the server does not echo it - the client
+///   knows which arm it asked for, and a word written here shifts the capabilities into the status.
+/// * a second timestamp for the inbound authenticator, for the mirror reason: it is `[in,out]`, and
+///   only its out half travels, which is the credential.
+///
+/// The timestamp the server DOES send is zero, as `netlogon_creds_server_step_check` sets it: nothing
+/// reads it, and a clock in a reply is a difference between two machines waiting to be mistaken for
+/// a credential.
+fn capabilities_reply(channel: Option<&crate::server::ChannelState>, status: u32) -> Vec<u8> {
     let zero = [0u8; 8];
     let (credential, flags) = match channel {
         Some(channel) => (channel.server_credential, channel.flags),
         None => (zero, 0),
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
     let mut writer = NdrWriter::new();
     writer.raw(&credential);
-    writer.u32(u32::try_from(now & 0xFFFF_FFFF).unwrap_or(0));
-    writer.u32(u32::try_from(now >> 32).unwrap_or(0));
-    // The union's discriminant is the query level the client asked at; the arm answers only level 1.
-    writer.u32(query_level);
+    writer.raw(&[0u8; 8]);
     writer.u32(flags);
     writer.u32(status);
     writer.finish()
@@ -1183,7 +1166,8 @@ mod tests {
         let mut stamp = sequence.to_le_bytes().to_vec();
         stamp.extend_from_slice(&[0u8; 4]);
         stub.extend_from_slice(&stamp);
-        stub.extend_from_slice(&[0u8; 16]);
+        // `return_authenticator` is `[in,out,ref]`: only eight octets of credential travel.
+        stub.extend_from_slice(&[0u8; 8]);
         stub.extend_from_slice(&query_level.to_le_bytes());
         stub
     }
@@ -1304,24 +1288,28 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 28, "16 + discriminant + capabilities + status");
+        assert_eq!(
+            reply.len(),
+            24,
+            "credential, timestamp, capabilities, status"
+        );
         assert_eq!(
             &reply[..8],
             &octets(LIVE_SERVER),
             "the server's half of the chain, not the client's"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("level")),
-            1,
-            "the union's discriminant is the level asked at"
+            &reply[8..16],
+            &[0u8; 8],
+            "the timestamp nothing reads, and the client is not told otherwise"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
             0x610f_ffff,
             "the flags both sides negotiated, and nothing else"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_SUCCESS
         );
     }
@@ -1336,15 +1324,15 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 28, "a refusal is the same shape");
+        assert_eq!(reply.len(), 24, "a refusal is the same shape");
         assert_eq!(&reply[..8], &[0u8; 8], "no credential is handed back");
         assert_eq!(
-            u32::from_le_bytes(reply[20..24].try_into().expect("capabilities")),
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
             0,
             "no capability is claimed to a caller that did not prove the channel"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
     }
@@ -1359,14 +1347,14 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 28);
+        assert_eq!(reply.len(), 24);
         assert_eq!(
-            u32::from_le_bytes(reply[16..20].try_into().expect("level")),
-            2,
-            "a client told about level 1 would read the arm it did not ask for"
+            u32::from_le_bytes(reply[16..20].try_into().expect("capabilities")),
+            0,
+            "a level this server does not answer carries no capability"
         );
         assert_eq!(
-            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_NOT_SUPPORTED
         );
     }
@@ -1387,10 +1375,55 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 28);
+        assert_eq!(reply.len(), 24);
         assert_eq!(
-            u32::from_le_bytes(reply[24..28].try_into().expect("status")),
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
+    }
+
+    /// The whole capabilities stub a live client sent.
+    ///
+    /// Held as the client's octets rather than assembled from the IDL's wording, because the two
+    /// disagree: `server_name` is in place with no referent, `computer_name` is behind one, and the
+    /// fields after them are aligned by size, not packed.
+    const LIVE_CAPABILITIES_STUB: &str = "1700000000000000170000005c005c00730061006d00620061002e00610064002e006500780061006d0070006c0065002e0063006f006d000000000000000200060000000000000006000000530041004d004200410000002be1cf050b62a06ae46ef46a000000000000000000000000010000008ae3137102f43671010004000100000002002800785634123412cdabef0001234567cffb01000000045d888aeb1cc9119fe808002b104860020000000340100000000000100000000900000000001500158b7c187bbad0707bc0bfa5f3dd44df18ca396a549b8247c75855ff412b61aa62e9457ebc714f5af5b1ca016e69c6523e142da69dbb7a4ae98ef2a71d856f0f6c6445b514d0c26fcc35a24e130436915da499acaebea95d2b683056b388eda3e91fd6b8b83b9d857599dc6e3cf3317970612217c176071845b05bac54eb5adb609978f2b4ccd341efa171f3afaeb2078a727577bfff091abbac35ceccbd132a19187f8c68b5fd01ae13d89d4b6aaa450b0b088577900eecf70491317d1f6b7b537e3152bdd502c6ec5e976b9f19c9bb";
+
+    #[test]
+    fn the_live_capabilities_stub_parses_to_the_fields_it_carries() {
+        let stub = hex::decode(LIVE_CAPABILITIES_STUB).expect("hex");
+        assert_eq!(stub.len(), 404, "one whole request");
+        let mut reader = NdrReader::new(&stub);
+        let server_name = reader.string().expect("server_name");
+        assert_eq!(
+            String::from_utf16_lossy(&server_name),
+            "\\\\samba.ad.example.com",
+            "in place, with no referent"
+        );
+        assert_eq!(
+            reader.pointer(),
+            Some(true),
+            "computer_name is a unique pointer"
+        );
+        let computer = reader.string().expect("computer_name");
+        assert_eq!(String::from_utf16_lossy(&computer), "SAMBA");
+        let credential = reader.bytes(8).expect("credential");
+        assert_eq!(
+            credential,
+            hex::decode("2be1cf050b62a06a").expect("hex").as_slice(),
+            "the half the client computed for this step"
+        );
+        let timestamp = reader.bytes(8).expect("timestamp");
+        assert_eq!(
+            u32::from_le_bytes(timestamp[..4].try_into().expect("four")),
+            0x6af4_6ee4,
+            "the sequence the chain steps by"
+        );
+        assert_eq!(
+            reader.bytes(8).expect("return_authenticator"),
+            &[0u8; 8],
+            "the client expects a credential back and has none to send"
+        );
+        assert_eq!(reader.u32(), Some(1), "query_level");
     }
 }
