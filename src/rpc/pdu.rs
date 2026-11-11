@@ -94,13 +94,20 @@ pub(crate) const SAMR: SyntaxId = SyntaxId {
     version: 1,
 };
 
-/// netlogon, 12345678-1234-abcd-ef00-0123456789ab, version 1.0: the interface a member's secure
-/// channel is built through. Version **1**, like `samr` and unlike `lsarpc`: a member asks for 1.0
-/// and a server that answered 0.0 would see every bind refused.
+/// netlogon, 12345678-1234-abcd-ef00-**01234567cffb**, version 1.0: the interface a member's secure
+/// channel is built through.
+///
+/// Read from `librpc/idl/netlogon.idl`, not recalled: the family's other members end their last
+/// field in `…89ab` (`lsarpc` at 0.0) and `…89ac` (`samr` at 1.0), and a version of this constant
+/// that followed the pattern was rejected on every bind. The client reports that as
+/// `{Buffer Too Small}` from the pipe it had just opened, which names the buffer and not the
+/// interface.
+///
+/// Version **1**, like `samr` and unlike `lsarpc`.
 pub(crate) const NETLOGON: SyntaxId = SyntaxId {
     uuid: [
-        0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0xcd, 0xab, 0xef, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89,
-        0xab,
+        0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0xcd, 0xab, 0xef, 0x00, 0x01, 0x23, 0x45, 0x67, 0xcf,
+        0xfb,
     ],
     version: 1,
 };
