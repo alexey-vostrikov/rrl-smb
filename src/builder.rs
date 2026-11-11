@@ -336,6 +336,7 @@ pub struct SmbServerBuilder {
     /// The domain's SID, answered by `lsarpc` beside that name.
     domain_sid: Option<Vec<u8>>,
     machine_secrets: Option<std::sync::Arc<dyn crate::server::MachineSecrets>>,
+    netlogon_des: bool,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
     domain_netbios: Option<String>,
     max_read_size: u32,
@@ -393,6 +394,7 @@ impl SmbServerBuilder {
             dns_domain: None,
             domain_sid: None,
             machine_secrets: None,
+            netlogon_des: false,
             domain_netbios: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
@@ -460,6 +462,15 @@ impl SmbServerBuilder {
         secrets: std::sync::Arc<dyn crate::server::MachineSecrets>,
     ) -> Self {
         self.machine_secrets = Some(secrets);
+        self
+    }
+
+    /// Serves the secure channel of a client that offers no AES.
+    ///
+    /// Off by default: that channel's credential is two DES passes over a 56-bit key. A deployment
+    /// that has to accept an old member turns it on knowingly; everything modern offers AES.
+    pub fn netlogon_des(mut self, enabled: bool) -> Self {
+        self.netlogon_des = enabled;
         self
     }
 
@@ -804,6 +815,7 @@ impl SmbServerBuilder {
             dns_domain: self.dns_domain.clone(),
             domain_sid: self.domain_sid.clone(),
             machine_secrets: self.machine_secrets.clone(),
+            netlogon_des: self.netlogon_des,
             domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
