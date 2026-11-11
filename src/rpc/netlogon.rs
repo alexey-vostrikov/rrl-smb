@@ -218,7 +218,7 @@ fn authenticate3(
         .u32()
         .ok_or_else(|| malformed_at("secure_channel_type"))?;
     let Some(computer_units) = reader.string() else {
-        return Err(malformed_at("computer_name"));
+        return Err(malformed_hex("computer_name", stub));
     };
     let Some(client_credential) = reader.bytes(8) else {
         return Err(malformed_at("client_credential"));
@@ -397,6 +397,19 @@ fn refusal(flags: u32, rid: u32, status: u32) -> Vec<u8> {
 /// The stub is not the shape this call has, and the field that stopped it is named.
 fn malformed_at(field: &str) -> Fault {
     tracing::warn!(field, "netlogon: the request stub ends before this field");
+    malformed()
+}
+
+/// The same, with the octets that were read: a layout mistake is visible in a hex dump and
+/// invisible in a message.
+fn malformed_hex(field: &str, stub: &[u8]) -> Fault {
+    let head = &stub[..stub.len().min(96)];
+    tracing::warn!(
+        field,
+        len = stub.len(),
+        hex = %head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "netlogon: the request stub ends before this field"
+    );
     malformed()
 }
 
