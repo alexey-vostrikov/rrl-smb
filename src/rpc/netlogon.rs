@@ -282,8 +282,20 @@ fn authenticate3(
         ));
     };
 
-    let key = session_key(&machine.nt_hash, &challenge.client, &challenge.server);
-    let expected = credential(&challenge.client, &key);
+    // Which credential the client computed is decided by the flags, not by preference: with
+    // `NETLOGON_NEG_SUPPORTS_AES` it uses a 32-octet HMAC-SHA256 session key and AES-128-CFB8,
+    // without it the 16-octet HMAC-MD5 key and two DES passes. Both are checked here so that a
+    // client that negotiated either can open a channel.
+    let aes = client_flags & SUPPORTS_AES != 0;
+    let expected = if aes {
+        credential_aes(
+            &challenge.client,
+            &session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server),
+        )
+    } else {
+        let key = session_key(&machine.nt_hash, &challenge.client, &challenge.server);
+        credential(&challenge.client, &key)
+    };
     // TEMP-DIAG: every input and both outputs, so the arithmetic can be redone outside.
     if std::env::var_os("NETLOGON_DIAG").is_some() {
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -293,7 +305,7 @@ fn authenticate3(
             rid = machine.rid,
             client_challenge = %hex(&challenge.client),
             server_challenge = %hex(&challenge.server),
-            session_key = %hex(&key),
+            aes = aes,
             got = %hex(&client_credential),
             want = %hex(&expected),
             "netlogon-diag"
@@ -312,7 +324,17 @@ fn authenticate3(
         ));
     }
 
-    let answer = credential(&challenge.server, &key);
+    let answer = if aes {
+        credential_aes(
+            &challenge.server,
+            &session_key_aes(&machine.nt_hash, &challenge.client, &challenge.server),
+        )
+    } else {
+        credential(
+            &challenge.server,
+            &session_key(&machine.nt_hash, &challenge.client, &challenge.server),
+        )
+    };
     let flags = server_flags(client_flags);
     tracing::info!(
         account = %account,
@@ -328,15 +350,18 @@ fn authenticate3(
 ///
 /// An intersection and not an echo: a flag this server does not implement yet, claimed here, is a
 /// client that takes a path nobody wrote. AES is the one that matters - claiming it makes the
-/// credential AES-CFB8 instead of DES, and nothing in this crate computes that.
+/// credential AES-CFB8 instead of DES, so the flag is echoed only now that [`credential_aes`] exists.
+/// `NETLOGON_NEG_SUPPORTS_AES` (0x01000000): the credential is AES-128-CFB8 over a 32-octet
+/// session key, which [`credential_aes`] computes.
+const SUPPORTS_AES: u32 = 0x0100_0000;
+
 fn server_flags(client: u32) -> u32 {
-    /// `NETLOGON_NEG_STRONG_KEYS` (0x00004000): a 128-bit session key, which is what
-    /// [`session_key`] produces.
+    /// `NETLOGON_NEG_STRONG_KEYS` (0x00004000): a 128-bit session key.
     const STRONG_KEYS: u32 = 0x0000_4000;
     /// `NETLOGON_NEG_AUTHENTICATED_RPC` (0x40000000): the channel is checked, not anonymous.
     const AUTHENTICATED_RPC: u32 = 0x4000_0000;
 
-    client & (STRONG_KEYS | AUTHENTICATED_RPC)
+    client & (STRONG_KEYS | SUPPORTS_AES | AUTHENTICATED_RPC)
 }
 
 /// `HMAC_MD5(nt_hash, MD5(Z(4) || client_challenge || server_challenge))`.
@@ -373,6 +398,46 @@ fn credential(input: &[u8; 8], session_key: &[u8; 16]) -> [u8; 8] {
         cipher.encrypt_block(&mut block);
     }
     block.into()
+}
+
+/// The 32-octet session key of an AES secure channel: `HMAC_SHA256(nt_hash, client || server)`.
+///
+/// MS-NRPC 3.1.4.1.2. The message is the two challenges with no separator and no zero prefix - the
+/// prefix belongs to the MD5 form the DES path uses, and carrying it over produces a key the client
+/// never computes.
+fn session_key_aes(nt_hash: &[u8; 16], client: &[u8; 8], server: &[u8; 8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(nt_hash).expect("HMAC takes a key of any length");
+    mac.update(client);
+    mac.update(server);
+    mac.finalize().into_bytes().into()
+}
+
+/// A credential under an AES secure channel: AES-128-CFB8 over the challenge, zero IV (MS-NRPC
+/// 3.1.4.3.1, `ComputeNetlogonCredential`).
+///
+/// The first sixteen octets of the session key are the key, and the mode is CFB with one-octet
+/// segments - so the block cipher is run once per octet and the result feeds the next block. This is
+/// the same operation in both directions: the keystream is what the plaintext is exclusive-ored
+/// with, so encrypting a received credential reproduces it.
+fn credential_aes(input: &[u8; 8], session_key: &[u8; 32]) -> [u8; 8] {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+
+    let cipher = aes::Aes128::new_from_slice(&session_key[..16]).expect("a 16-octet AES key");
+    let mut state = [0u8; 16];
+    let mut out = [0u8; 8];
+    for (index, byte) in input.iter().enumerate() {
+        let mut block = aes::Block::from(state);
+        cipher.encrypt_block(&mut block);
+        let keystream = block[0];
+        out[index] = byte ^ keystream;
+        state.copy_within(1.., 0);
+        state[15] = out[index];
+    }
+    out
 }
 
 /// Seven octets as the eight-octet DES key they spell (MS-NRPC 3.1.4.4.1, `transformKey`).
@@ -632,9 +697,18 @@ mod tests {
     #[test]
     fn only_the_flags_both_sides_support_are_agreed() {
         // AES is the one that matters: claiming it makes the client switch the credential to
-        // AES-CFB8, which nothing here computes.
+        // AES-CFB8, so it is agreed only because `credential_aes` computes that path now.
         const CLIENT: u32 = 0x0000_4000 | 0x4000_0000 | 0x0100_0000 | 0x0000_0004;
-        assert_eq!(server_flags(CLIENT), 0x0000_4000 | 0x4000_0000);
+        assert_eq!(
+            server_flags(CLIENT),
+            0x0000_4000 | 0x4000_0000 | 0x0100_0000,
+            "the AES flag is echoed, and the unsupported bit 0x4 is not"
+        );
+        assert_eq!(
+            server_flags(0x0000_4000 | 0x4000_0000),
+            0x0000_4000 | 0x4000_0000,
+            "a client that did not offer AES gets the DES path"
+        );
         assert_eq!(
             server_flags(0),
             0,
@@ -651,5 +725,27 @@ mod tests {
             u32::from_le_bytes(reply[16..].try_into().expect("status")),
             NTSTATUS_ACCESS_DENIED
         );
+    }
+
+    #[test]
+    fn an_aes_channel_matches_the_credential_a_client_computes() {
+        // Measured from a live client on the join stand: the machine's NT hash, the two challenges
+        // and the eight octets it sent. With HMAC-SHA256 over the challenges and AES-128-CFB8 over
+        // the client challenge these reproduce it exactly; the DES path does not, which is what
+        // made every channel answer ACCESS_DENIED while the hash itself was right.
+        let nt_hash: [u8; 16] = [
+            0xe2, 0x3d, 0x8a, 0x88, 0xfb, 0x99, 0x8d, 0x47, 0x89, 0x5b, 0x77, 0xef, 0xdd, 0xe9,
+            0x24, 0x7b,
+        ];
+        let client: [u8; 8] = [0xa2, 0xd4, 0x27, 0x65, 0x1d, 0x3d, 0x9c, 0x59];
+        let server: [u8; 8] = [0xc6, 0xc4, 0x44, 0xd5, 0x59, 0x1e, 0xab, 0x90];
+
+        let key = session_key_aes(&nt_hash, &client, &server);
+        assert_eq!(
+            credential_aes(&client, &key),
+            [0xb0, 0x14, 0xa0, 0x61, 0x9c, 0xae, 0x3b, 0xdb]
+        );
+        // The server's answer is the same computation over its own challenge.
+        assert_ne!(credential_aes(&server, &key), [0u8; 8]);
     }
 }
