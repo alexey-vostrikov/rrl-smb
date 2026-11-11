@@ -98,6 +98,16 @@ pub(crate) async fn serve(
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
     tracing::debug!(opnum, len = stub.len(), "netlogon: call");
+    // Behind `NETLOGON_DUMP` like every other octet dump here: a call's own bytes are what settles
+    // where a field lands, and an ordinary run stays quiet.
+    if std::env::var_os("NETLOGON_DUMP").is_some() {
+        tracing::warn!(
+            opnum,
+            len = stub.len(),
+            hex = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "netlogon: call stub"
+        );
+    }
     match opnum {
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
