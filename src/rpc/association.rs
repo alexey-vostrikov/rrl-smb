@@ -95,6 +95,20 @@ pub(crate) struct Association {
     current_call_id: u32,
     /// The start of a PDU whose last bytes have not arrived.
     inbox: Vec<u8>,
+    /// A bind that negotiated schannel, waiting for the AUTH3 that proves it.
+    schannel: Option<PendingSchannel>,
+}
+
+/// A negotiated authentication this server has not yet had proved.
+///
+/// Kept per association and not per process: the proof arrives on the same association as the
+/// negotiate, and an association that negotiated nothing must not accept an AUTH3.
+#[derive(Debug, Clone, Copy)]
+struct PendingSchannel {
+    /// The `auth_context_id` the client used, which its AUTH3 must repeat.
+    auth_context_id: u32,
+    /// The flags the client said it supports.
+    flags: u32,
 }
 
 impl Default for Association {
@@ -108,6 +122,7 @@ impl Default for Association {
             partial: None,
             current_call_id: 0,
             inbox: Vec::new(),
+            schannel: None,
         }
     }
 }
@@ -254,15 +269,20 @@ impl Association {
                 "rpc: authenticated pdu"
             );
         }
-        let step = self.dispatch(&header, pdu.body);
+        let step = self.dispatch(&header, pdu.body, pdu.auth.as_ref());
         self.current_call_id = self.current_call_id.max(header.call_id);
         step
     }
 
-    fn dispatch(&mut self, header: &Header, body: Body<'_>) -> Option<Step> {
+    fn dispatch(
+        &mut self,
+        header: &Header,
+        body: Body<'_>,
+        auth: Option<&pdu::AuthVerifier<'_>>,
+    ) -> Option<Step> {
         if !self.bound {
             return Some(match body {
-                Body::Bind(bind) => self.bind(header, bind),
+                Body::Bind(bind) => self.bind(header, bind, auth),
                 _ => {
                     debug!(ptype = header.ptype, "rpc pdu before bind");
                     self.close(pdu::bind_nak(
@@ -301,7 +321,12 @@ impl Association {
     /// C706 12.6.4.3. The fragment size is the smaller of the two the
     /// client offers, kept between 2048 and [`MAX_FRAG`] and cut to a
     /// multiple of 8.
-    fn bind(&mut self, header: &Header, bind: pdu::Bind) -> Step {
+    fn bind(
+        &mut self,
+        header: &Header,
+        bind: pdu::Bind,
+        auth: Option<&pdu::AuthVerifier<'_>>,
+    ) -> Step {
         let nak = |reason| pdu::bind_nak(header.call_id, reason);
         if bind.contexts.is_empty() {
             return self.close(nak(NAK_PROTOCOL_VERSION_NOT_SUPPORTED));
@@ -317,10 +342,45 @@ impl Association {
         if feature_elements > 1 {
             return self.close(nak(NAK_NOT_SPECIFIED));
         }
-        // MS-RPCE 3.3.3.5.3: the server knows no authentication provider.
-        if header.auth_length > 0 {
-            debug!("authenticated rpc bind refused");
-            return self.close(nak(NAK_AUTHENTICATION_TYPE_NOT_RECOGNIZED));
+        // An authenticated bind, which a netlogon pipe requires of an AD domain.
+        //
+        // The service is `RPC_C_AUTHN_NETLOGON` (68), not NTLMSSP: Samba's schannel, whose token is
+        // MS-NRPC's `NL_AUTH_MESSAGE` rather than an NTLM message. Measured - a bind from a live
+        // join carries type 68 and level 6.
+        //
+        // This answer is the negotiate half only: it says this server speaks the service and agrees
+        // to the level. Nothing is proved yet, and that is the protocol's order - the proof comes in
+        // the AUTH3 that follows, against the session key the secure channel established.
+        let mut auth_reply = None;
+        if let Some(auth) = auth {
+            if auth.auth_type != pdu::AuthVerifier::TYPE_NETLOGON
+                || auth.auth_level != pdu::AuthVerifier::LEVEL_PRIVACY
+            {
+                debug!(
+                    auth_type = auth.auth_type,
+                    auth_level = auth.auth_level,
+                    "rpc bind refused: an authentication service this server does not speak"
+                );
+                return self.close(nak(NAK_AUTHENTICATION_TYPE_NOT_RECOGNIZED));
+            }
+            let message = match crate::rpc::schannel::parse_negotiate(auth.token) {
+                Ok(message) => message,
+                Err(err) => {
+                    debug!(?err, "rpc bind refused: the token is not a negotiate");
+                    return self.close(nak(NAK_AUTHENTICATION_TYPE_NOT_RECOGNIZED));
+                }
+            };
+            debug!(
+                flags = format_args!("{:#010x}", message.flags),
+                domain = %message.domain,
+                computer = %message.computer,
+                "rpc bind: schannel negotiated"
+            );
+            self.schannel = Some(PendingSchannel {
+                auth_context_id: auth.auth_context_id,
+                flags: message.flags,
+            });
+            auth_reply = Some(crate::rpc::schannel::negotiate(message.flags));
         }
         let Some(results) = self.negotiate(&bind.contexts, true) else {
             debug!("rpc bind past the context limit");
@@ -351,6 +411,13 @@ impl Association {
             contexts = ?self.contexts,
             "rpc bind"
         );
+        let auth_reply = auth_reply.as_ref().map(|token| pdu::AuthReply {
+            auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
+            auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
+            auth_pad_length: 0,
+            auth_context_id: self.schannel.map_or(1, |pending| pending.auth_context_id),
+            token,
+        });
         Step::Send(pdu::bind_ack(
             PTYPE_BIND_ACK,
             header.call_id,
@@ -358,6 +425,7 @@ impl Association {
             self.assoc_group_id,
             SECONDARY_ADDRESS,
             &results,
+            auth_reply.as_ref(),
         ))
     }
 
@@ -384,6 +452,7 @@ impl Association {
             self.assoc_group_id,
             "",
             &results,
+            None,
         ))
     }
 

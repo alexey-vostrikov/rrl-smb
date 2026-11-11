@@ -24,6 +24,7 @@ pub(crate) const NETLOGON_PIPE: &str = "netlogon";
 pub(crate) mod lsarpc;
 pub(crate) mod netlogon;
 pub(crate) mod samr;
+pub(crate) mod schannel;
 
 /// Source of association group ids for binds that ask for a new group.
 static NEXT_ASSOC_GROUP: AtomicU32 = AtomicU32::new(1);
