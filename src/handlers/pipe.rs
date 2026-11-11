@@ -28,7 +28,7 @@ use crate::proto::messages::{
     SetInfoRequest, WriteRequest, WriteResponse,
 };
 use crate::rpc::pipe::{MAX_PIPES_PER_CONNECTION, Pipe, Read};
-use crate::rpc::{LSARPC_PIPE, SAMR_PIPE, SRVSVC_PIPE};
+use crate::rpc::{LSARPC_PIPE, NETLOGON_PIPE, SAMR_PIPE, SRVSVC_PIPE};
 use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
 
@@ -201,7 +201,11 @@ async fn create(
     let pipe = name.trim_start_matches(['\\', '/']);
     let known = (server.config.share_listing && pipe.eq_ignore_ascii_case(SRVSVC_PIPE))
         || pipe.eq_ignore_ascii_case(LSARPC_PIPE)
-        || pipe.eq_ignore_ascii_case(SAMR_PIPE);
+        || pipe.eq_ignore_ascii_case(SAMR_PIPE)
+        // `netlogon` is what a member opens after its account exists, to prove it holds the machine
+        // password. A join reaches it last and a server without it says the domain could not be
+        // contacted, which is the same message a network failure gives.
+        || pipe.eq_ignore_ascii_case(NETLOGON_PIPE);
     if !known {
         debug!(name = %name, "no such pipe");
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);

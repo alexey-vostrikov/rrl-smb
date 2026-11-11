@@ -17,7 +17,12 @@ pub(crate) const LSARPC_PIPE: &str = "lsarpc";
 /// The pipe it opens second, to create its machine account: SAM.
 pub(crate) const SAMR_PIPE: &str = "samr";
 
+/// The pipe a member opens once its account exists, to prove it holds the machine password and then
+/// read the domain's description of itself: netlogon.
+pub(crate) const NETLOGON_PIPE: &str = "netlogon";
+
 pub(crate) mod lsarpc;
+pub(crate) mod netlogon;
 pub(crate) mod samr;
 
 /// Source of association group ids for binds that ask for a new group.
