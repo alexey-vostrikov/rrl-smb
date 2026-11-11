@@ -98,7 +98,7 @@ pub(crate) async fn serve(
                 "netlogon: a secure channel needs the machine account's NT hash, \
                  which this crate has no directory to read"
             );
-            Ok(not_supported())
+            Ok(not_supported(opnum))
         }
         _ => Err(Fault {
             status: NCA_OP_RNG_ERROR,
@@ -138,19 +138,42 @@ fn request_challenge(session: &mut Session, stub: &[u8]) -> Result<Vec<u8>, Faul
         server,
     });
 
-    // A `[ref]` return has no referent id: the caller receives the eight octets and nothing else.
+    // Out parameters first, the return value last: that is the order NDR marshals a stub in
+    // (MS-RPCE 2.2.6), and a reply that puts `NTSTATUS` first is read as a challenge of four bytes
+    // and a status taken from the middle of the server's own random value. Measured: the client
+    // answered `NT code 0x16128db8` - not a status anybody defined, which is what a status read
+    // from the wrong offset looks like.
     let mut writer = NdrWriter::new();
-    writer.u32(NTSTATUS_SUCCESS_STATUS);
     writer.raw(&server);
+    writer.u32(NTSTATUS_SUCCESS_STATUS);
     Ok(writer.finish())
 }
 
 /// `NTSTATUS` success, which every reply in this interface begins with.
 const NTSTATUS_SUCCESS_STATUS: u32 = 0x0000_0000;
 
-/// A refusal with nothing after it, for the two calls this server does not make.
-fn not_supported() -> Vec<u8> {
+/// A refusal for the two calls this server does not make.
+///
+/// The out parameters are still written, zeroed, because a client decodes the stub by the shape of
+/// the call it made and not by the status it finds: `ServerAuthenticate3` answers with a server
+/// credential, the negotiated flags and a RID before the status, and a reply that omitted them
+/// would be read as a shorter structure with a status made of their first octets.
+fn not_supported(opnum: u16) -> Vec<u8> {
     let mut writer = NdrWriter::new();
+    match opnum {
+        OPNUM_SERVER_AUTHENTICATE3 => {
+            writer.raw(&[0u8; 8]);
+            writer.u32(0); // negotiate_flags, which no channel agreed on
+            writer.u32(0); // rid
+        }
+        _ => {
+            // `netr_LogonGetDomainInfo` answers with an authenticator and a `netr_DomainInfo`
+            // union; zeros are the only honest content for a call that did nothing.
+            writer.raw(&[0u8; 8]);
+            writer.u32(0);
+            writer.u32(0);
+        }
+    }
     writer.u32(NTSTATUS_NOT_SUPPORTED);
     writer.finish()
 }
@@ -205,13 +228,17 @@ mod tests {
         let reply = request_challenge(&mut session, &request(&client)).expect("answered");
 
         assert_eq!(
-            u32::from_le_bytes(reply[..4].try_into().expect("status")),
-            0,
-            "the call succeeds"
+            reply.len(),
+            12,
+            "the eight octets and the status, nothing else"
         );
-        assert_eq!(reply.len(), 12, "status and the eight octets, nothing else");
+        assert_eq!(
+            u32::from_le_bytes(reply[8..].try_into().expect("status")),
+            0,
+            "the status is last, after the out parameters"
+        );
         assert_ne!(
-            &reply[4..12],
+            &reply[..8],
             &[0u8; 8],
             "the server's own challenge is random"
         );
@@ -222,7 +249,7 @@ mod tests {
         assert_eq!(stored.client, client, "the client's half is what it sent");
         assert_eq!(
             stored.server,
-            <[u8; 8]>::try_from(&reply[4..12]).expect("eight octets"),
+            <[u8; 8]>::try_from(&reply[..8]).expect("eight octets"),
             "the half the client was told is the half this server will check against"
         );
     }
@@ -252,12 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn the_calls_this_server_does_not_make_are_refused_by_name() {
-        let reply = not_supported();
+    fn the_calls_this_server_does_not_make_are_refused_after_their_own_shape() {
+        // `ServerAuthenticate3` answers with a credential, the flags and a RID before the status, so
+        // a refusal that omitted them would be decoded as a shorter structure.
+        let reply = not_supported(OPNUM_SERVER_AUTHENTICATE3);
+        assert_eq!(reply.len(), 20, "eight octets, two words, then the status");
         assert_eq!(
-            u32::from_le_bytes(reply[..4].try_into().expect("status")),
+            u32::from_le_bytes(reply[16..].try_into().expect("status")),
             NTSTATUS_NOT_SUPPORTED
         );
-        assert_eq!(reply.len(), 4, "a refusal carries no structure");
+        assert_eq!(&reply[..16], &[0u8; 16], "nothing was agreed");
     }
 }
