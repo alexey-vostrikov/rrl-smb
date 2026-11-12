@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(feature = "krb5")]
+use crate::proto::auth::kerberos::KerberosIdentity;
 use crate::proto::auth::ntlm::{
     AuthOutcome, Direction, Identity, NTLMSSP_SIGNATURE, NtlmAuthenticate, NtlmMac, NtlmServer,
     NtlmTargetInfo, UserCreds,
@@ -123,6 +125,26 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_REQUEST_NOT_ACCEPTED);
     }
 
+    // The closing round of a Kerberos logon: the ticket was proved and the AP-REP sent in the round
+    // before, and the client has now returned it. Everything this round needs is in the pending
+    // entry, so the security buffer is empty by design.
+    #[cfg(feature = "krb5")]
+    if sid != 0
+        && let Some((identity, started)) = conn.pending_kerberos.write().await.remove(&sid)
+    {
+        if !blob.is_empty() {
+            warn!(
+                len = blob.len(),
+                "the closing kerberos round carried a token; it is ignored"
+            );
+        }
+        debug!(
+            waited_ms = started.elapsed().as_millis() as u64,
+            "kerberos: closing round"
+        );
+        return finish_kerberos(server, conn, &req, sid, identity).await;
+    }
+
     let token = match Token::decode(blob) {
         Ok(t) => t,
         Err(status) => return HandlerResponse::err(status),
@@ -138,7 +160,7 @@ pub async fn handle(
         Token::Init(init)
             if server.kerberos.is_some() && init.mech_types.iter().any(|mech| mech == OID_KRB5) =>
         {
-            return accept_kerberos(server, conn, &req, sid, &init).await;
+            return accept_kerberos(server, conn, sid, &init).await;
         }
         Token::Init(init) => Opening::Spnego(init),
         Token::Raw { ntlm, .. } => {
@@ -181,7 +203,6 @@ pub async fn handle(
 async fn accept_kerberos(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
-    req: &SessionSetupRequest,
     sid: u64,
     init: &NegTokenInit,
 ) -> HandlerResponse {
@@ -245,18 +266,9 @@ async fn accept_kerberos(
     }
 
     let dialect = *conn.dialect.read().await;
-    let Some(dialect) = dialect else {
+    if dialect.is_none() {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    };
-
-    let session_base_key = identity.session_key;
-    let cipher = *conn.cipher.read().await;
-    let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
-    let session_flags = if encrypt_data {
-        SessionSetupResponse::FLAG_ENCRYPT_DATA
-    } else {
-        0
-    };
+    }
 
     // The reply carries the AP-REP when the client asked for mutual authentication: Windows always
     // does, and a client that asked and got none refuses the session even though the ticket was good.
@@ -275,14 +287,83 @@ async fn accept_kerberos(
         tracing::debug!(len = response_token.len(), head = %head, "kerberos reply bytes");
     }
 
-    let body_out =
-        build_session_setup_response(ntstatus::STATUS_SUCCESS, &response_token, session_flags);
+    // The AP-REP goes out now; the session is created when the client returns it. Windows needs
+    // that round trip to finish its own GSS context, and a server that answers SUCCESS on this round
+    // leaves the client with a context it never completes - it closes the connection without ever
+    // connecting a share, and the redirector reports `ERROR_INVALID_PARAMETER` on the share rather
+    // than an authentication failure, which sends the search in the wrong direction.
+    conn.pending_kerberos
+        .write()
+        .await
+        .insert(new_sid, (identity, std::time::Instant::now()));
+    let body_out = build_session_setup_response(
+        ntstatus::STATUS_MORE_PROCESSING_REQUIRED,
+        &response_token,
+        0,
+    );
+    HandlerResponse {
+        body: body_out,
+        status: ntstatus::STATUS_MORE_PROCESSING_REQUIRED,
+        override_tree_id: None,
+        override_session_id: Some(new_sid),
+        // No key yet: the session does not exist until the next round, and signing this reply with
+        // a key the client has not finished agreeing to is what would make it unreadable.
+        skip_signing: true,
+        take_preauth_snapshot_for_session: None,
+        after_send: Vec::new(),
+    }
+}
 
+/// Completes a Kerberos logon whose AP-REP the client has returned.
+///
+/// Everything here was proved in the previous round: the ticket, the session key, and the identity.
+/// What this round adds is the client's confirmation, and only then does a session exist.
+async fn finish_kerberos(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &SessionSetupRequest,
+    sid: u64,
+    identity: KerberosIdentity,
+) -> HandlerResponse {
+    // A realm is not a share ACL: the identity is the user, and what it may reach is decided by the
+    // share and the session, exactly as for an NTLM logon of the same name.
+    let smb_identity = Identity::User {
+        user: identity.user.clone(),
+        domain: identity.realm.clone(),
+    };
+
+    // Reauthentication keeps the session and its trees, for the same user only (MS-SMB2 3.3.5.5.2).
+    let existing = conn.sessions.read().await.get(&sid).cloned();
+    if let Some(existing) = &existing
+        && !same_user(&existing.read().await.identity, &smb_identity)
+    {
+        info!(%identity.realm, "kerberos reauthentication as another user refused");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+
+    let dialect = *conn.dialect.read().await;
+    let Some(dialect) = dialect else {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    };
+
+    let session_base_key = identity.session_key;
+    let cipher = *conn.cipher.read().await;
+    let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
+    let session_flags = if encrypt_data {
+        SessionSetupResponse::FLAG_ENCRYPT_DATA
+    } else {
+        0
+    };
+
+    // No token: the AP-REP was answered in the previous round, and this round only closes the bind.
+    let success_buf = encode_resp_token(NegState::AcceptCompleted, None, None, None);
+    let body_out =
+        build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_buf, session_flags);
     let mut response = HandlerResponse {
         body: body_out,
         status: ntstatus::STATUS_SUCCESS,
         override_tree_id: None,
-        override_session_id: Some(new_sid),
+        override_session_id: Some(sid),
         skip_signing: false,
         take_preauth_snapshot_for_session: None,
         after_send: Vec::new(),
@@ -321,21 +402,20 @@ async fn accept_kerberos(
             warn!("session limit reached on connection");
             return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
         }
-        sessions.insert(new_sid, session_arc);
+        sessions.insert(sid, session_arc);
     }
 
-    if req.previous_session_id != 0 && req.previous_session_id != new_sid {
+    if req.previous_session_id != 0 && req.previous_session_id != sid {
         close_previous_session(server, req.previous_session_id, &smb_identity).await;
     }
     if dialect == Dialect::Smb311 {
-        response.take_preauth_snapshot_for_session = Some(new_sid);
+        response.take_preauth_snapshot_for_session = Some(sid);
     }
 
     server.auth.record_success(&identity.user);
     info!(
         user = %identity.user,
         realm = %identity.realm,
-        mutual = identity.ap_rep.is_some(),
         "session established by kerberos"
     );
     response

@@ -62,6 +62,22 @@ pub struct Connection {
     /// SPNEGO-wrapped (false) so the second-round response matches form.
     pub pending_auths: RwLock<HashMap<u64, PendingAuth>>,
 
+    /// Kerberos logons whose ticket is proved and whose AP-REP has gone out, waiting for the client
+    /// to return it. Windows completes mutual authentication in two SESSION_SETUP rounds - it needs
+    /// the round trip to finish its own GSS context - and a server that answers SUCCESS on the first
+    /// round leaves the client with a context it never completes: it closes the connection and the
+    /// redirector reports `ERROR_INVALID_PARAMETER` on the share it was connecting to.
+    #[cfg(feature = "krb5")]
+    pub pending_kerberos: RwLock<
+        HashMap<
+            u64,
+            (
+                crate::proto::auth::kerberos::KerberosIdentity,
+                std::time::Instant,
+            ),
+        >,
+    >,
+
     /// In-flight SMB 3.1.1 preauth state keyed by SessionId during
     /// multi-leg SESSION_SETUP.
     pub session_preauth: RwLock<HashMap<u64, PreauthIntegrity>>,
@@ -122,6 +138,8 @@ impl Connection {
             max_write_size: tokio::sync::RwLock::new(max_write_size),
             sessions: RwLock::new(HashMap::new()),
             pending_auths: RwLock::new(HashMap::new()),
+            #[cfg(feature = "krb5")]
+            pending_kerberos: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
             disconnect: AtomicBool::new(false),
             closing: AtomicBool::new(false),
