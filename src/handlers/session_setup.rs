@@ -142,7 +142,10 @@ pub async fn handle(
             waited_ms = started.elapsed().as_millis() as u64,
             "kerberos: closing round"
         );
-        return finish_kerberos(server, conn, &req, sid, identity).await;
+        // The closing round: the AP-REP was answered in the previous one, so this carries nothing
+        // but the state that says the bind is complete.
+        let closing = encode_resp_token(NegState::AcceptCompleted, None, None, None);
+        return finish_kerberos(server, conn, &req, sid, identity, closing).await;
     }
 
     let token = match Token::decode(blob) {
@@ -160,7 +163,7 @@ pub async fn handle(
         Token::Init(init)
             if server.kerberos.is_some() && init.mech_types.iter().any(|mech| mech == OID_KRB5) =>
         {
-            return accept_kerberos(server, conn, sid, &init).await;
+            return accept_kerberos(server, conn, &req, sid, &init).await;
         }
         Token::Init(init) => Opening::Spnego(init),
         Token::Raw { ntlm, .. } => {
@@ -203,6 +206,7 @@ pub async fn handle(
 async fn accept_kerberos(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
+    req: &SessionSetupRequest,
     sid: u64,
     init: &NegTokenInit,
 ) -> HandlerResponse {
@@ -277,11 +281,17 @@ async fn accept_kerberos(
     // The reply carries the AP-REP when the client asked for mutual authentication: Windows always
     // does, and a client that asked and got none refuses the session even though the ticket was good.
     //
-    // `accept-incomplete`, because the exchange is not finished: this round hands the client its
-    // AP-REP and the next one closes the bind. Saying `accept-completed` here is what a Windows client
-    // reads as a contradiction and abandons.
+    // Whether the bind closes here or in a second round is the one thing that had to be measured, and
+    // `RRL_SMB_KRB_TWOROUND` decides it. A Windows client that is answered `accept-completed` and
+    // STATUS_SUCCESS in one round is finished; one that is answered `accept-incomplete` must send a
+    // closing round, and a client that does not is left with a context it never completes.
+    let two_rounds = std::env::var_os("RRL_SMB_KRB_TWOROUND").is_some();
     let response_token = encode_resp_token(
-        NegState::AcceptIncomplete,
+        if two_rounds {
+            NegState::AcceptIncomplete
+        } else {
+            NegState::AcceptCompleted
+        },
         Some(OID_KRB5),
         identity.ap_rep.as_deref().map(mechanism_token),
         None,
@@ -308,11 +318,11 @@ async fn accept_kerberos(
         }
     }
 
-    // The AP-REP goes out now; the session is created when the client returns it. Windows needs
-    // that round trip to finish its own GSS context, and a server that answers SUCCESS on this round
-    // leaves the client with a context it never completes - it closes the connection without ever
-    // connecting a share, and the redirector reports `ERROR_INVALID_PARAMETER` on the share rather
-    // than an authentication failure, which sends the search in the wrong direction.
+    if !two_rounds {
+        return finish_kerberos(server, conn, req, new_sid, identity, response_token).await;
+    }
+
+    // The AP-REP goes out now; the session is created when the client returns it.
     conn.pending_kerberos
         .write()
         .await
@@ -345,6 +355,7 @@ async fn finish_kerberos(
     req: &SessionSetupRequest,
     sid: u64,
     identity: KerberosIdentity,
+    success_token: Vec<u8>,
 ) -> HandlerResponse {
     // A realm is not a share ACL: the identity is the user, and what it may reach is decided by the
     // share and the session, exactly as for an NTLM logon of the same name.
@@ -376,10 +387,8 @@ async fn finish_kerberos(
         0
     };
 
-    // No token: the AP-REP was answered in the previous round, and this round only closes the bind.
-    let success_buf = encode_resp_token(NegState::AcceptCompleted, None, None, None);
     let body_out =
-        build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_buf, session_flags);
+        build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_token, session_flags);
     let mut response = HandlerResponse {
         body: body_out,
         status: ntstatus::STATUS_SUCCESS,
