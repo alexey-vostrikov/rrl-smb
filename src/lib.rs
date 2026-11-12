@@ -432,10 +432,10 @@ pub use files::{
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
-pub use proto::auth::ntlm::Identity;
+pub use proto::auth::ntlm::{Identity, UserCreds};
 pub use server::{
-    ConfigError, ConfigHandle, ChannelState, MachineAccount, MachinePasswords, MachineSecrets,
-    ShareMode, ShutdownHandle, SmbServer,
+    ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachinePasswords,
+    MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
 };
 pub use stream::{StreamInfo, StreamName};
 

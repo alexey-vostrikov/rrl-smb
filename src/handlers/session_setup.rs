@@ -531,7 +531,19 @@ async fn continue_exchange(
         let (acceptor, raw_form) = (&pair.0, pair.1);
         let lookup = |u: &str, _d: &str| match configured_user(&users, u) {
             Some((_, creds)) => Some(creds.clone()),
-            None => (public && is_guest(&users, u)).then(|| UserCreds::from_password("")),
+            // The domain's own accounts, for a client that has no ticket yet. `Add-Computer`
+            // cannot present one - the domain it is joining has not issued any - so its first
+            // SESSION_SETUP is NTLM against a real account, and a server with an empty static table
+            // refuses every Windows machine at exactly this point.
+            None => match server
+                .config
+                .logon_users
+                .as_ref()
+                .and_then(|source| source.user(u))
+            {
+                Some(creds) => Some(creds),
+                None => (public && is_guest(&users, u)).then(|| UserCreds::from_password("")),
+            },
         };
         acceptor
             .authenticate(&ntlm, lookup)
@@ -550,7 +562,18 @@ async fn continue_exchange(
                             *user = name.clone();
                             nt_hash = Some(creds.nt_hash);
                         }
-                        None => guest = public && is_guest(&users, user),
+                        // A domain account keeps the name it logged on with - the directory is the
+                        // authority on its spelling - and its hash is kept so that the check after
+                        // this block can notice an account that changed or went away meanwhile.
+                        None => match server
+                            .config
+                            .logon_users
+                            .as_ref()
+                            .and_then(|source| source.user(user))
+                        {
+                            Some(creds) => nt_hash = Some(creds.nt_hash),
+                            None => guest = public && is_guest(&users, user),
+                        },
                     }
                 }
                 let mic = if raw_form {
