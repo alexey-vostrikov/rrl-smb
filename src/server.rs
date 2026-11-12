@@ -211,6 +211,27 @@ pub trait MachinePasswords: Send + Sync + std::fmt::Debug {
     async fn set_password(&self, account: &str, password: &[u8]) -> bool;
 }
 
+/// Where a domain account's NT hash comes from, when this deployment has a directory.
+///
+/// NTLM is how a Windows client authenticates to `IPC$` when it has no ticket yet - which is the
+/// whole of `Add-Computer`: the domain it is joining cannot have issued it one. A server with an
+/// empty static user table therefore refuses every Windows machine at the first
+/// `SESSION_SETUP`, and the client reports "the user name or password is incorrect" for a password
+/// that is right. Measured on the AD-join stand: that was the last thing between the guest and a
+/// joined domain.
+///
+/// `None` covers two cases on purpose, and the caller must keep them indistinguishable: an account
+/// that does not exist, and one that exists but may not log on. NTLM's own defence against account
+/// enumeration is that both take the same time and give the same status, and a hook that answered
+/// differently would undo it.
+///
+/// Synchronous, unlike [`MachinePasswords`]: the NTLM exchange checks the response inside
+/// `NtlmServer::authenticate`, and a directory-backed answer reads a snapshot it already holds.
+pub trait LogonUsers: Send + Sync + std::fmt::Debug {
+    /// The credentials `account` logs on with, or `None` when this server does not serve it.
+    fn user(&self, account: &str) -> Option<UserCreds>;
+}
+
 /// A secure channel that has been proved: what signs its PDUs, and the pair of credentials its
 /// `netr_Authenticator`s carry.
 ///
@@ -290,6 +311,9 @@ pub struct ServerConfig {
     /// Where `netr_ServerPasswordSet2` writes the password it carried, when this deployment has a
     /// directory to write it to.
     pub machine_passwords: Option<Arc<dyn MachinePasswords>>,
+    /// Where a domain account's NT hash comes from, for the NTLM logon a machine without a ticket
+    /// makes: `Add-Computer` has no ticket yet, because the domain it is joining has not issued one.
+    pub logon_users: Option<Arc<dyn LogonUsers>>,
     /// Serve the secure channel of a client that offers no AES, which means DES.
     ///
     /// Off by default, and deliberately a setting rather than a build feature: DES is a 56-bit
@@ -328,6 +352,7 @@ impl ServerConfig {
             limits: Limits::default(),
             machine_secrets: None,
             machine_passwords: None,
+            logon_users: None,
             netlogon_des: false,
             share_listing: true,
             apple_model: None,
@@ -610,8 +635,16 @@ impl ServerState {
     }
 
     /// Look up a user's NT hash by name.
+    ///
+    /// The static table first - it is what a deployment configured, and a directory that happened to
+    /// hold the same name must not shadow it - then the source that owns the domain's accounts. The
+    /// second half is what lets a machine log on before it has a ticket (`Add-Computer` sends NTLM),
+    /// and it is also the check that a user deleted during a logon gets no session.
     pub async fn lookup_user(&self, name: &str) -> Option<UserCreds> {
-        self.users.table.read().await.get(name).cloned()
+        if let Some(creds) = self.users.table.read().await.get(name).cloned() {
+            return Some(creds);
+        }
+        self.config.logon_users.as_ref()?.user(name)
     }
 
     /// Whether anonymous logon is permitted (i.e. at least one share is public).

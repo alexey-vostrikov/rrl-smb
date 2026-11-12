@@ -336,6 +336,7 @@ pub struct SmbServerBuilder {
     /// The domain's SID, answered by `lsarpc` beside that name.
     domain_sid: Option<Vec<u8>>,
     machine_secrets: Option<std::sync::Arc<dyn crate::server::MachineSecrets>>,
+    logon_users: Option<std::sync::Arc<dyn crate::server::LogonUsers>>,
     machine_passwords: Option<std::sync::Arc<dyn crate::server::MachinePasswords>>,
     netlogon_des: bool,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
@@ -395,6 +396,7 @@ impl SmbServerBuilder {
             dns_domain: None,
             domain_sid: None,
             machine_secrets: None,
+            logon_users: None,
             machine_passwords: None,
             netlogon_des: false,
             domain_netbios: None,
@@ -476,6 +478,15 @@ impl SmbServerBuilder {
         secrets: std::sync::Arc<dyn crate::server::MachineSecrets>,
     ) -> Self {
         self.machine_secrets = Some(secrets);
+        self
+    }
+
+    /// Sets where a domain account's NT hash comes from.
+    ///
+    /// The logon a Windows machine makes before it has a ticket: `Add-Computer` cannot present a
+    /// ticket for a domain it has not joined, so its first `SESSION_SETUP` is NTLM.
+    pub fn logon_users(mut self, users: std::sync::Arc<dyn crate::server::LogonUsers>) -> Self {
+        self.logon_users = Some(users);
         self
     }
 
@@ -829,6 +840,7 @@ impl SmbServerBuilder {
             dns_domain: self.dns_domain.clone(),
             domain_sid: self.domain_sid.clone(),
             machine_secrets: self.machine_secrets.clone(),
+            logon_users: self.logon_users.clone(),
             machine_passwords: self.machine_passwords.clone(),
             netlogon_des: self.netlogon_des,
             domain_netbios: self.domain_netbios.clone(),
