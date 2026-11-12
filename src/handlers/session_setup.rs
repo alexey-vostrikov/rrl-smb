@@ -272,8 +272,12 @@ async fn accept_kerberos(
 
     // The reply carries the AP-REP when the client asked for mutual authentication: Windows always
     // does, and a client that asked and got none refuses the session even though the ticket was good.
+    //
+    // `accept-incomplete`, because the exchange is not finished: this round hands the client its
+    // AP-REP and the next one closes the bind. Saying `accept-completed` here is what a Windows client
+    // reads as a contradiction and abandons.
     let response_token = encode_resp_token(
-        NegState::AcceptCompleted,
+        NegState::AcceptIncomplete,
         Some(OID_KRB5),
         identity.ap_rep.as_deref(),
         None,

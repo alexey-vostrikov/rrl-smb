@@ -70,8 +70,12 @@ pub const OID_NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02,
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NegState {
-    AcceptCompleted = 0,
-    AcceptIncomplete = 1,
+    // RFC 4178 §4.2.1: `accept-incomplete (0), accept-completed (1), reject (2), request-mic (3)`.
+    // The two were the other way round here, so every reply said the opposite of what it meant - and
+    // a Windows client, told "accept-completed" while it was still waiting for its AP-REP, closed the
+    // connection at the tree connect with `ERROR_INVALID_PARAMETER`.
+    AcceptIncomplete = 0,
+    AcceptCompleted = 1,
     Reject = 2,
     RequestMic = 3,
 }
@@ -79,8 +83,8 @@ pub enum NegState {
 impl NegState {
     fn from_byte(b: u8) -> ProtoResult<Self> {
         match b {
-            0 => Ok(NegState::AcceptCompleted),
-            1 => Ok(NegState::AcceptIncomplete),
+            0 => Ok(NegState::AcceptIncomplete),
+            1 => Ok(NegState::AcceptCompleted),
             2 => Ok(NegState::Reject),
             3 => Ok(NegState::RequestMic),
             _ => Err(ProtoError::Auth("invalid NegState")),
