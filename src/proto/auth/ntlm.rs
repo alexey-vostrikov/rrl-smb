@@ -690,6 +690,31 @@ pub struct NtlmServer {
 }
 
 impl NtlmServer {
+    /// A server that offers no confidentiality or integrity.
+    ///
+    /// SASL over LDAP negotiates a security layer of its own (RFC 4752), and a client that reads
+    /// SIGN or SEAL in the challenge believes it must seal every later message. An LDAP client that
+    /// expects that sends its next request wrapped, and a server that only parses LDAP reads the
+    /// sealed octets as a malformed message - measured on the AD-join stand, where the join failed
+    /// with "the specified network resource or device is no longer available" one round after a
+    /// successful bind.
+    ///
+    /// What is left is what NTLMv2 needs: Unicode, extended session security, and the target info
+    /// that carries the time.
+    pub fn without_signing(
+        server_challenge: [u8; 8],
+        target: NtlmTargetInfo,
+        timestamp: u64,
+    ) -> Self {
+        let mut server = Self::new(server_challenge, target, timestamp);
+        server.server_flags &= !(flags::NTLMSSP_NEGOTIATE_SIGN
+            | flags::NTLMSSP_NEGOTIATE_SEAL
+            | flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+            | flags::NTLMSSP_NEGOTIATE_KEY_EXCH);
+        server.negotiated_flags = server.server_flags;
+        server
+    }
+
     /// Create a new server-side acceptor.
     pub fn new(server_challenge: [u8; 8], target: NtlmTargetInfo, timestamp: u64) -> Self {
         // Flags the server offers.
