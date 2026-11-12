@@ -1189,6 +1189,16 @@ async fn build_response_bytes(
     } else {
         hdr.flags &= !SMB2_FLAGS_SIGNED;
     }
+    // What a client can actually verify, gated: whether the closing SESSION_SETUP carries a
+    // signature, and which key it was computed with. A Windows client that drops the connection right
+    // after this frame says nothing about why, so the answer has to be visible here.
+    if std::env::var_os("RRL_SMB_SIGN_DIAG").is_some() && req_hdr.command == Command::SessionSetup {
+        let head: String = key.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "sign-diag: sid={} status=0x{:08x} signed={} key={} algo={:?} flags=0x{:08x}",
+            hdr.session_id, handler_resp.status, should_sign, head, algo, hdr.flags
+        );
+    }
     let mut out = Vec::with_capacity(SMB2_HEADER_LEN + handler_resp.body.len());
     if let Err(e) = hdr.write(&mut out) {
         error!(error = %e, "failed to encode response header");
