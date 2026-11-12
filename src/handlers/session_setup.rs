@@ -226,6 +226,10 @@ async fn accept_kerberos(
         }
         tracing::debug!(len = ap_req.len(), head = %head, "kerberos ticket bytes");
     }
+    if std::env::var_os("RRL_SMB_HEX").is_some() {
+        let full: String = ap_req.iter().map(|byte| format!("{byte:02x}")).collect();
+        eprintln!("smb-hex: ap_req={full}");
+    }
 
     let identity = match acceptor.accept(ap_req) {
         Ok(identity) => identity,
@@ -289,6 +293,19 @@ async fn accept_kerberos(
             write!(&mut head, "{byte:02x}").expect("writing to String cannot fail");
         }
         tracing::debug!(len = response_token.len(), head = %head, "kerberos reply bytes");
+    }
+    // The whole reply, when a client refuses it: 48 octets are enough to see the shape and not enough
+    // to see what is wrong with it, and a Windows client says only that the share cannot be reached.
+    if std::env::var_os("RRL_SMB_HEX").is_some() {
+        let full: String = response_token
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        eprintln!("smb-hex: reply={full}");
+        if let Some(ap_rep) = identity.ap_rep.as_deref() {
+            let rep: String = ap_rep.iter().map(|byte| format!("{byte:02x}")).collect();
+            eprintln!("smb-hex: ap_rep={rep}");
+        }
     }
 
     // The AP-REP goes out now; the session is created when the client returns it. Windows needs
