@@ -433,6 +433,9 @@ pub use files::{
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::{AuthOutcome, Identity, NtlmServer, NtlmTargetInfo, UserCreds};
+// The SPNEGO codec, for a protocol that negotiates the same mechanism outside SMB: the framing of a
+// `NegTokenResp` is not SMB's and a second encoder would be a second place to be wrong about DER.
+pub use proto::auth::spnego::{NegState, encode_resp_token};
 pub use server::{
     ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachinePasswords,
     MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
