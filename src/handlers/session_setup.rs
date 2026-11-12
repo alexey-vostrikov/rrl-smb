@@ -283,7 +283,7 @@ async fn accept_kerberos(
     let response_token = encode_resp_token(
         NegState::AcceptIncomplete,
         Some(OID_KRB5),
-        identity.ap_rep.as_deref(),
+        identity.ap_rep.as_deref().map(mechanism_token),
         None,
     );
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -559,6 +559,29 @@ fn more_processing(sid: u64, outbound: &[u8]) -> HandlerResponse {
         take_preauth_snapshot_for_session: None,
         after_send: Vec::new(),
     }
+}
+
+/// The mechanism token inside a Kerberos GSS token, without the GSS-API framing.
+///
+/// A token as GSS-API produces it is `[APPLICATION 0] { OID krb5, TOK_ID 0x02 0x00, AP-REP }`. That
+/// framing belongs to the mechanism speaking GSS directly - which is what LDAP does, and Windows
+/// accepts it there. SPNEGO carries the mechanism's own token, so the envelope is the NegTokenResp
+/// itself and a second `[APPLICATION 0]` where an `AP-REP` is expected leaves the client unable to
+/// proceed; it closes the connection and the redirector reports `ERROR_INVALID_PARAMETER`.
+///
+/// `RRL_SMB_KRB_GSS=1` keeps the envelope, because a client exists that wants it and the difference
+/// is one environment variable rather than one build.
+fn mechanism_token(token: &[u8]) -> &[u8] {
+    if std::env::var_os("RRL_SMB_KRB_GSS").is_some() {
+        return token;
+    }
+    // 0x6e is an AP-REQ, 0x6f an AP-REP: either is the mechanism's token.
+    if token.first() == Some(&0x60)
+        && let Some(position) = token.iter().position(|byte| *byte == 0x6f || *byte == 0x6e)
+    {
+        return &token[position..];
+    }
+    token
 }
 
 /// Later rounds of the exchange for `sid`.
