@@ -417,6 +417,13 @@ fn open_domain(stub: &[u8]) -> Result<Vec<u8>, Fault> {
 fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     let _handle = reader.bytes(20);
+    // `RPC_UNICODE_STRING` is `{ Length <H, MaximumLength <H, Data LPWSTR }` - two two-octet
+    // lengths and *then* the pointer to the characters. Reading it as a bare pointer consumed the
+    // two lengths as that pointer and then read the pointer as a string header, so every name came
+    // out as nonsense, `matches` was false, and the client was told `STATUS_NO_SUCH_DOMAIN` for the
+    // domain it had just enumerated: `NetpProvisionComputerAccount: 0x54b`.
+    let _length = reader.u16();
+    let _maximum = reader.u16();
     let _present = reader.pointer();
     let name = reader
         .string()
@@ -524,9 +531,18 @@ mod tests {
     }
 
     /// A `samr_LookupDomain` request: handle, string referent, the units and their NUL.
+    /// The stub a client sends `samr_LookupDomain`: a handle and an `RPC_UNICODE_STRING`.
+    ///
+    /// The name part is the shape the reader has to expect, and it is the shape that was wrong on
+    /// both sides at once: a fixture that wrote a bare pointer and a reader that expected one agreed
+    /// with each other and disagreed with every real client, which is why the stand reported
+    /// `STATUS_NO_SUCH_DOMAIN` for the domain it had just enumerated.
     fn lookup_stub(name: &str) -> Vec<u8> {
         let mut reader = NdrWriter::new();
         reader.bytes(&samr_handle());
+        let octets = u16::try_from(name.encode_utf16().count() * 2).expect("a short name");
+        reader.u16(octets); // Length
+        reader.u16(octets); // MaximumLength
         reader.pointer(true);
         reader.string(name);
         reader.finish()
