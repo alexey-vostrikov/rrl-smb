@@ -11,7 +11,6 @@ use crate::proto::auth::ntlm::{
     NtlmTargetInfo, UserCreds,
 };
 #[cfg(feature = "krb5")]
-use crate::proto::auth::spnego::OID_KRB5;
 use crate::proto::auth::spnego::{
     NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
 };

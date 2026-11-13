@@ -17,10 +17,18 @@ pub(crate) const LSARPC_PIPE: &str = "lsarpc";
 /// The pipe it opens second, to create its machine account: SAM.
 pub(crate) const SAMR_PIPE: &str = "samr";
 
+/// The pipe `drsuapi` is reached by when a client picks `ncacn_np` instead of `ncacn_ip_tcp`.
+///
+/// A Windows join's tower asks for `ncacn_ip_tcp`, but the same interface is served over a named
+/// pipe by every DC, and a client that cannot reach the port falls back to it. Serving the interface
+/// here costs one name and makes the implementation testable without a TCP listener.
+pub(crate) const DRSUAPI_PIPE: &str = "drsuapi";
+
 /// The pipe a member opens once its account exists, to prove it holds the machine password and then
 /// read the domain's description of itself: netlogon.
 pub(crate) const NETLOGON_PIPE: &str = "netlogon";
 
+pub(crate) mod drsuapi;
 pub(crate) mod lsarpc;
 pub(crate) mod netlogon;
 pub(crate) mod samr;

@@ -67,6 +67,19 @@ pub(crate) const SRVSVC: SyntaxId = SyntaxId {
     version: 3,
 };
 
+/// drsuapi 4.0, e3514235-4b06-11d1-ab04-00c04fc2dcd2 (MS-DRSR 2.1).
+///
+/// The interface `NetpGetComputerObjectDn` binds to over `ncacn_ip_tcp` after the endpoint mapper
+/// names a port for it: a Windows join asks for it in a tower whose first floor is this UUID at
+/// version 4.0, measured on the stand.
+pub(crate) const DRSUAPI: SyntaxId = SyntaxId {
+    uuid: [
+        0x35, 0x42, 0x51, 0xe3, 0x06, 0x4b, 0xd1, 0x11, 0xab, 0x04, 0x00, 0xc0, 0x4f, 0xc2, 0xdc,
+        0xd2,
+    ],
+    version: 4,
+};
+
 /// lsarpc 0.0, 12345778-1234-abcd-ef00-0123456789ab (MS-LSAD 2.1).
 ///
 /// The interface a Samba member's join asks for first: `net ads join` opens it, then
