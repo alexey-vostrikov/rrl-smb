@@ -32,7 +32,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use super::pdu::{self, Body, ContextResult, Pdu, SyntaxId};
+use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
+use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
+use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
+
+/// What this endpoint needs in order to answer a client's SPNEGO exchange.
+///
+/// The names are the ones a client compares against its own configuration: `nb_domain` is what it
+/// calls the domain, and `dns_domain` is what it was told to join. Answering with this server's own
+/// name instead is how a join stops at "workgroup set to X, should be Y" with everything else right.
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    /// Where to listen.
+    pub addr: SocketAddr,
+    /// The domain's NetBIOS name.
+    pub nb_domain: String,
+    /// The domain's DNS name.
+    pub dns_domain: String,
+    /// This computer's NetBIOS name.
+    pub nb_computer: String,
+    /// This computer's DNS name.
+    pub dns_computer: String,
+}
 
 /// The largest fragment this server will send, in octets.
 ///
@@ -49,13 +70,121 @@ const REASON_NOT_SPECIFIED: u16 = 1;
 /// `abstract_syntax_not_supported`, for a known interface with an unusable transfer syntax.
 const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u16 = 3;
 
+/// The SPNEGO exchange over this endpoint, as far as NTLM inside it goes.
+///
+/// A join's `alter_context` carries `auth_type` 9 (`RPC_C_AUTHN_GSS_NEGOTIATE`) with a SPNEGO
+/// `NegTokenInit` at level 6, measured on the stand. RFC 4178 §4.2 puts the mechanism's own tokens
+/// inside the negotiation: the init's `mechToken` is an NTLMSSP NEGOTIATE, the answer is an NTLMSSP
+/// CHALLENGE inside a `NegTokenResp` with `negState` `accept-incomplete`, and the client's third leg
+/// arrives in an `auth3` PDU with no answer expected.
+///
+/// NTLM rather than Kerberos on purpose: the sealing that level 6 requires is already implemented for
+/// NTLM in `proto::auth::ntlm`, and a client accepts whichever mechanism the `NegTokenResp` names.
+fn spnego_answer(
+    parsed: &Pdu<'_>,
+    endpoint: &Endpoint,
+    acceptor: &mut Option<NtlmServer>,
+) -> Option<Vec<u8>> {
+    let auth = parsed.auth.as_ref()?;
+    if auth.auth_type != pdu::AuthVerifier::TYPE_GSS_NEGOTIATE {
+        debug!(
+            auth_type = auth.auth_type,
+            "rpc: authentication this endpoint cannot answer"
+        );
+        return None;
+    }
+    let token = auth.token;
+    // `[APPLICATION 0]` opens a `NegTokenInit`; `[1]` opens a `NegTokenResp`, which is how the
+    // client brings the AUTHENTICATE back.
+    match token.first() {
+        Some(0x60) => {
+            let init = match spnego::decode_init_token(token) {
+                Ok(init) => init,
+                Err(err) => {
+                    warn!(%err, "rpc: SPNEGO init did not parse");
+                    return None;
+                }
+            };
+            if !init.mech_types.iter().any(|mech| mech == OID_NTLMSSP) {
+                warn!(
+                    mechs = init.mech_types.len(),
+                    "rpc: SPNEGO init offers no NTLMSSP, and Kerberos is not implemented here"
+                );
+                return None;
+            }
+            let inner = match init.mech_token {
+                Some(inner) => inner,
+                None => {
+                    warn!("rpc: SPNEGO init offered NTLMSSP without a token");
+                    return None;
+                }
+            };
+            let mut challenge = [0_u8; 8];
+            if let Err(err) = crate::utils::fill_random(&mut challenge) {
+                // An NTLM challenge that is not random is an NTLM challenge that repeats: the
+                // exchange must not continue with one.
+                warn!(%err, "rpc: the OS random source failed; no challenge");
+                return None;
+            }
+            let mut server = NtlmServer::new(
+                challenge,
+                NtlmTargetInfo::new(
+                    endpoint.nb_domain.clone(),
+                    endpoint.nb_domain.clone(),
+                    endpoint.nb_computer.clone(),
+                    endpoint.dns_domain.clone(),
+                    endpoint.dns_computer.clone(),
+                ),
+                crate::utils::now_filetime(),
+            );
+            if let Err(err) = server.step1_negotiate(&inner) {
+                warn!(%err, "rpc: the client's NEGOTIATE did not parse");
+                return None;
+            }
+            let blob = server.challenge();
+            *acceptor = Some(server);
+            info!(
+                challenge = blob.len(),
+                "rpc: answering SPNEGO with an NTLMSSP challenge"
+            );
+            Some(spnego::encode_resp_token(
+                NegState::AcceptIncomplete,
+                Some(OID_NTLMSSP),
+                Some(&blob),
+                None,
+            ))
+        }
+        Some(0xa1) => {
+            let resp = match spnego::decode_resp_token(token) {
+                Ok(resp) => resp,
+                Err(err) => {
+                    warn!(%err, "rpc: SPNEGO response did not parse");
+                    return None;
+                }
+            };
+            // The third leg: the AUTHENTICATE the client signs its calls with. Verifying it needs
+            // the account's hash, which is the next step; until then the fact that it arrived is
+            // what the log can honestly say, and no answer is due for it.
+            info!(
+                token = resp.response_token.as_ref().map_or(0, Vec::len),
+                "rpc: client sent its AUTHENTICATE; verification is not implemented yet"
+            );
+            None
+        }
+        other => {
+            debug!(first = ?other, "rpc: authentication token of an unknown shape");
+            None
+        }
+    }
+}
+
 /// Binds `addr` and serves every connection until the process ends.
 ///
 /// Binding is not retried and not softened: a port this process cannot have is a configuration
 /// fault, and a server that starts anyway is one that a client cannot reach while the log says it is
 /// running.
-pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
+    let listener = TcpListener::bind(endpoint.addr).await?;
     let local = listener.local_addr()?;
     info!(%local, "rpc: serving drsuapi over ncacn_ip_tcp");
 
@@ -70,9 +199,10 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
             }
         };
         let port = local.port();
+        let endpoint = endpoint.clone();
         tokio::spawn(async move {
             debug!(%peer, "rpc: connection opened");
-            if let Err(err) = connection(stream, port).await {
+            if let Err(err) = connection(stream, port, &endpoint).await {
                 debug!(%peer, %err, "rpc: connection ended");
             }
         });
@@ -80,10 +210,12 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
 }
 
 /// Serves one connection until the client closes it.
-async fn connection(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
+async fn connection(mut stream: TcpStream, port: u16, endpoint: &Endpoint) -> std::io::Result<()> {
     let mut inbox: Vec<u8> = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut contexts: Vec<(u16, SyntaxId)> = Vec::new();
+    // One exchange per connection: the client authenticates the association it is about to call on.
+    let mut acceptor: Option<NtlmServer> = None;
 
     loop {
         let read = stream.read(&mut buffer).await?;
@@ -107,7 +239,7 @@ async fn connection(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
                 debug!(len = raw.len(), "rpc: unparseable PDU dropped");
                 continue;
             };
-            for reply in answer(&parsed, &mut contexts, port) {
+            for reply in answer(&parsed, &mut contexts, port, endpoint, &mut acceptor) {
                 stream.write_all(&reply).await?;
             }
         }
@@ -118,7 +250,15 @@ async fn connection(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
 ///
 /// Split out from [`connection`] so it can be tested without a socket: the interesting decisions are
 /// which contexts are taken and what a call is answered with, and neither needs a peer.
-fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> Vec<Vec<u8>> {
+fn answer(
+    parsed: &Pdu<'_>,
+    contexts: &mut Vec<(u16, SyntaxId)>,
+    port: u16,
+    endpoint: &Endpoint,
+    acceptor: &mut Option<NtlmServer>,
+) -> Vec<Vec<u8>> {
+    // Computed once here, because both bind-shaped answers carry it and a call does not.
+    let token = spnego_answer(parsed, endpoint, acceptor);
     match &parsed.body {
         Body::Bind(bind) => {
             // C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff
@@ -136,7 +276,21 @@ fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> V
                 bind.assoc_group_id,
                 &port.to_string(),
                 &results(bind, contexts),
-                None,
+                token
+                    .as_deref()
+                    .map(|token| AuthReply {
+                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
+                        auth_level: parsed.auth.as_ref().map_or(6, |auth| auth.auth_level),
+                        // This PDU adds no padding: the token follows the result list directly, and a
+                        // non-zero count here would tell the client to skip octets that are not there.
+                        auth_pad_length: 0,
+                        auth_context_id: parsed
+                            .auth
+                            .as_ref()
+                            .map_or(0, |auth| auth.auth_context_id),
+                        token,
+                    })
+                    .as_ref(),
             )]
         }
 
@@ -164,7 +318,19 @@ fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> V
                 0,
                 "",
                 &results(bind, contexts),
-                None,
+                token
+                    .as_deref()
+                    .map(|token| AuthReply {
+                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
+                        auth_level: parsed.auth.as_ref().map_or(6, |auth| auth.auth_level),
+                        auth_pad_length: 0,
+                        auth_context_id: parsed
+                            .auth
+                            .as_ref()
+                            .map_or(0, |auth| auth.auth_context_id),
+                        token,
+                    })
+                    .as_ref(),
             )]
         }
 
@@ -321,12 +487,99 @@ mod tests {
         out
     }
 
+    /// An endpoint, so the tests do not depend on the stand's names.
+    fn endpoint() -> Endpoint {
+        Endpoint {
+            addr: "127.0.0.1:0".parse().expect("a literal address"),
+            nb_domain: "AD".to_string(),
+            dns_domain: "ad.example.com".to_string(),
+            nb_computer: "SAMBA".to_string(),
+            dns_computer: "samba.ad.example.com".to_string(),
+        }
+    }
+
+    /// DER helpers, so a test builds the token a client builds rather than a byte soup.
+    fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 0x80 {
+            out.push(u8::try_from(body.len()).expect("short"));
+        } else {
+            out.push(0x81);
+            out.push(u8::try_from(body.len()).expect("under 256"));
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A `NegTokenInit` offering NTLMSSP, with a NEGOTIATE inside - what a Windows join sends in its
+    /// `alter_context` (measured: `auth_type` 9, level 6, token opening `60 82 ...`).
+    fn spnego_init() -> Vec<u8> {
+        let mut negotiate = b"NTLMSSP\x00".to_vec();
+        negotiate.extend_from_slice(&1u32.to_le_bytes());
+        negotiate.extend_from_slice(&0xe2_08_82_15_u32.to_le_bytes());
+        negotiate.extend_from_slice(&[0; 16]); // the two empty name fields
+        let mech_types = der(0x30, &der(0x06, OID_NTLMSSP));
+        let mut body = der(0xa0, &mech_types);
+        body.extend_from_slice(&der(0xa2, &der(0x04, &negotiate)));
+        let init = der(0x30, &body);
+        let mut gss = der(0x06, spnego::OID_SPNEGO);
+        gss.extend_from_slice(&der(0xa0, &init));
+        der(0x60, &gss)
+    }
+
+    /// An `alter_context` carrying `token` as an SPNEGO verifier at level 6.
+    fn alter_context_with(token: &[u8]) -> Vec<u8> {
+        let mut raw = bind_pdu(&[context(2, pdu::DRSUAPI, pdu::NDR)]);
+        raw[2] = pdu::PTYPE_ALTER_CONTEXT;
+        let mut body = raw[16..].to_vec();
+        // The verifier: `sec_trailer` (auth_type 9, level 6, no padding, context 2) then the token.
+        body.extend_from_slice(&[9, 6, 0, 0]);
+        body.extend_from_slice(&2u32.to_le_bytes());
+        body.extend_from_slice(token);
+        let frag = u16::try_from(16 + body.len()).expect("a small PDU");
+        let mut out = header(pdu::PTYPE_ALTER_CONTEXT, 3, frag);
+        out[10..12].copy_from_slice(
+            &u16::try_from(token.len())
+                .expect("a short token")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn a_spnego_init_gets_an_ntlmssp_challenge_inside_a_response_token() {
+        let raw = alter_context_with(&spnego_init());
+        let parsed = pdu::parse(&raw).expect("an alter_context with a verifier");
+        let mut contexts = Vec::new();
+        let mut acceptor = None;
+        let answer = &answer(&parsed, &mut contexts, 49152, &endpoint(), &mut acceptor)[0];
+
+        assert!(acceptor.is_some(), "an NTLM exchange was started");
+        // `auth_length` counts the token only, not the eight-octet `sec_trailer` before it.
+        let auth_len = usize::from(u16::from_le_bytes([answer[10], answer[11]]));
+        assert!(auth_len > 0, "the answer carries a token");
+        let token = &answer[answer.len() - auth_len..];
+        assert_eq!(token[0], 0xa1, "a `NegTokenResp` context tag");
+        let text = String::from_utf8_lossy(token);
+        assert!(
+            token.windows(8).any(|w| w == b"NTLMSSP\x00"),
+            "the challenge is inside: {text:?}"
+        );
+    }
+
     #[test]
     fn a_bind_for_drsuapi_over_ndr_is_accepted() {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
-        let replies = answer(&parsed, &mut contexts, 49152);
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        );
         assert_eq!(replies.len(), 1);
         assert_eq!(contexts, vec![(0, pdu::DRSUAPI)]);
 
@@ -351,7 +604,13 @@ mod tests {
         let raw = bind_pdu(&[context(0, pdu::SRVSVC, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
-        let replies = answer(&parsed, &mut contexts, 49152);
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        );
         assert!(contexts.is_empty(), "nothing was taken");
         let ack = &replies[0];
         let results_at = ack.len() - 24;
@@ -366,13 +625,25 @@ mod tests {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
-        answer(&parsed, &mut contexts, 49152);
+        answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        );
 
         // `IDL_DRSBind` takes two pointers, both absent: a client with no DSA GUID yet.
         let stub = [0_u8; 8];
         let call = request_pdu(0, &stub);
         let parsed = pdu::parse(&call).expect("a request");
-        let replies = answer(&parsed, &mut contexts, 49152);
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        );
         assert_eq!(replies.len(), 1);
         let reply = &replies[0];
         assert_eq!(reply[2], pdu::PTYPE_RESPONSE, "a handler answered");
@@ -392,7 +663,13 @@ mod tests {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
-        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        let ack = &answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        )[0];
         assert_eq!(u16::from_le_bytes([ack[10], ack[11]]), 0, "no auth_length");
         // frag_length is the whole PDU, so nothing trails the result list.
         let frag = usize::from(u16::from_le_bytes([ack[8], ack[9]]));
@@ -414,7 +691,13 @@ mod tests {
         raw[20..24].copy_from_slice(&7u32.to_le_bytes());
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
-        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        let ack = &answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        )[0];
         let echoed = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
         assert_eq!(echoed, 7);
     }
@@ -426,7 +709,13 @@ mod tests {
         raw[2] = pdu::PTYPE_ALTER_CONTEXT;
         let parsed = pdu::parse(&raw).expect("an alter_context");
         let mut contexts = Vec::new();
-        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        let ack = &answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        )[0];
         assert_eq!(ack[2], pdu::PTYPE_ALTER_CONTEXT_RESP);
         assert_eq!(
             u16::from_le_bytes([ack[24], ack[25]]),
@@ -442,7 +731,13 @@ mod tests {
         let mut contexts = Vec::new();
         let call = request_pdu(0, &[0_u8; 8]);
         let parsed = pdu::parse(&call).expect("a request");
-        let replies = answer(&parsed, &mut contexts, 49152);
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            &mut Option::<NtlmServer>::None,
+        );
         assert_eq!(replies[0][2], pdu::PTYPE_FAULT);
     }
 }
