@@ -167,7 +167,8 @@ pub async fn handle(
         // is either good now or never.
         #[cfg(feature = "krb5")]
         Token::Init(init)
-            if server.kerberos.is_some() && init.mech_types.iter().any(|mech| mech == OID_KRB5) =>
+            if server.kerberos.is_some()
+                && crate::proto::auth::spnego::offered_kerberos(&init.mech_types).is_some() =>
         {
             return accept_kerberos(server, conn, &req, sid, &init).await;
         }
@@ -292,13 +293,17 @@ async fn accept_kerberos(
     // STATUS_SUCCESS in one round is finished; one that is answered `accept-incomplete` must send a
     // closing round, and a client that does not is left with a context it never completes.
     let two_rounds = std::env::var_os("RRL_SMB_KRB_TWOROUND").is_some();
+    // The mechanism the client listed first, which is the one it built its token for. Answering with a
+    // different one - `1.2.840.113554.1.2.2` when it asked for `1.2.840.48018.1.2.2` - is what an SMB
+    // client reports as `SEC_E_INVALID_TOKEN`, having no field to say which mechanism it disliked.
+    let selected_mech = crate::proto::auth::spnego::offered_kerberos(&init.mech_types);
     let response_token = encode_resp_token(
         if two_rounds {
             NegState::AcceptIncomplete
         } else {
             NegState::AcceptCompleted
         },
-        Some(OID_KRB5),
+        selected_mech,
         identity.ap_rep.as_deref().map(mechanism_token),
         None,
     );

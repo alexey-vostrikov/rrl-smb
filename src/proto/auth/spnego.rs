@@ -61,6 +61,31 @@ pub const OID_SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 /// `2a 86 48 86 f7 12 01 02 02`: 1.2 -> 0x2a, 840 -> 86 48, 113554 -> 86 f7 12, then 1, 2, 2.
 pub const OID_KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
 
+/// `1.2.840.48018.1.2.2`, Microsoft's own Kerberos OID.
+///
+/// The same mechanism as [`OID_KRB5`] to this server - one acceptor keytab answers both - but a Windows
+/// client lists **this one first** and offers `1.2.840.113554.1.2.2` second. Per RFC 4178 the target
+/// selects the initiator's first choice that it supports, and names it in `supportedMech`; answering with
+/// a mechanism the client did not choose is what an SMB client reports as `SEC_E_INVALID_TOKEN`
+/// (0x80090308) with no further detail.
+pub const OID_KRB5_MS: &[u8] = &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02];
+
+/// The Kerberos OID a client offered, preferring the one it listed first.
+///
+/// Both spell the same mechanism here, so the choice is the client's: it is the one whose token it built,
+/// and RFC 4178 §4.2.2 has the target name its selection in `supportedMech`.
+pub fn offered_kerberos(mech_types: &[Vec<u8>]) -> Option<&'static [u8]> {
+    for mech in mech_types {
+        if mech.as_slice() == OID_KRB5_MS {
+            return Some(OID_KRB5_MS);
+        }
+        if mech.as_slice() == OID_KRB5 {
+            return Some(OID_KRB5);
+        }
+    }
+    None
+}
+
 /// NTLMSSP `1.3.6.1.4.1.311.2.2.10` encoded as OID *content*.
 pub const OID_NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
