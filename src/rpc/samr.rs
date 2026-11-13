@@ -49,7 +49,56 @@ const STATUS_SOME_NOT_MAPPED: u32 = 0x0000_0107;
 pub(crate) const OPNUM_CONNECT: u16 = 0;
 /// `samr_Close` (opnum 1).
 pub(crate) const OPNUM_CLOSE: u16 = 1;
+/// `samr_EnumerateDomainsInSamServer` (opnum 0x06): the domains this server holds.
+///
+/// A member asks this before it looks one up by name, and a server that faults sends it to the next
+/// controller. There is exactly one domain here, so the enumeration is one entry and the second call
+/// - the one that asks for more - is an empty page, which is how a client learns it has them all.
+///
+/// `SAMPR_ENUMERATION_BUFFER` is `{ EntriesRead ULONG, Buffer PSAMPR_RID_ENUMERATION_ARRAY }`; the
+/// array's element is `{ RelativeId ULONG, Name RPC_UNICODE_STRING }`. A domain has no RID of its
+/// own, so `RelativeId` is zero and the name is the NetBIOS name a client matches its configuration
+/// against.
+fn enumerate_domains(config: &crate::server::ServerConfig) -> Result<Vec<u8>, Fault> {
+    let name = config
+        .domain_netbios
+        .clone()
+        .or_else(|| config.dns_domain.clone())
+        .unwrap_or_else(|| config.netbios_name.clone());
+
+    let mut writer = NdrWriter::new();
+    writer.u32(0); // EnumerationContext: this enumeration has one page
+    // `[out,ref] SAMPR_ENUMERATION_BUFFER *Buffer`: a real pointer, referent and value.
+    writer.pointer(true);
+    writer.u32(1); // EntriesRead
+    // The array behind the pointer: the maximum it could hold, the offset, and how many are there.
+    writer.pointer(true);
+    writer.u32(1);
+    writer.u32(0);
+    writer.u32(1);
+    writer.u32(0); // RelativeId: a domain is not an account and has none
+    // The name as an `RPC_UNICODE_STRING`: length and size in octets, then the pointer, then the
+    // characters in the deferred section - the shape `lookup_names` reads back off a live stub.
+    let octets = u16::try_from(name.encode_utf16().count() * 2).expect("a short domain name");
+    writer.u16(octets);
+    writer.u16(octets);
+    writer.pointer(true);
+    // No terminator: this is a counted string, and a client reads exactly `length` octets.
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let count = u32::try_from(units.len()).expect("a short domain name");
+    writer.u32(count);
+    writer.u32(0);
+    writer.u32(count);
+    for unit in units {
+        writer.raw(&unit.to_le_bytes());
+    }
+    writer.u32(1); // CountReturned
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
+}
+
 /// `samr_LookupDomain` (opnum 5): the SID of a domain, by name.
+pub(crate) const OPNUM_ENUMERATE_DOMAINS: u16 = 6;
 pub(crate) const OPNUM_LOOKUP_DOMAIN: u16 = 5;
 /// `samr_LookupNames` (0x11): a name to a RID and a name type. What a join calls on the machine
 /// account it has just created, before it can set that account's password.
@@ -88,6 +137,7 @@ pub(crate) fn dispatch(
         OPNUM_CONNECT5 => connect5(stub),
         OPNUM_CLOSE => close_handle(stub),
         OPNUM_OPEN_DOMAIN => open_domain(stub),
+        OPNUM_ENUMERATE_DOMAINS => enumerate_domains(config),
         OPNUM_LOOKUP_DOMAIN => lookup_domain(config, stub),
         OPNUM_LOOKUP_NAMES => lookup_names(config, stub),
         OPNUM_CREATE_USER2 => create_user2(stub),
@@ -497,6 +547,57 @@ mod tests {
         assert_eq!(body.len(), 20 + 4);
         assert_eq!(&body[..20], &samr_handle());
         assert_eq!(&body[20..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn enumerate_domains_answers_one_domain_named_as_the_configuration_says() {
+        // The call a member makes before it looks a domain up by name. A fault here sends it to the
+        // next controller, so the answer has to be well formed even when there is nothing to say.
+        let stub = samr_handle(); // the server handle, and nothing else
+        let body = dispatch(&config(), OPNUM_ENUMERATE_DOMAINS, &stub).expect("answered");
+
+        let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+        #[allow(clippy::cast_possible_truncation)]
+        let short = |at: usize| u16::from_le_bytes(body[at..at + 2].try_into().unwrap());
+
+        // Offsets, in the order the IDL marshals them - the whole point of the test:
+        //
+        //    0  EnumerationContext        24  array actual_count
+        //    4  buffer pointer            28  entry RelativeId
+        //    8  EntriesRead               32  name length (octets)
+        //   12  array pointer             34  name size   (octets)
+        //   16  array max_count           36  name pointer
+        //   20  array offset              40  chars max_count
+        //                                  44  chars offset
+        //                                  48  chars actual_count
+        //                                  52  the units
+        //                                  56  CountReturned
+        //                                  60  status
+        assert_eq!(body.len(), 64);
+        assert_eq!(word(0), 0, "EnumerationContext");
+        assert_ne!(word(4), 0, "the enumeration buffer is a real pointer");
+        assert_eq!(word(8), 1, "EntriesRead");
+        assert_ne!(word(12), 0, "the array is behind its own pointer");
+        assert_eq!(word(16), 1, "the array could hold one");
+        assert_eq!(word(20), 0, "no offset: the whole array is here");
+        assert_eq!(word(24), 1, "and exactly one entry is");
+        assert_eq!(word(28), 0, "a domain has no RelativeId");
+        assert_eq!(short(32), 4, "\"AD\" is two units, counted in octets");
+        assert_eq!(short(34), 4);
+        assert_ne!(word(36), 0, "the characters are deferred, behind a pointer");
+        assert_eq!(word(40), 2);
+        assert_eq!(word(44), 0);
+        assert_eq!(word(48), 2);
+        let text: String = (0..2)
+            .map(|index| char::from_u32(u32::from(short(52 + index * 2))).expect("a unit"))
+            .collect();
+        assert_eq!(
+            text, "AD",
+            "the NetBIOS name a client matches its configuration against"
+        );
+        assert_eq!(word(56), 1, "CountReturned");
+        let status = body.len() - 4;
+        assert_eq!(word(status), NTSTATUS_SUCCESS);
     }
 
     #[test]
