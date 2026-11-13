@@ -12,12 +12,9 @@ use smb_server::wire::header::Command;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 use tokio::net::TcpStream;
 
-// RFC 4178 §4.2.1. These two were the other way round, which is how the server came to say
-// "accept-completed" while it was still waiting for a Kerberos AP-REP: a Windows client reads that
-// as a contradiction, abandons the session, and the redirector blames the share with
-// ERROR_INVALID_PARAMETER.
-const ACCEPT_INCOMPLETE: u8 = 0;
-const ACCEPT_COMPLETED: u8 = 1;
+// RFC 4178 §4.2.2: accept-completed is 0 and accept-incomplete is 1.
+const ACCEPT_COMPLETED: u8 = 0;
+const ACCEPT_INCOMPLETE: u8 = 1;
 const REQUEST_MIC: u8 = 3;
 
 async fn server() -> (TcpStream, tokio::task::JoinHandle<()>, tempfile::TempDir) {
