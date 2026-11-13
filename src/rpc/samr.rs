@@ -308,19 +308,19 @@ fn connect5(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     // and what a client can read without guessing.
     let _ = level;
 
+    // MS-SAMR 3.1.5.6.5 lists the out parameters as `OutVersion`, `OutRevisionInfo`,
+    // `ServerHandle`, `ErrorCode` - in that order, and none of the first two is a pointer:
+    // `SAMPR_REVISION_INFO` is a union whose switch is a **ULONG** (4.2.3.16), and the only arm is
+    // V1 { Revision ULONG, SupportedFeatures ULONG }.
+    //
+    // A response that sends them as pointers - which is what this did - is a stub the client cannot
+    // unmarshal: `NetpProvisionComputerAccount` reports `0x6f7 RPC_X_BAD_STUB_DATA`, and the join
+    // stops at the first RPC call it makes after LDAP.
     let mut writer = NdrWriter::new();
-    // `[out,ref] uint32 *level_out`: a real pointer, referent and value.
-    writer.pointer(true);
-    writer.u32(1);
-    // `[out,ref] samr_ConnectInfo *info_out`: a pointer to the union, then its discriminant.
-    writer.pointer(true);
-    writer.u16(1);
-    writer.align(4);
-    // `samr_ConnectInfo1`: the version this server speaks, and no optional features.
-    writer.u32(SAMR_CONNECT_AFTER_W2K);
-    // `samr_SupportedFeatures` is a bitmap64.
-    writer.raw(&0u64.to_le_bytes());
-    // The handle last, inline, as [`handle_response`] records.
+    writer.u32(1); // OutVersion
+    writer.u32(1); // SAMPR_REVISION_INFO tag: case 1
+    writer.u32(SAMR_CONNECT_AFTER_W2K); // Revision
+    writer.u32(0); // SupportedFeatures: nothing claimed
     writer.bytes(&samr_handle());
     writer.u32(NTSTATUS_SUCCESS);
     Ok(writer.finish())
@@ -509,24 +509,23 @@ mod tests {
 
         let body = dispatch(&config(), OPNUM_CONNECT5, &stub).expect("answered");
 
-        // The level and its information first, then the handle inline, then the status: the order
-        // the IDL lists the out parameters in (MS-SAMR 3.1.5.2.5).
-        assert_eq!(&body[..4], &[0, 0, 2, 0], "level_out referent");
-        assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 1);
+        // OutVersion, the union's ULONG tag, the arm, the handle inline, the status. Nothing here is
+        // a pointer, and a client that reads `OutVersion` as one rejects the whole stub - which is
+        // how this failure was found: `0x6f7 RPC_X_BAD_STUB_DATA` on the first RPC call of a join.
+        assert_eq!(body.len(), 40, "4 + 4 + 4 + 4 + 20 + 4");
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 1);
         assert_eq!(
-            &body[8..12],
-            &[4, 0, 2, 0],
-            "info_out referent, the next id"
+            u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            1,
+            "case 1"
         );
-        assert_eq!(u16::from_le_bytes(body[12..14].try_into().unwrap()), 1);
-        // The arm: the version (u32) and the 64-bit feature bitmap.
         assert_eq!(
-            u32::from_le_bytes(body[16..20].try_into().unwrap()),
+            u32::from_le_bytes(body[8..12].try_into().unwrap()),
             SAMR_CONNECT_AFTER_W2K
         );
-        assert_eq!(&body[20..28], &[0u8; 8], "no optional features claimed");
-        assert_eq!(&body[28..48], &samr_handle(), "the handle, inline");
-        assert_eq!(&body[48..], &[0, 0, 0, 0]);
+        assert_eq!(u32::from_le_bytes(body[12..16].try_into().unwrap()), 0);
+        assert_eq!(&body[16..36], &samr_handle(), "the handle, inline");
+        assert_eq!(&body[36..], &[0, 0, 0, 0]);
     }
 
     #[test]
