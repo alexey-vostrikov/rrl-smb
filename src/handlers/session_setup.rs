@@ -117,6 +117,12 @@ pub async fn handle(
             sid = hdr.session_id,
             "session setup blob"
         );
+        // The whole blob, when a client refuses what we answer: the mechToken is only part of it, and
+        // the fields beside it - `negHints`, `mechListMIC` - decide whether the reply owes a MIC.
+        if std::env::var_os("RRL_SMB_HEX").is_some() {
+            let full: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("smb-hex: blob={full}");
+        }
     }
 
     let sid = hdr.session_id;
