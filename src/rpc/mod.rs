@@ -34,6 +34,9 @@ pub(crate) mod netlogon;
 pub(crate) mod samr;
 pub(crate) mod schannel;
 
+/// `drsuapi` over `ncacn_ip_tcp`, the endpoint a join asks the mapper for.
+pub mod tcp;
+
 /// Source of association group ids for binds that ask for a new group.
 static NEXT_ASSOC_GROUP: AtomicU32 = AtomicU32::new(1);
 
