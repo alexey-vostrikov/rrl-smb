@@ -107,6 +107,8 @@ pub(crate) const OPNUM_LOOKUP_NAMES: u16 = 17;
 pub(crate) const OPNUM_OPEN_DOMAIN: u16 = 7;
 /// `samr_CreateUser2` (opnum 50): where the machine account would be created.
 pub(crate) const OPNUM_CREATE_USER2: u16 = 50;
+/// `samr_SetInformationUser2` (opnum 58): what a join calls last, to set the flags and the name.
+pub(crate) const OPNUM_SET_INFO_USER2: u16 = 58;
 /// `samr_Connect2` (opnum 57): what a Samba member actually calls.
 pub(crate) const OPNUM_CONNECT2: u16 = 57;
 /// `samr_Connect5` (opnum 64).
@@ -141,6 +143,7 @@ pub(crate) fn dispatch(
         OPNUM_LOOKUP_DOMAIN => lookup_domain(config, stub),
         OPNUM_LOOKUP_NAMES => lookup_names(config, stub),
         OPNUM_CREATE_USER2 => create_user2(stub),
+        OPNUM_SET_INFO_USER2 => set_information_user2(stub),
         other => {
             // The number goes to the log: a client reports only "the procedure number is out of
             // range", and which number is the difference between a missing feature and a typo.
@@ -495,6 +498,71 @@ fn create_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     Ok(writer.finish())
 }
 
+/// `samr_SetInformationUser2`: read, named, and refused - the write belongs to the directory.
+///
+/// MS-SAMR 3.1.5.6.34 sends a user handle, a `USER_INFORMATION_CLASS` and a union whose arm the
+/// class selects. This crate holds no store, so the honest answer is `NOT_SUPPORTED`; what makes the
+/// answer useful is naming the class, because "the client asked for something" and "the client asked
+/// for `UserAccountInformation`" are different pieces of work for whoever implements the hook.
+///
+/// The enum travels as a half word, like `secure_channel_type` in the Netlogon interface (measured
+/// there: `0200`); the union's discriminant on the wire is the same value.
+fn set_information_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(_handle) = reader.bytes(20) else {
+        return Err(malformed_at("user_handle", stub));
+    };
+    // Both widths are read: a producer that declares the enum `v1_enum` sends four octets, and
+    // reading the wrong width would name the class from half a number and the first two octets of
+    // the union.
+    let narrow = reader.u16();
+    let wide = {
+        let mut again = NdrReader::new(stub);
+        let _ = again.bytes(20);
+        again.u32()
+    };
+    let class = narrow.map(u32::from).or(wide).unwrap_or(u32::MAX);
+
+    tracing::warn!(
+        class,
+        name = info_class_name(class),
+        stub = stub.len(),
+        "samr: SetInformationUser2 is a directory write, and this server has no directory to write \
+         it to. The class is named so the missing hook is a known piece of work rather than a \
+         number in a log."
+    );
+
+    // The reply to this call has no out parameters beyond the status.
+    let mut writer = NdrWriter::new();
+    writer.u32(NTSTATUS_NOT_SUPPORTED);
+    Ok(writer.finish())
+}
+
+/// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.5.20).
+fn info_class_name(class: u32) -> &'static str {
+    match class {
+        0 => "UserGeneralInformation",
+        1 => "UserPreferencesInformation",
+        2 => "UserLogonInformation",
+        3 => "UserLogonHoursInformation",
+        4 => "UserAccountInformation",
+        5 => "UserNameInformation",
+        6 => "UserAccountNameInformation",
+        7 => "UserFullNameInformation",
+        8 => "UserPrimaryGroupInformation",
+        9 => "UserHomeInformation",
+        10 => "UserScriptInformation",
+        11 => "UserProfileInformation",
+        12 => "UserAdminCommentInformation",
+        13 => "UserWorkStationsInformation",
+        14 => "UserControlInformation",
+        15 => "UserExpiresInformation",
+        16 => "UserParametersInformation",
+        17 => "UserAllInformation",
+        _ => "unknown",
+    }
+}
+
 /// `dom_sid2`: a conformant array of sub-authorities behind the SID's own header.
 ///
 /// Not the flat octets a directory stores: `[size_is(num_auths)] uint32 sub_auths[]` puts its
@@ -614,6 +682,35 @@ mod tests {
         assert_eq!(word(56), 1, "CountReturned");
         let status = body.len() - 4;
         assert_eq!(word(status), NTSTATUS_SUCCESS);
+    }
+
+    #[test]
+    fn set_information_user2_names_the_class_and_refuses() {
+        // The call a join makes last. This crate has no store, so the answer is `NOT_SUPPORTED` - and
+        // the class has to be read correctly anyway, because the log line is the only thing that says
+        // which write is missing. Reading the enum as a word instead of a half word would name the
+        // class from half a number and the first two octets of the union.
+        let mut writer = NdrWriter::new();
+        writer.bytes(&samr_handle());
+        writer.u16(4); // UserAccountInformation
+        writer.raw(&[0u8; 32]); // the union's arm, unread
+        let stub = writer.finish();
+
+        let body = dispatch(&config(), OPNUM_SET_INFO_USER2, &stub).expect("answered");
+        assert_eq!(body.len(), 4, "only a status comes back");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn every_information_class_has_a_name() {
+        // A number in a log is a chore; the name is a piece of work with a scope.
+        assert_eq!(info_class_name(4), "UserAccountInformation");
+        assert_eq!(info_class_name(14), "UserControlInformation");
+        assert_eq!(info_class_name(17), "UserAllInformation");
+        assert_eq!(info_class_name(9999), "unknown");
     }
 
     #[test]
