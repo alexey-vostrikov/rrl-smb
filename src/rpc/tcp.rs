@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
+use super::pdu::{self, Body, ContextResult, Pdu, SyntaxId};
 
 /// The largest fragment this server will send, in octets.
 ///
@@ -121,24 +121,22 @@ async fn connection(mut stream: TcpStream, port: u16) -> std::io::Result<()> {
 fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> Vec<Vec<u8>> {
     match &parsed.body {
         Body::Bind(bind) => {
-            // Bound to a local before the call: an `AuthReply` borrowed from a temporary would have
-            // to outlive the statement the answer is built in.
-            let verifier = parsed.auth.as_ref().map(|auth| AuthReply {
-                auth_type: auth.auth_type,
-                auth_level: auth.auth_level,
-                auth_pad_length: auth.auth_pad_length,
-                auth_context_id: auth.auth_context_id,
-                // No token: this is the step that has to become a SPNEGO answer.
-                token: &[],
-            });
+            // C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff
+            // `auth_length != 0`**. Attaching a `sec_trailer` with an empty token therefore leaves
+            // eight octets a client cannot account for - it locates the trailer by counting back
+            // `auth_length`, and that is zero. This server has no token to send yet, so it sends no
+            // verifier at all, which is a different (and legal) statement from "an empty one".
             vec![pdu::bind_ack(
                 pdu::PTYPE_BIND_ACK,
                 parsed.header.call_id,
                 MAX_FRAG,
-                0,
+                // "may also contain a new association group identifier if one was requested by the
+                // client": echoing a requested zero is what "no group" means, and inventing an
+                // identifier would claim a grouping this server does not keep.
+                bind.assoc_group_id,
                 &port.to_string(),
                 &results(bind, contexts),
-                verifier.as_ref(),
+                None,
             )]
         }
 
@@ -155,13 +153,10 @@ fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> V
                     "rpc: alter_context with authentication"
                 );
             }
-            let verifier = parsed.auth.as_ref().map(|auth| AuthReply {
-                auth_type: auth.auth_type,
-                auth_level: auth.auth_level,
-                auth_pad_length: 0,
-                auth_context_id: auth.auth_context_id,
-                token: &[],
-            });
+            // C706 chap. 12, `rpcconn_alter_context_response_hdr_t`: same fields as `bind_ack`, and
+            // `sec_addr` is present but ignored - so an empty `port_any_t` (length 0) is the correct
+            // value, not a missing field. The verifier follows the same rule as in `bind_ack`: it is
+            // present only when `auth_length != 0`, and this server has no SPNEGO token to send yet.
             vec![pdu::bind_ack(
                 pdu::PTYPE_ALTER_CONTEXT_RESP,
                 parsed.header.call_id,
@@ -169,7 +164,7 @@ fn answer(parsed: &Pdu<'_>, contexts: &mut Vec<(u16, SyntaxId)>, port: u16) -> V
                 0,
                 "",
                 &results(bind, contexts),
-                verifier.as_ref(),
+                None,
             )]
         }
 
@@ -387,6 +382,59 @@ mod tests {
             "the answer carries extensions and a handle: {} octets",
             reply.len()
         );
+    }
+
+    #[test]
+    fn a_bind_ack_carries_no_verifier_when_it_has_no_token() {
+        // C706 chap. 12: the verifier is present iff `auth_length != 0`. Eight octets of
+        // `sec_trailer` with a zero `auth_length` are octets a client cannot place, so their
+        // absence is part of the format, not an omission.
+        let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
+        let parsed = pdu::parse(&raw).expect("a bind");
+        let mut contexts = Vec::new();
+        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        assert_eq!(u16::from_le_bytes([ack[10], ack[11]]), 0, "no auth_length");
+        // frag_length is the whole PDU, so nothing trails the result list.
+        let frag = usize::from(u16::from_le_bytes([ack[8], ack[9]]));
+        assert_eq!(frag, ack.len(), "the fragment is exactly what was sent");
+        // 16 header; `max_xmit_frag` 2, `max_recv_frag` 2, `assoc_group_id` 4; `sec_addr` 2 + 6
+        // ("49152" and its NUL), already four-aligned so no pad; `p_result_list` 1 + 3; and 24 per
+        // result. Only the fields the IDL names, and each once.
+        assert_eq!(
+            ack.len(),
+            16 + 2 + 2 + 4 + 2 + 6 + 1 + 3 + 24,
+            "body laid out per the IDL"
+        );
+    }
+
+    #[test]
+    fn a_bind_ack_echoes_the_association_group_the_client_asked_for() {
+        let mut raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
+        // `assoc_group_id` at octets 20..24 of the PDU: a non-zero request must come back as is.
+        raw[20..24].copy_from_slice(&7u32.to_le_bytes());
+        let parsed = pdu::parse(&raw).expect("a bind");
+        let mut contexts = Vec::new();
+        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        let echoed = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
+        assert_eq!(echoed, 7);
+    }
+
+    #[test]
+    fn an_alter_context_response_keeps_the_secondary_address_field_empty() {
+        // The field is in the IDL and its value is ignored; dropping it would shift every result.
+        let mut raw = bind_pdu(&[context(2, pdu::DRSUAPI, pdu::NDR)]);
+        raw[2] = pdu::PTYPE_ALTER_CONTEXT;
+        let parsed = pdu::parse(&raw).expect("an alter_context");
+        let mut contexts = Vec::new();
+        let ack = &answer(&parsed, &mut contexts, 49152)[0];
+        assert_eq!(ack[2], pdu::PTYPE_ALTER_CONTEXT_RESP);
+        assert_eq!(
+            u16::from_le_bytes([ack[24], ack[25]]),
+            0,
+            "an empty sec_addr"
+        );
+        assert_eq!(u16::from_le_bytes([ack[10], ack[11]]), 0, "no verifier");
+        assert_eq!(contexts, vec![(2, pdu::DRSUAPI)]);
     }
 
     #[test]
