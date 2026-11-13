@@ -28,7 +28,7 @@ use crate::proto::messages::{
     SetInfoRequest, WriteRequest, WriteResponse,
 };
 use crate::rpc::pipe::{MAX_PIPES_PER_CONNECTION, Pipe, Read};
-use crate::rpc::{LSARPC_PIPE, NETLOGON_PIPE, SAMR_PIPE, SRVSVC_PIPE};
+use crate::rpc::{DRSUAPI_PIPE, LSARPC_PIPE, NETLOGON_PIPE, SAMR_PIPE, SRVSVC_PIPE};
 use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
 
@@ -205,7 +205,10 @@ async fn create(
         // `netlogon` is what a member opens after its account exists, to prove it holds the machine
         // password. A join reaches it last and a server without it says the domain could not be
         // contacted, which is the same message a network failure gives.
-        || pipe.eq_ignore_ascii_case(NETLOGON_PIPE);
+        || pipe.eq_ignore_ascii_case(NETLOGON_PIPE)
+        // `drsuapi` is the same interface over `ncacn_np`: a client that cannot reach the TCP port
+        // the endpoint mapper named falls back to it.
+        || pipe.eq_ignore_ascii_case(DRSUAPI_PIPE);
     if !known {
         debug!(name = %name, "no such pipe");
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);

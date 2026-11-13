@@ -250,6 +250,9 @@ impl Pipe {
                             )
                             .await
                         }
+                        Some(syntax) if syntax == crate::rpc::pdu::DRSUAPI => {
+                            crate::rpc::drsuapi::serve(call.opnum, &call.stub)
+                        }
                         Some(syntax) if syntax == crate::rpc::pdu::SRVSVC => {
                             srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await
                         }
