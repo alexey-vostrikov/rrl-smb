@@ -193,8 +193,19 @@ fn spnego_answer(
                             ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
                             "rpc: a service ticket was accepted"
                         );
+                        // One round or two. Measured with ETW: answering `accept-completed` made the
+                        // client's own security package fail internally (`RPC_S_SEC_PKG_ERROR` 0x721
+                        // and `SEC_E_INTERNAL_ERROR` 0x80090304, reported as "an internal error"),
+                        // which is the package saying it was still waiting for a round the server had
+                        // already closed. The switch exists because the SMB path needed it too and the
+                        // right answer differs per client.
+                        let state = if std::env::var_os("RRL_RPC_KRB_TWOROUND").is_some() {
+                            NegState::AcceptIncomplete
+                        } else {
+                            NegState::AcceptCompleted
+                        };
                         return Some(spnego::encode_resp_token(
-                            NegState::AcceptCompleted,
+                            state,
                             mechanism,
                             ap_rep.as_deref().map(mechanism_token),
                             None,
