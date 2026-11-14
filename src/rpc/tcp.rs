@@ -45,7 +45,7 @@ use tracing::{debug, info, warn};
 use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
 use crate::proto::auth::kerberos::KerberosAcceptor;
 use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
-use crate::proto::auth::spnego::{self, NegState, OID_KRB5, OID_NTLMSSP};
+use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
 
 /// What this endpoint needs in order to answer a client's SPNEGO exchange.
 ///
@@ -76,14 +76,30 @@ pub struct Endpoint {
 /// No `Debug`: it holds an NTLM acceptor, whose state is the password material this server compares
 /// against, and a derive here would put that into a log line the first time somebody traced a
 /// binding.
-#[derive(Default)]
 struct Exchange {
     /// The NTLM acceptor, once a NEGOTIATE arrived.
     ntlm: Option<NtlmServer>,
+    /// The SPNEGO negotiation, while it is still going.
+    ///
+    /// Kept because SPNEGO can need more than one round: when the mechanism the initiator's token
+    /// names is not the first it offered, RFC 4178 section 5 requires a `mechListMIC`, and that
+    /// exchange has state. Accepting the ticket with the bare Kerberos acceptor works - the ticket
+    /// verifies - but the answer then carries no MIC, and Windows ends the binding with
+    /// `RPC_S_PROTOCOL_ERROR` (0x6c0) however good the ticket was.
     /// The session key from an accepted ticket.
     kerberos: Option<[u8; 16]>,
     /// Who the client proved to be.
     principal: Option<String>,
+}
+
+impl Default for Exchange {
+    fn default() -> Self {
+        Exchange {
+            ntlm: None,
+            kerberos: None,
+            principal: None,
+        }
+    }
 }
 
 /// The largest fragment this server will send, in octets.
@@ -141,7 +157,11 @@ fn spnego_answer(
                 "rpc: SPNEGO offer"
             );
 
-            // The optimistic token: a ticket, when the client has one for this host.
+            // Kerberos, from the keytab. Two details here are not choices and are the whole of a
+            // `RPC_S_PROTOCOL_ERROR` (0x6c0): the answer must name **the mechanism the client listed
+            // first** - it builds its token for that one, and answering with the other Kerberos OID
+            // leaves it no field to say what it disliked - and the AP-REP must be sent as the
+            // mechanism's own token, not as the GSS-API envelope the acceptor produced.
             if let (Some(acceptor), Some(inner)) = (kerberos, init.mech_token.as_deref())
                 && matches!(inner.first(), Some(&0x60) | Some(&0x6e))
             {
@@ -149,6 +169,7 @@ fn spnego_answer(
                     Ok(identity) => {
                         let principal = format!("{}@{}", identity.user, identity.realm);
                         let ap_rep = identity.ap_rep;
+                        let mechanism = spnego::offered_kerberos(&init.mech_types);
                         exchange.kerberos = Some(identity.session_key);
                         exchange.principal = Some(principal.clone());
                         info!(
@@ -156,12 +177,10 @@ fn spnego_answer(
                             ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
                             "rpc: a service ticket was accepted"
                         );
-                        // One round: the AP-REP proves this side holds the key, so the negotiation is
-                        // over. `accept-incomplete` here would make the client wait for more.
                         return Some(spnego::encode_resp_token(
                             NegState::AcceptCompleted,
-                            Some(OID_KRB5),
-                            ap_rep.as_deref(),
+                            mechanism,
+                            ap_rep.as_deref().map(mechanism_token),
                             None,
                         ));
                     }
@@ -248,6 +267,19 @@ fn spnego_answer(
             None
         }
     }
+}
+
+/// The mechanism's own token inside a GSS-API envelope.
+///
+/// `0x6e` opens an AP-REQ and `0x6f` an AP-REP; a client that receives the envelope where it expects
+/// the token has no field to say so. Taken from the SMB path, which learned it against a live client.
+fn mechanism_token(token: &[u8]) -> &[u8] {
+    if token.first() == Some(&0x60)
+        && let Some(position) = token.iter().position(|byte| *byte == 0x6f || *byte == 0x6e)
+    {
+        return &token[position..];
+    }
+    token
 }
 
 /// A CHALLENGE for an NTLMSSP NEGOTIATE, inside a `NegTokenResp`.
