@@ -18,23 +18,34 @@
 //! holds nothing else: a connection is one client, and closing it forgets everything, which is what
 //! lets this be a plain loop rather than a state machine with a lifetime.
 //!
+//! # Authentication
+//!
+//! A Windows client's `alter_context` for this endpoint carries `auth_type` 9
+//! (`RPC_C_AUTHN_GSS_NEGOTIATE`) at level 6 (`Packet Privacy`), measured rather than assumed, and the
+//! mechanism token inside the SPNEGO offer is a **Kerberos AP-REQ** - also measured, and the ticket
+//! in it names `ldap/<host>` because that is the service ticket the client already holds for this
+//! domain controller. A ticket for a service this server holds a key for is a ticket it can accept,
+//! whatever port it arrived on, so Kerberos is answered first, from the keytab.
+//!
+//! NTLM stays as the fallback for a client that offers no usable ticket: the sealing it needs is
+//! already implemented and proven against a live client.
+//!
 //! # What is not here yet
 //!
-//! Authentication. A Windows client's `alter_context` for this endpoint carries `auth_type` 9
-//! (`RPC_C_AUTHN_GSS_NEGOTIATE`) at level 6 (`Packet Privacy`), which is measured, not assumed; the
-//! answer today names the contexts and leaves the verifier out, so the client reports
-//! `RPC_S_PROTOCOL_ERROR` (`0x6c0`). The fields it sent are logged, because the next step is to
-//! answer them and the values are the specification of what to answer.
+//! Sealing the call stubs at level 6 (RFC 4121 wrap / NTLM sealing), and verifying an NTLM
+//! AUTHENTICATE, which needs the account source.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
+use crate::proto::auth::kerberos::KerberosAcceptor;
 use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
-use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
+use crate::proto::auth::spnego::{self, NegState, OID_KRB5, OID_NTLMSSP};
 
 /// What this endpoint needs in order to answer a client's SPNEGO exchange.
 ///
@@ -53,6 +64,26 @@ pub struct Endpoint {
     pub nb_computer: String,
     /// This computer's DNS name.
     pub dns_computer: String,
+    /// The keytab whose keys accept a client's service ticket, when Kerberos is offered.
+    ///
+    /// Absent means this endpoint accepts NTLM only - a different statement from "the keytab is
+    /// broken", which is a startup error.
+    pub keytab: Option<std::path::PathBuf>,
+}
+
+/// What one association has proved so far.
+///
+/// No `Debug`: it holds an NTLM acceptor, whose state is the password material this server compares
+/// against, and a derive here would put that into a log line the first time somebody traced a
+/// binding.
+#[derive(Default)]
+struct Exchange {
+    /// The NTLM acceptor, once a NEGOTIATE arrived.
+    ntlm: Option<NtlmServer>,
+    /// The session key from an accepted ticket.
+    kerberos: Option<[u8; 16]>,
+    /// Who the client proved to be.
+    principal: Option<String>,
 }
 
 /// The largest fragment this server will send, in octets.
@@ -70,20 +101,17 @@ const REASON_NOT_SPECIFIED: u16 = 1;
 /// `abstract_syntax_not_supported`, for a known interface with an unusable transfer syntax.
 const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u16 = 3;
 
-/// The SPNEGO exchange over this endpoint, as far as NTLM inside it goes.
+/// Answers the client's authentication offer, if there is one to answer.
 ///
-/// A join's `alter_context` carries `auth_type` 9 (`RPC_C_AUTHN_GSS_NEGOTIATE`) with a SPNEGO
-/// `NegTokenInit` at level 6, measured on the stand. RFC 4178 §4.2 puts the mechanism's own tokens
-/// inside the negotiation: the init's `mechToken` is an NTLMSSP NEGOTIATE, the answer is an NTLMSSP
-/// CHALLENGE inside a `NegTokenResp` with `negState` `accept-incomplete`, and the client's third leg
-/// arrives in an `auth3` PDU with no answer expected.
-///
-/// NTLM rather than Kerberos on purpose: the sealing that level 6 requires is already implemented for
-/// NTLM in `proto::auth::ntlm`, and a client accepts whichever mechanism the `NegTokenResp` names.
+/// Kerberos first, from the keytab: the mechanism token a Windows join sends is an AP-REQ, measured,
+/// and it names a service this server holds a key for - so it can be accepted here without a password
+/// and without a second round. NTLM is the fallback for a client whose ticket cannot be used, because
+/// the sealing it needs is already implemented and proven against a live client.
 fn spnego_answer(
     parsed: &Pdu<'_>,
     endpoint: &Endpoint,
-    acceptor: &mut Option<NtlmServer>,
+    kerberos: Option<&Arc<KerberosAcceptor>>,
+    exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let auth = parsed.auth.as_ref()?;
     if auth.auth_type != pdu::AuthVerifier::TYPE_GSS_NEGOTIATE {
@@ -105,11 +133,6 @@ fn spnego_answer(
                     return None;
                 }
             };
-            // A join offers Kerberos first and carries a Kerberos ticket in `mechToken`, because the
-            // domain it is joining looks like one that would have issued it. The token therefore
-            // does not start with the NTLMSSP signature, and handing it to the NTLM acceptor fails
-            // as "signature mismatch" - which reads like a malformed message and is really an offer
-            // of another mechanism.
             let offers_ntlm = init.mech_types.iter().any(|mech| mech == OID_NTLMSSP);
             info!(
                 mechs = init.mech_types.len(),
@@ -117,8 +140,41 @@ fn spnego_answer(
                 token = init.mech_token.as_ref().map_or(0, Vec::len),
                 "rpc: SPNEGO offer"
             );
+
+            // The optimistic token: a ticket, when the client has one for this host.
+            if let (Some(acceptor), Some(inner)) = (kerberos, init.mech_token.as_deref())
+                && matches!(inner.first(), Some(&0x60) | Some(&0x6e))
+            {
+                match acceptor.accept(inner) {
+                    Ok(identity) => {
+                        let principal = format!("{}@{}", identity.user, identity.realm);
+                        let ap_rep = identity.ap_rep;
+                        exchange.kerberos = Some(identity.session_key);
+                        exchange.principal = Some(principal.clone());
+                        info!(
+                            %principal,
+                            ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
+                            "rpc: a service ticket was accepted"
+                        );
+                        // One round: the AP-REP proves this side holds the key, so the negotiation is
+                        // over. `accept-incomplete` here would make the client wait for more.
+                        return Some(spnego::encode_resp_token(
+                            NegState::AcceptCompleted,
+                            Some(OID_KRB5),
+                            ap_rep.as_deref(),
+                            None,
+                        ));
+                    }
+                    Err(err) => {
+                        // Named, not swallowed: a ticket this server cannot use and a client that
+                        // offers no ticket are different faults with the same remedy in the log.
+                        debug!(%err, "rpc: the offered ticket was refused; falling back to SPNEGO");
+                    }
+                }
+            }
+
             if !offers_ntlm {
-                warn!("rpc: SPNEGO offers no NTLMSSP, and Kerberos is not implemented here");
+                warn!("rpc: SPNEGO offers nothing this endpoint can accept");
                 return Some(spnego::encode_resp_token(
                     NegState::Reject,
                     Some(OID_NTLMSSP),
@@ -129,15 +185,15 @@ fn spnego_answer(
             match init.mech_token.as_deref() {
                 // Already an NTLMSSP NEGOTIATE: answer it here.
                 Some(inner) if inner.starts_with(b"NTLMSSP\x00") => {
-                    challenge_for(inner, endpoint, acceptor)
+                    challenge_for(inner, endpoint, exchange)
                 }
-                // A token for another mechanism: RFC 4178 §4.2.2 turns this into
-                // `accept-incomplete` with `supportedMech`, which is the server saying "this exchange
-                // continues, with that mechanism". Answering `reject` here would end it.
+                // A token for another mechanism: RFC 4178 §4.2.2 turns this into `accept-incomplete`
+                // with `supportedMech`, which is the server saying "this exchange continues, with that
+                // mechanism". Answering `reject` here would end it.
                 other => {
                     info!(
                         token = other.map_or(0, <[u8]>::len),
-                        "rpc: the offer's token is not NTLM; asking for NTLMSSP"
+                        "rpc: asking the client for NTLMSSP"
                     );
                     Some(spnego::encode_resp_token(
                         NegState::AcceptIncomplete,
@@ -163,7 +219,7 @@ fn spnego_answer(
             {
                 // The NEGOTIATE, after this server asked for NTLMSSP.
                 Some(1) if inner.starts_with(b"NTLMSSP\x00") => {
-                    challenge_for(&inner, endpoint, acceptor)
+                    challenge_for(&inner, endpoint, exchange)
                 }
                 // The AUTHENTICATE. Verifying it needs the account source, which is the next step;
                 // what the log can say honestly is that it arrived and with which flags.
@@ -198,7 +254,7 @@ fn spnego_answer(
 fn challenge_for(
     negotiate: &[u8],
     endpoint: &Endpoint,
-    acceptor: &mut Option<NtlmServer>,
+    exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let mut challenge = [0_u8; 8];
     if let Err(err) = crate::utils::fill_random(&mut challenge) {
@@ -222,7 +278,7 @@ fn challenge_for(
         return None;
     }
     let blob = server.challenge();
-    *acceptor = Some(server);
+    exchange.ntlm = Some(server);
     info!(
         challenge = blob.len(),
         "rpc: answering with an NTLMSSP challenge"
@@ -243,6 +299,25 @@ fn challenge_for(
 pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
     let listener = TcpListener::bind(endpoint.addr).await?;
     let local = listener.local_addr()?;
+    // Read once and shared: a keytab that changes under a running endpoint is one an operator meant
+    // to restart for. A keytab that will not load is a startup error naming the file, because an
+    // endpoint that silently accepts NTLM only is one whose Kerberos failures look like client bugs.
+    let kerberos = match &endpoint.keytab {
+        None => None,
+        Some(path) => {
+            let acceptor = KerberosAcceptor::from_keytab(path).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("drsuapi keytab '{}': {err:?}", path.display()),
+                )
+            })?;
+            info!(
+                principals = ?acceptor.principals(),
+                "rpc: Kerberos accepted on this endpoint"
+            );
+            Some(Arc::new(acceptor))
+        }
+    };
     info!(%local, "rpc: serving drsuapi over ncacn_ip_tcp");
 
     loop {
@@ -257,9 +332,10 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
         };
         let port = local.port();
         let endpoint = endpoint.clone();
+        let kerberos = kerberos.clone();
         tokio::spawn(async move {
             debug!(%peer, "rpc: connection opened");
-            if let Err(err) = connection(stream, port, &endpoint).await {
+            if let Err(err) = connection(stream, port, &endpoint, kerberos.as_ref()).await {
                 debug!(%peer, %err, "rpc: connection ended");
             }
         });
@@ -267,12 +343,17 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
 }
 
 /// Serves one connection until the client closes it.
-async fn connection(mut stream: TcpStream, port: u16, endpoint: &Endpoint) -> std::io::Result<()> {
+async fn connection(
+    mut stream: TcpStream,
+    port: u16,
+    endpoint: &Endpoint,
+    kerberos: Option<&Arc<KerberosAcceptor>>,
+) -> std::io::Result<()> {
     let mut inbox: Vec<u8> = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut contexts: Vec<(u16, SyntaxId)> = Vec::new();
     // One exchange per connection: the client authenticates the association it is about to call on.
-    let mut acceptor: Option<NtlmServer> = None;
+    let mut exchange = Exchange::default();
 
     loop {
         let read = stream.read(&mut buffer).await?;
@@ -296,7 +377,14 @@ async fn connection(mut stream: TcpStream, port: u16, endpoint: &Endpoint) -> st
                 debug!(len = raw.len(), "rpc: unparseable PDU dropped");
                 continue;
             };
-            for reply in answer(&parsed, &mut contexts, port, endpoint, &mut acceptor) {
+            for reply in answer(
+                &parsed,
+                &mut contexts,
+                port,
+                endpoint,
+                kerberos,
+                &mut exchange,
+            ) {
                 stream.write_all(&reply).await?;
             }
         }
@@ -312,10 +400,11 @@ fn answer(
     contexts: &mut Vec<(u16, SyntaxId)>,
     port: u16,
     endpoint: &Endpoint,
-    acceptor: &mut Option<NtlmServer>,
+    kerberos: Option<&Arc<KerberosAcceptor>>,
+    exchange: &mut Exchange,
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
-    let token = spnego_answer(parsed, endpoint, acceptor);
+    let token = spnego_answer(parsed, endpoint, kerberos, exchange);
     // One line per PDU: which packet type arrived and, for a call, which interface and opnum. A
     // client that connects and then stops speaking is otherwise indistinguishable from one that
     // never connected, and that difference was the whole of a day's work on this endpoint.
@@ -562,6 +651,7 @@ mod tests {
             dns_domain: "ad.example.com".to_string(),
             nb_computer: "SAMBA".to_string(),
             dns_computer: "samba.ad.example.com".to_string(),
+            keytab: None,
         }
     }
 
@@ -619,10 +709,17 @@ mod tests {
         let raw = alter_context_with(&spnego_init());
         let parsed = pdu::parse(&raw).expect("an alter_context with a verifier");
         let mut contexts = Vec::new();
-        let mut acceptor = None;
-        let answer = &answer(&parsed, &mut contexts, 49152, &endpoint(), &mut acceptor)[0];
+        let mut exchange = Exchange::default();
+        let answer = &answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut exchange,
+        )[0];
 
-        assert!(acceptor.is_some(), "an NTLM exchange was started");
+        assert!(exchange.ntlm.is_some(), "an NTLM exchange was started");
         // `auth_length` counts the token only, not the eight-octet `sec_trailer` before it.
         let auth_len = usize::from(u16::from_le_bytes([answer[10], answer[11]]));
         assert!(auth_len > 0, "the answer carries a token");
@@ -636,6 +733,48 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_offer_without_a_keytab_keeps_the_exchange_alive() {
+        // The offer's token is not NTLMSSP but a Kerberos AP-REQ (`6e`), and there is no keytab to
+        // accept it with. The answer must name NTLMSSP and leave the negotiation running: a
+        // `reject` would end it, and no answer at all is what the client reports as
+        // `RPC_S_PROTOCOL_ERROR` (0x6c0).
+        let mut mech_types = der(0x06, spnego::OID_KRB5);
+        mech_types.extend_from_slice(&der(0x06, OID_NTLMSSP));
+        let mut body = der(0xa0, &der(0x30, &mech_types));
+        body.extend_from_slice(&der(
+            0xa2,
+            &der(0x04, b"\x6e\x82\x00\x10a kerberos ap-req "),
+        ));
+        let init = der(0x30, &body);
+        let mut gss = der(0x06, spnego::OID_SPNEGO);
+        gss.extend_from_slice(&der(0xa0, &init));
+
+        let raw = alter_context_with(&der(0x60, &gss));
+        let parsed = pdu::parse(&raw).expect("an alter_context with a verifier");
+        let mut contexts = Vec::new();
+        let mut exchange = Exchange::default();
+        let answer = &answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut exchange,
+        )[0];
+
+        let auth_len = usize::from(u16::from_le_bytes([answer[10], answer[11]]));
+        assert!(auth_len > 0, "the answer carries a token");
+        let token = &answer[answer.len() - auth_len..];
+        assert_eq!(token[0], 0xa1, "a `NegTokenResp`");
+        // `accept-incomplete (1)` inside `negState [0]`: `a0 03 0a 01 01`.
+        assert!(
+            token.windows(4).any(|w| w == [0xa0, 0x03, 0x0a, 0x01]),
+            "the negotiation continues: {token:02x?}"
+        );
+        assert!(!exchange.ntlm.is_some(), "no NTLM exchange was started");
+    }
+
+    #[test]
     fn a_bind_for_drsuapi_over_ndr_is_accepted() {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
@@ -645,7 +784,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         );
         assert_eq!(replies.len(), 1);
         assert_eq!(contexts, vec![(0, pdu::DRSUAPI)]);
@@ -676,7 +816,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         );
         assert!(contexts.is_empty(), "nothing was taken");
         let ack = &replies[0];
@@ -697,7 +838,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         );
 
         // `IDL_DRSBind` takes two pointers, both absent: a client with no DSA GUID yet.
@@ -709,7 +851,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         );
         assert_eq!(replies.len(), 1);
         let reply = &replies[0];
@@ -735,7 +878,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         )[0];
         assert_eq!(u16::from_le_bytes([ack[10], ack[11]]), 0, "no auth_length");
         // frag_length is the whole PDU, so nothing trails the result list.
@@ -763,7 +907,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         )[0];
         let echoed = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
         assert_eq!(echoed, 7);
@@ -781,7 +926,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         )[0];
         assert_eq!(ack[2], pdu::PTYPE_ALTER_CONTEXT_RESP);
         assert_eq!(
@@ -803,7 +949,8 @@ mod tests {
             &mut contexts,
             49152,
             &endpoint(),
-            &mut Option::<NtlmServer>::None,
+            None,
+            &mut Exchange::default(),
         );
         assert_eq!(replies[0][2], pdu::PTYPE_FAULT);
     }
