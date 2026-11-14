@@ -117,6 +117,22 @@ const REASON_NOT_SPECIFIED: u16 = 1;
 /// `abstract_syntax_not_supported`, for a known interface with an unusable transfer syntax.
 const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u16 = 3;
 
+/// The association group id this server returns.
+///
+/// Non-zero, chosen here rather than echoed: C706 lets a server name a group, and a real controller
+/// does - Samba answers 3181 to a request carrying 0, measured. The value never has to match
+/// anything, because a group only means something to a server that shares one association across
+/// several connections, and this one keeps everything per connection.
+fn assoc_group() -> u32 {
+    let mut bytes = [0_u8; 4];
+    match crate::utils::fill_random(&mut bytes) {
+        // Any non-zero value: zero is the one that reads as "no group", so it is mapped to 1 rather
+        // than sent.
+        Ok(()) => u32::from_le_bytes(bytes) | 1,
+        Err(_) => 1,
+    }
+}
+
 /// Answers the client's authentication offer, if there is one to answer.
 ///
 /// Kerberos first, from the keytab: the mechanism token a Windows join sends is an AP-REQ, measured,
@@ -458,10 +474,11 @@ fn answer(
                 pdu::PTYPE_BIND_ACK,
                 parsed.header.call_id,
                 MAX_FRAG,
-                // "may also contain a new association group identifier if one was requested by the
-                // client": echoing a requested zero is what "no group" means, and inventing an
-                // identifier would claim a grouping this server does not keep.
-                bind.assoc_group_id,
+                // C706 says this "may contain a new association group identifier if one was requested
+                // by the client", and a real controller answers with a fresh non-zero id even when the
+                // client asked for zero - measured: Samba returns 3181 for a request carrying 0. A
+                // server that echoes the zero is one a client can read as "no association".
+                assoc_group(),
                 &port.to_string(),
                 &results(bind, contexts),
                 token
@@ -928,10 +945,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bind_ack_echoes_the_association_group_the_client_asked_for() {
-        let mut raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
-        // `assoc_group_id` at octets 20..24 of the PDU: a non-zero request must come back as is.
-        raw[20..24].copy_from_slice(&7u32.to_le_bytes());
+    fn a_bind_ack_names_an_association_group_of_its_own() {
+        // Measured: Samba answers 3181 to a request carrying 0. A zero in the answer is the one
+        // value that reads as "no group", so the answer must carry a number.
+        let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
         let ack = &answer(
@@ -942,8 +959,8 @@ mod tests {
             None,
             &mut Exchange::default(),
         )[0];
-        let echoed = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
-        assert_eq!(echoed, 7);
+        let group = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
+        assert_ne!(group, 0, "a zero group is what a client reads as none");
     }
 
     #[test]
