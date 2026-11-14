@@ -95,7 +95,7 @@ fn spnego_answer(
     }
     let token = auth.token;
     // `[APPLICATION 0]` opens a `NegTokenInit`; `[1]` opens a `NegTokenResp`, which is how the
-    // client brings the AUTHENTICATE back.
+    // client brings its next message back.
     match token.first() {
         Some(0x60) => {
             let init = match spnego::decode_init_token(token) {
@@ -105,54 +105,48 @@ fn spnego_answer(
                     return None;
                 }
             };
-            if !init.mech_types.iter().any(|mech| mech == OID_NTLMSSP) {
-                warn!(
-                    mechs = init.mech_types.len(),
-                    "rpc: SPNEGO init offers no NTLMSSP, and Kerberos is not implemented here"
-                );
-                return None;
-            }
-            let inner = match init.mech_token {
-                Some(inner) => inner,
-                None => {
-                    warn!("rpc: SPNEGO init offered NTLMSSP without a token");
-                    return None;
-                }
-            };
-            let mut challenge = [0_u8; 8];
-            if let Err(err) = crate::utils::fill_random(&mut challenge) {
-                // An NTLM challenge that is not random is an NTLM challenge that repeats: the
-                // exchange must not continue with one.
-                warn!(%err, "rpc: the OS random source failed; no challenge");
-                return None;
-            }
-            let mut server = NtlmServer::new(
-                challenge,
-                NtlmTargetInfo::new(
-                    endpoint.nb_domain.clone(),
-                    endpoint.nb_domain.clone(),
-                    endpoint.nb_computer.clone(),
-                    endpoint.dns_domain.clone(),
-                    endpoint.dns_computer.clone(),
-                ),
-                crate::utils::now_filetime(),
-            );
-            if let Err(err) = server.step1_negotiate(&inner) {
-                warn!(%err, "rpc: the client's NEGOTIATE did not parse");
-                return None;
-            }
-            let blob = server.challenge();
-            *acceptor = Some(server);
+            // A join offers Kerberos first and carries a Kerberos ticket in `mechToken`, because the
+            // domain it is joining looks like one that would have issued it. The token therefore
+            // does not start with the NTLMSSP signature, and handing it to the NTLM acceptor fails
+            // as "signature mismatch" - which reads like a malformed message and is really an offer
+            // of another mechanism.
+            let offers_ntlm = init.mech_types.iter().any(|mech| mech == OID_NTLMSSP);
             info!(
-                challenge = blob.len(),
-                "rpc: answering SPNEGO with an NTLMSSP challenge"
+                mechs = init.mech_types.len(),
+                offers_ntlm,
+                token = init.mech_token.as_ref().map_or(0, Vec::len),
+                "rpc: SPNEGO offer"
             );
-            Some(spnego::encode_resp_token(
-                NegState::AcceptIncomplete,
-                Some(OID_NTLMSSP),
-                Some(&blob),
-                None,
-            ))
+            if !offers_ntlm {
+                warn!("rpc: SPNEGO offers no NTLMSSP, and Kerberos is not implemented here");
+                return Some(spnego::encode_resp_token(
+                    NegState::Reject,
+                    Some(OID_NTLMSSP),
+                    None,
+                    None,
+                ));
+            }
+            match init.mech_token.as_deref() {
+                // Already an NTLMSSP NEGOTIATE: answer it here.
+                Some(inner) if inner.starts_with(b"NTLMSSP\x00") => {
+                    challenge_for(inner, endpoint, acceptor)
+                }
+                // A token for another mechanism: RFC 4178 §4.2.2 turns this into
+                // `accept-incomplete` with `supportedMech`, which is the server saying "this exchange
+                // continues, with that mechanism". Answering `reject` here would end it.
+                other => {
+                    info!(
+                        token = other.map_or(0, <[u8]>::len),
+                        "rpc: the offer's token is not NTLM; asking for NTLMSSP"
+                    );
+                    Some(spnego::encode_resp_token(
+                        NegState::AcceptIncomplete,
+                        Some(OID_NTLMSSP),
+                        None,
+                        None,
+                    ))
+                }
+            }
         }
         Some(0xa1) => {
             let resp = match spnego::decode_resp_token(token) {
@@ -162,20 +156,83 @@ fn spnego_answer(
                     return None;
                 }
             };
-            // The third leg: the AUTHENTICATE the client signs its calls with. Verifying it needs
-            // the account's hash, which is the next step; until then the fact that it arrived is
-            // what the log can honestly say, and no answer is due for it.
-            info!(
-                token = resp.response_token.as_ref().map_or(0, Vec::len),
-                "rpc: client sent its AUTHENTICATE; verification is not implemented yet"
-            );
-            None
+            let inner = resp.response_token.clone().unwrap_or_default();
+            match inner
+                .get(8..12)
+                .map(|kind| u32::from_le_bytes(kind.try_into().expect("four")))
+            {
+                // The NEGOTIATE, after this server asked for NTLMSSP.
+                Some(1) if inner.starts_with(b"NTLMSSP\x00") => {
+                    challenge_for(&inner, endpoint, acceptor)
+                }
+                // The AUTHENTICATE. Verifying it needs the account source, which is the next step;
+                // what the log can say honestly is that it arrived and with which flags.
+                Some(3) => {
+                    let flags = inner
+                        .get(60..64)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four")));
+                    info!(
+                        token = inner.len(),
+                        flags = flags.map(|flags| format!("0x{flags:08x}")),
+                        "rpc: client sent its AUTHENTICATE; verification is not implemented yet"
+                    );
+                    None
+                }
+                _ => {
+                    info!(
+                        token = inner.len(),
+                        "rpc: SPNEGO response carries no NTLMSSP message"
+                    );
+                    None
+                }
+            }
         }
         other => {
             debug!(first = ?other, "rpc: authentication token of an unknown shape");
             None
         }
     }
+}
+
+/// A CHALLENGE for an NTLMSSP NEGOTIATE, inside a `NegTokenResp`.
+fn challenge_for(
+    negotiate: &[u8],
+    endpoint: &Endpoint,
+    acceptor: &mut Option<NtlmServer>,
+) -> Option<Vec<u8>> {
+    let mut challenge = [0_u8; 8];
+    if let Err(err) = crate::utils::fill_random(&mut challenge) {
+        // An NTLM challenge that is not random is one that repeats: the exchange must not go on.
+        warn!(%err, "rpc: the OS random source failed; no challenge");
+        return None;
+    }
+    let mut server = NtlmServer::new(
+        challenge,
+        NtlmTargetInfo::new(
+            endpoint.nb_domain.clone(),
+            endpoint.nb_domain.clone(),
+            endpoint.nb_computer.clone(),
+            endpoint.dns_domain.clone(),
+            endpoint.dns_computer.clone(),
+        ),
+        crate::utils::now_filetime(),
+    );
+    if let Err(err) = server.step1_negotiate(negotiate) {
+        warn!(%err, "rpc: the client's NEGOTIATE did not parse");
+        return None;
+    }
+    let blob = server.challenge();
+    *acceptor = Some(server);
+    info!(
+        challenge = blob.len(),
+        "rpc: answering with an NTLMSSP challenge"
+    );
+    Some(spnego::encode_resp_token(
+        NegState::AcceptIncomplete,
+        Some(OID_NTLMSSP),
+        Some(&blob),
+        None,
+    ))
 }
 
 /// Binds `addr` and serves every connection until the process ends.
@@ -259,6 +316,16 @@ fn answer(
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
     let token = spnego_answer(parsed, endpoint, acceptor);
+    // One line per PDU: which packet type arrived and, for a call, which interface and opnum. A
+    // client that connects and then stops speaking is otherwise indistinguishable from one that
+    // never connected, and that difference was the whole of a day's work on this endpoint.
+    debug!(
+        ptype = parsed.header.ptype,
+        call_id = parsed.header.call_id,
+        auth_length = parsed.header.auth_length,
+        body = ?parsed.body,
+        "rpc: pdu"
+    );
     match &parsed.body {
         Body::Bind(bind) => {
             // C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff
