@@ -32,8 +32,9 @@
 //!
 //! # What is not here yet
 //!
-//! Sealing the call stubs at level 6 (RFC 4121 wrap / NTLM sealing), and verifying an NTLM
-//! AUTHENTICATE, which needs the account source.
+//! The path is implemented and **not yet measured end to end**: sealing was written from RFC 4121
+//! §4.2 and the crate's own per-message tokens, and no Windows client has accepted a sealed answer
+//! from this endpoint yet. An NTLM AUTHENTICATE is still unverified - that needs the account source.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,7 +44,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
-use crate::proto::auth::kerberos::KerberosAcceptor;
 use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
 use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
 
@@ -90,6 +90,19 @@ struct Exchange {
     kerberos: Option<[u8; 16]>,
     /// Who the client proved to be.
     principal: Option<String>,
+    /// The RFC 4121 per-message machinery of an accepted ticket: what seals a call at level 6.
+    ///
+    /// Keyed on the ticket's base key, which is the initiator's subkey when one was offered - the
+    /// same choice SMB signing makes, and taking the plain session key here would seal with a key the
+    /// client never uses.
+    seal: Option<krb5::token::PerMessageTokens<krb5::token::ContextKey>>,
+    /// Sequence numbers, one per direction.
+    ///
+    /// GSS wrap does not carry them in a DCE/RPC PDU - only in the token header, which this server
+    /// writes itself - so both sides count from zero: the client's first sealed call is 0 and the
+    /// answer to it is 0 too.
+    recv_seq: u64,
+    send_seq: u64,
 }
 
 impl Default for Exchange {
@@ -98,6 +111,9 @@ impl Default for Exchange {
             ntlm: None,
             kerberos: None,
             principal: None,
+            seal: None,
+            recv_seq: 0,
+            send_seq: 0,
         }
     }
 }
@@ -142,7 +158,7 @@ fn assoc_group() -> u32 {
 fn spnego_answer(
     parsed: &Pdu<'_>,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<KerberosAcceptor>>,
+    kerberos: Option<&Arc<krb5::Keytab>>,
     exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let auth = parsed.auth.as_ref()?;
@@ -178,16 +194,36 @@ fn spnego_answer(
             // first** - it builds its token for that one, and answering with the other Kerberos OID
             // leaves it no field to say what it disliked - and the AP-REP must be sent as the
             // mechanism's own token, not as the GSS-API envelope the acceptor produced.
-            if let (Some(acceptor), Some(inner)) = (kerberos, init.mech_token.as_deref())
+            if let (Some(keytab), Some(inner)) = (kerberos, init.mech_token.as_deref())
                 && matches!(inner.first(), Some(&0x60) | Some(&0x6e))
             {
-                match acceptor.accept(inner) {
-                    Ok(identity) => {
-                        let principal = format!("{}@{}", identity.user, identity.realm);
-                        let ap_rep = identity.ap_rep;
+                // The context, not an identity: the per-message tokens that seal a call at level 6
+                // are derived from its base key, and an acceptor that returns only a session key
+                // cannot seal anything the client would accept.
+                let accepted = match inner.first() {
+                    Some(&0x60) => krb5::KerberosContext::accept_token(keytab, inner),
+                    _ => krb5::KerberosContext::accept_ap_req(
+                        keytab,
+                        inner,
+                        &krb5::acceptor::AcceptOptions::default(),
+                    ),
+                };
+                match accepted {
+                    Ok((context, ap_rep)) => {
+                        let principal = context.client_principal.clone();
                         let mechanism = spnego::offered_kerberos(&init.mech_types);
-                        exchange.kerberos = Some(identity.session_key);
+                        // The base key is the initiator's subkey when one was offered (RFC 4121 §2),
+                        // and SMB signing takes the same one; sealing with the ticket's session key
+                        // instead would produce tokens the client refuses without saying why.
+                        match context.per_message_tokens() {
+                            Ok(tokens) => exchange.seal = Some(tokens),
+                            Err(err) => {
+                                warn!(%err, "rpc: no per-message tokens; calls cannot be sealed");
+                            }
+                        }
+                        exchange.kerberos = Some(truncate_key(&context.base_key));
                         exchange.principal = Some(principal.clone());
+                        let ap_rep = (!ap_rep.is_empty()).then_some(ap_rep);
                         info!(
                             %principal,
                             ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
@@ -296,6 +332,106 @@ fn spnego_answer(
     }
 }
 
+
+/// Opens a call sealed at level 6, or says why it cannot be.
+///
+/// The token is in two pieces: the sixteen-octet RFC 4121 header travels in the verifier and the
+/// ciphertext travels where the arguments would be, so they are joined here before the token layer
+/// sees them. `Ok(None)` means this association never accepted a ticket, which is a client talking
+/// NTLM or nothing: its stub is arguments in clear text, not a token that failed.
+///
+/// The pad is stripped **after** the seal opens. MS-RPCE 2.2.2.11 has `auth_pad_length` count octets
+/// at the end of the stub, and at this level those octets are inside the ciphertext - subtracting
+/// them from the ciphertext instead would hand the handler a stub that is short and still parses.
+fn open_sealed_call(
+    header: &[u8],
+    stub: &[u8],
+    pad: usize,
+    exchange: &mut Exchange,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    // Taken out of the exchange and put back: the sequence counter lives beside the tokens, and
+    // `unwrap` needs the tokens while the counter needs to change.
+    let Some(tokens) = exchange.seal.take() else {
+        return Ok(None);
+    };
+    let mut token = header.to_vec();
+    token.extend_from_slice(stub);
+    let opened = tokens.unwrap(&token);
+    exchange.seal = Some(tokens);
+    let verified = opened.map_err(|_| "the token did not verify")?;
+    exchange.recv_seq = verified.seq.saturating_add(1);
+    let kept = verified
+        .message
+        .len()
+        .checked_sub(pad)
+        .ok_or("the pad is longer than the sealed stub")?;
+    let mut message = verified.message;
+    message.truncate(kept);
+    debug!(
+        seq = verified.seq,
+        plaintext = message.len(),
+        pad,
+        "rpc: a sealed call was opened"
+    );
+    Ok(Some(message))
+}
+
+/// The first sixteen octets of a key, for the paths that take a fixed-size session key.
+///
+/// Every KDF this crate implements for a *session* consumes 128 bits, and a shorter key is a
+/// configuration the caller has to see rather than a key padded with zeros.
+fn truncate_key(base_key: &[u8]) -> [u8; 16] {
+    let mut key = [0_u8; 16];
+    let take = base_key.len().min(16);
+    key[..take].copy_from_slice(&base_key[..take]);
+    key
+}
+
+/// The body and verifier of an answer at one authentication level.
+///
+/// At level 6 the answer is sealed the way the call was: an RFC 4121 Wrap token whose sixteen-octet
+/// header becomes the verifier and whose ciphertext becomes the body. `emit_wrap` builds the token
+/// whole, so the split is exactly at `HEADER_LEN` — that is only true because this crate emits with
+/// RRC = 0, which is always legal for AES (RFC 4121 §4.2.4).
+///
+/// The plaintext is padded to four octets before it is sealed, and the padding goes **inside** the
+/// seal: MS-RPCE 2.2.2.11.1 puts it in the encrypted data, so the PDU reports none.
+fn seal_answer(stub: &[u8], level: u8, exchange: &mut Exchange) -> (Vec<u8>, Option<Vec<u8>>) {
+    if level != 6 {
+        return (stub.to_vec(), None);
+    }
+    let Some(tokens) = exchange.seal.take() else {
+        // No ticket was accepted on this association: the client is talking NTLM or nothing, and a
+        // plain answer is the honest one.
+        return (stub.to_vec(), None);
+    };
+    let mut plaintext = stub.to_vec();
+    plaintext.resize(plaintext.len().next_multiple_of(4), 0);
+    let seq = exchange.send_seq;
+    let sealed = tokens.emit_wrap(seq, &plaintext);
+    exchange.seal = Some(tokens);
+    match sealed {
+        Ok(token) => {
+            exchange.send_seq = seq.saturating_add(1);
+            let (header, body) = token.split_at(krb5::token::HEADER_LEN);
+            debug!(
+                seq,
+                plaintext = stub.len(),
+                sealed = body.len(),
+                "rpc: the answer was sealed"
+            );
+            (body.to_vec(), Some(header.to_vec()))
+        }
+        Err(err) => {
+            // An answer that cannot be sealed must not travel in the clear: a client at level 6
+            // discards an unsealed answer, and sending one would look like a protocol error on its
+            // side rather than a fault on this one.
+            warn!(%err, "rpc: the answer could not be sealed; sending an empty body");
+            (Vec::new(), None)
+        }
+    }
+}
+
 /// The mechanism's own token inside a GSS-API envelope.
 ///
 /// `0x6e` opens an AP-REQ and `0x6f` an AP-REP; a client that receives the envelope where it expects
@@ -361,20 +497,24 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
     // Read once and shared: a keytab that changes under a running endpoint is one an operator meant
     // to restart for. A keytab that will not load is a startup error naming the file, because an
     // endpoint that silently accepts NTLM only is one whose Kerberos failures look like client bugs.
+    //
+    // The raw `Keytab`, not a ready-made acceptor: accepting a ticket has to yield the *context*,
+    // because the per-message tokens that seal a call at level 6 are derived from its base key, and
+    // an acceptor that returns only an identity and a session key throws that away.
     let kerberos = match &endpoint.keytab {
         None => None,
         Some(path) => {
-            let acceptor = KerberosAcceptor::from_keytab(path).map_err(|err| {
+            let keytab = krb5::Keytab::load(path).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("drsuapi keytab '{}': {err:?}", path.display()),
                 )
             })?;
             info!(
-                principals = ?acceptor.principals(),
+                path = %path.display(),
                 "rpc: Kerberos accepted on this endpoint"
             );
-            Some(Arc::new(acceptor))
+            Some(Arc::new(keytab))
         }
     };
     info!(%local, "rpc: serving drsuapi over ncacn_ip_tcp");
@@ -406,7 +546,7 @@ async fn connection(
     mut stream: TcpStream,
     port: u16,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<KerberosAcceptor>>,
+    kerberos: Option<&Arc<krb5::Keytab>>,
 ) -> std::io::Result<()> {
     let mut inbox: Vec<u8> = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -459,7 +599,7 @@ fn answer(
     contexts: &mut Vec<(u16, SyntaxId)>,
     port: u16,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<KerberosAcceptor>>,
+    kerberos: Option<&Arc<krb5::Keytab>>,
     exchange: &mut Exchange,
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
@@ -557,9 +697,37 @@ fn answer(
                 .iter()
                 .find(|(id, _)| *id == request.context_id)
                 .map(|(_, syntax)| *syntax);
+
+            // At level 6 the stub is not the arguments: it is a sealed RFC 4121 Wrap token whose
+            // sixteen-octet header travels in the verifier and whose ciphertext travels where the
+            // arguments would be. Handing the ciphertext to a handler parses nonsense - which is
+            // what a join reports as `RPC_X_BAD_STUB_DATA`.
+            let level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level);
+            let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
+            let pad = usize::from(
+                parsed
+                    .auth
+                    .as_ref()
+                    .map_or(0, |auth| auth.auth_pad_length),
+            );
+            let unsealed = match (level, verifier_token) {
+                (6, Some(header)) => match open_sealed_call(header, request.stub, pad, exchange) {
+                    Ok(opened) => opened,
+                    // A call that cannot be opened is not answered: the alternative is a handler
+                    // reading ciphertext as arguments, which is what a client reports as a bad stub.
+                    Err(detail) => {
+                        warn!(detail, "rpc: a sealed call could not be opened");
+                        return Vec::new();
+                    }
+                },
+                // Below level 6 the stub is the arguments, and padding it needs is the PDU's own.
+                _ => None,
+            };
+            let stub = unsealed.as_deref().unwrap_or(request.stub);
+
             let result = match interface {
                 Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => {
-                    super::drsuapi::serve(request.opnum, request.stub)
+                    super::drsuapi::serve(request.opnum, stub)
                 }
                 other => {
                     warn!(
@@ -575,14 +743,31 @@ fn answer(
                 }
             };
             match result {
-                Ok(stub) => vec![pdu::response(
-                    parsed.header.call_id,
-                    pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
-                    u32::try_from(stub.len()).unwrap_or(u32::MAX),
-                    request.context_id,
-                    &stub,
-                    None,
-                )],
+                Ok(stub) => {
+                    let (body, header) = seal_answer(&stub, level, exchange);
+                    // Built here, not inside the helper: a verifier borrows its token, and the token
+                    // is the helper's return value, so it has to outlive the call.
+                    let verifier = header.as_deref().map(|token| AuthReply {
+                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
+                        auth_level: 6,
+                        // The padding travels **inside** the seal (MS-RPCE 2.2.2.11.1), so the PDU
+                        // itself adds none and this count is what the client must not skip.
+                        auth_pad_length: 0,
+                        auth_context_id: parsed
+                            .auth
+                            .as_ref()
+                            .map_or(0, |auth| auth.auth_context_id),
+                        token,
+                    });
+                    vec![pdu::response(
+                        parsed.header.call_id,
+                        pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
+                        u32::try_from(stub.len()).unwrap_or(u32::MAX),
+                        request.context_id,
+                        &body,
+                        verifier.as_ref(),
+                    )]
+                }
                 Err(fault) => vec![pdu::fault(
                     parsed.header.call_id,
                     pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG | pdu::PFC_DID_NOT_EXECUTE,
@@ -1013,5 +1198,211 @@ mod tests {
             &mut Exchange::default(),
         );
         assert_eq!(replies[0][2], pdu::PTYPE_FAULT);
+    }
+
+    /// The two ends of one context, over a key they were both given.
+    ///
+    /// `krb5::token` is used directly rather than a ticket: what these tests check is the RFC 4121
+    /// wiring in this file - that a sealed call is opened, that the answer is sealed back with the
+    /// verifier carrying the token header, and that the sequence numbers advance - and all of that
+    /// is the same arithmetic whoever agreed on the key. Accepting the ticket that produces the key
+    /// is tested by the SMB path (`proto::auth::kerberos`) and, live, by the stand.
+    fn endpoints_of_one_context() -> (
+        krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+        krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    ) {
+        // aes256-cts-hmac-sha1-96: the etype a modern client negotiates with this server.
+        let key = [0x5a_u8; 32];
+        let server = krb5::token::ContextKey::new(18, &key).expect("a key of the right length");
+        let client = krb5::token::ContextKey::new(18, &key).expect("a key of the right length");
+        (
+            krb5::token::PerMessageTokens::new(server, krb5::token::Role::Acceptor, false),
+            krb5::token::PerMessageTokens::new(client, krb5::token::Role::Initiator, false),
+        )
+    }
+
+    /// A request whose stub is a sealed token: the RFC 4121 header travels in the verifier and the
+    /// ciphertext where the arguments would be, which is what MS-RPCE 2.2.2.11.1 asks for at level 6.
+    fn sealed_request_pdu(call_id: u32, opnum: u16, token: &[u8], pad: u8) -> Vec<u8> {
+        let (header_part, body) = token.split_at(krb5::token::HEADER_LEN);
+        let mut out = header(pdu::PTYPE_REQUEST, call_id, 0);
+        out[10..12].copy_from_slice(
+            &u16::try_from(header_part.len())
+                .expect("a short header")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(body.len())
+                .expect("a short body")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&0u16.to_le_bytes()); // context 0
+        out.extend_from_slice(&opnum.to_le_bytes());
+        out.extend_from_slice(body);
+        // `sec_trailer`: auth_type GSS negotiate, level 6, the pad, a reserved octet, the id.
+        out.extend_from_slice(&[pdu::AuthVerifier::TYPE_GSS_NEGOTIATE, 6, pad, 0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(header_part);
+        let frag = u16::try_from(out.len()).expect("a small request");
+        out[8..10].copy_from_slice(&frag.to_le_bytes());
+        out
+    }
+
+    /// A context accepted on this association, the way a bind leaves it.
+    fn accepted_context() -> Vec<(u16, SyntaxId)> {
+        let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
+        let parsed = pdu::parse(&raw).expect("a bind");
+        let mut contexts = Vec::new();
+        answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut Exchange::default(),
+        );
+        contexts
+    }
+
+    /// The acceptance of the level-6 path: a sealed call is opened, and the answer comes back
+    /// sealed, with the token's header in the verifier and its ciphertext in the body.
+    #[test]
+    fn a_sealed_call_is_opened_and_the_answer_is_sealed_back() {
+        let (server, client) = endpoints_of_one_context();
+        let mut contexts = accepted_context();
+        let mut exchange = Exchange {
+            seal: Some(server),
+            ..Exchange::default()
+        };
+
+        // `IDL_DRSBind` with both pointers absent, sealed by the client at sequence 0.
+        let stub = [0_u8; 8];
+        let token = client.emit_wrap(0, &stub).expect("the client seals");
+        let call = sealed_request_pdu(2, 0, &token, 0);
+        let parsed = pdu::parse(&call).expect("a request");
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut exchange,
+        );
+
+        assert_eq!(replies.len(), 1, "a sealed call is answered");
+        let reply = &replies[0];
+        assert_eq!(reply[2], pdu::PTYPE_RESPONSE);
+        let parsed = pdu::parse(reply).expect("a response");
+        let verifier = parsed
+            .auth
+            .as_ref()
+            .expect("an answer at level 6 carries a verifier");
+        assert_eq!(verifier.auth_level, 6);
+        assert_eq!(
+            verifier.token.len(),
+            krb5::token::HEADER_LEN,
+            "the verifier is the token header, and the body is the ciphertext"
+        );
+
+        // The body is what follows the eight-octet response header at offset 24; `pdu::parse` reads
+        // a response's stub as `Unexpected`, because nothing in this crate parses an answer.
+        // Eight octets of `sec_trailer`, which is where the verifier's token begins.
+        const TRAILER: usize = 8;
+        let body = &reply[24..reply.len() - verifier.token.len() - TRAILER];
+        let mut whole = verifier.token.to_vec();
+        whole.extend_from_slice(body);
+        let opened = client
+            .unwrap(&whole)
+            .expect("the client opens what the server sealed");
+        assert_eq!(opened.seq, 0, "the first answer is sequence 0");
+        // `IDL_DRSBind` answers the server's `DRS_EXTENSIONS`, a handle and then the status, so the
+        // status is the last word: zero is a bind that was taken rather than a fault or a refusal.
+        assert_eq!(
+            &opened.message[opened.message.len() - 4..],
+            &[0, 0, 0, 0],
+            "a DRSBind that was taken answers ERROR_SUCCESS, not a fault"
+        );
+        assert!(
+            opened.message.len() >= 8,
+            "and carries a handle: {} octets",
+            opened.message.len()
+        );
+        assert!(
+            body.len() != opened.message.len(),
+            "the body on the wire is the ciphertext, not the plaintext"
+        );
+        assert_eq!(exchange.recv_seq, 1, "the next call is expected at 1");
+        assert_eq!(exchange.send_seq, 1, "and the next answer is 1");
+    }
+
+    /// The pad MS-RPCE counts in `auth_pad_length` travels inside the seal, so it is stripped after
+    /// the token opens. Stripping it from the ciphertext instead would shorten a stub that still
+    /// parses - the failure would be a handler reading somebody else's octets.
+    #[test]
+    fn the_pad_reported_by_the_trailer_is_removed_after_the_seal_opens() {
+        let (server, client) = endpoints_of_one_context();
+        let mut contexts = accepted_context();
+        let mut exchange = Exchange {
+            seal: Some(server),
+            ..Exchange::default()
+        };
+
+        // Eight octets of arguments and three of pad, sealed together, with the pad reported.
+        let mut plaintext = vec![0_u8; 8];
+        plaintext.extend_from_slice(&[0xAA; 3]);
+        let token = client.emit_wrap(0, &plaintext).expect("the client seals");
+        let call = sealed_request_pdu(3, 0, &token, 3);
+        let parsed = pdu::parse(&call).expect("a request");
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut exchange,
+        );
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0][2],
+            pdu::PTYPE_RESPONSE,
+            "the handler saw exactly the eight argument octets, so it answered instead of faulting"
+        );
+    }
+
+    /// A token sealed under a key this context does not hold is refused, and nothing is sent: an
+    /// answer built from ciphertext nobody can read would be a protocol error invented here.
+    #[test]
+    fn a_call_sealed_under_another_key_is_refused_without_an_answer() {
+        let (server, _client) = endpoints_of_one_context();
+        let mut contexts = accepted_context();
+        let mut exchange = Exchange {
+            seal: Some(server),
+            ..Exchange::default()
+        };
+
+        let other = krb5::token::ContextKey::new(18, &[0x11_u8; 32]).expect("a key");
+        let stranger =
+            krb5::token::PerMessageTokens::new(other, krb5::token::Role::Initiator, false);
+        let token = stranger.emit_wrap(0, &[0_u8; 8]).expect("sealed");
+        let call = sealed_request_pdu(4, 0, &token, 0);
+        let parsed = pdu::parse(&call).expect("a request");
+        let replies = answer(
+            &parsed,
+            &mut contexts,
+            49152,
+            &endpoint(),
+            None,
+            &mut exchange,
+        );
+
+        assert!(
+            replies.is_empty(),
+            "a call that cannot be opened is not answered"
+        );
+        assert_eq!(
+            exchange.recv_seq, 0,
+            "and the sequence does not advance for it"
+        );
     }
 }
