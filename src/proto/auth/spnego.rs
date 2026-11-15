@@ -427,8 +427,19 @@ pub fn encode_resp_token(
         write_tlv(TAG_OCTET, tok, &mut o);
         write_tlv(TAG_CTX_2, &o, &mut seq);
     }
+    // An OCTET STRING inside [3], like `responseToken` inside [2]. Writing the octets straight into
+    // the context tag is the shape RFC 4178 §4.2.2 reads as implicit and it is what this encoder did
+    // until a client said otherwise: a Samba member answered the final SESSION_SETUP with
+    // "Invalid SPNEGO request" and `A3 10 01 00 00 00 5B 92 C7 6F …` printed beside it, then
+    // `NT_STATUS_INVALID_PARAMETER` - which `NetUseAdd` reports as Win32 error 87, and which is why
+    // a Windows join stopped with "the parameter is incorrect" one round after a successful logon.
+    //
+    // Whether the ASN.1 module makes the tag implicit does not settle it: the decoders that matter
+    // read an OCTET STRING, and an encoder that omits one is a message they cannot parse.
     if let Some(mic) = mech_list_mic {
-        write_tlv(TAG_CTX_3, mic, &mut seq);
+        let mut o = Vec::new();
+        write_tlv(TAG_OCTET, mic, &mut o);
+        write_tlv(TAG_CTX_3, &o, &mut seq);
     }
 
     let mut inner = Vec::new();
@@ -521,10 +532,35 @@ mod tests {
         assert!(dec.response_token.is_none());
     }
 
+    /// The `mechListMIC` is an OCTET STRING inside `[3]`, and the round trip cannot say so.
+    ///
+    /// `decode_resp_token` reads both shapes on purpose, so a test that only encodes and decodes
+    /// passes with either one - which is how an encoder that wrote the octets straight into the
+    /// context tag reached a Samba client and was answered "Invalid SPNEGO request". The assertion
+    /// is therefore on the bytes: `a3` then an OCTET STRING (`04`) of the MIC.
     #[test]
-    fn resp_token_with_mic() {
+    fn the_mech_list_mic_is_an_octet_string_inside_its_context_tag() {
         let mic = vec![0xAAu8; 16];
         let enc = encode_resp_token(NegState::AcceptCompleted, None, None, Some(&mic));
+
+        // The `[3]` field, found by its tag rather than by an offset: the fields before it are the
+        // encoder's business and may grow.
+        let at = enc
+            .windows(2)
+            .position(|pair| pair[0] == TAG_CTX_3)
+            .expect("a mechListMIC field");
+        assert_eq!(
+            enc[at + 2],
+            TAG_OCTET,
+            "the field carries an OCTET STRING, not bare octets: {:02x?}",
+            &enc[at..]
+        );
+        assert_eq!(
+            &enc[at + 4..at + 4 + mic.len()],
+            mic.as_slice(),
+            "and the MIC is inside it"
+        );
+
         let dec = decode_resp_token(&enc).unwrap();
         assert_eq!(dec.mech_list_mic.as_deref(), Some(mic.as_slice()));
     }
