@@ -739,6 +739,7 @@ mod tests {
         // Nobody is admitted by this test: `serve` ignores the caller for every call this
         // interface implements, and the anonymous identity says so rather than inventing a user.
         let caller = Caller {
+            session_key: crate::server::SessionKey([0u8; 16]),
             identity: crate::proto::auth::ntlm::Identity::Anonymous,
             can_encrypt: false,
         };

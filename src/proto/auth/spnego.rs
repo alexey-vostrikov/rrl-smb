@@ -75,6 +75,8 @@ pub const OID_KRB5_MS: &[u8] = &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02,
 /// Both spell the same mechanism here, so the choice is the client's: it is the one whose token it built,
 /// and RFC 4178 §4.2.2 has the target name its selection in `supportedMech`.
 pub fn offered_kerberos(mech_types: &[Vec<u8>]) -> Option<&'static [u8]> {
+    // The order the client listed them in: it built its token for the mechanism it named, and
+    // answering with the other spelling is a difference it has no field to describe.
     for mech in mech_types {
         if mech.as_slice() == OID_KRB5_MS {
             return Some(OID_KRB5_MS);
@@ -316,15 +318,26 @@ pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
     while pos < seq_body.len() {
         let (tag, content, next) = read_any_tlv(seq_body, pos)?;
         match tag {
+            // Also read the explicit form, for the same reason [2] and [3] are: a peer that wrote
+            // its tags the way the ASN.1 module reads rather than the way RFC 4178 requires is a
+            // peer that still means `accept-completed`, and refusing it would name no reason.
             TAG_CTX_0 => {
-                let (en, _) = read_tlv(content, 0, TAG_ENUMERATED)?;
+                let (en, _) = if content.first() == Some(&TAG_ENUMERATED) {
+                    read_tlv(content, 0, TAG_ENUMERATED)?
+                } else {
+                    (content, 0)
+                };
                 if en.len() != 1 {
                     return Err(ProtoError::Auth("NegState ENUMERATED not 1 byte"));
                 }
                 out.neg_state = Some(NegState::from_byte(en[0])?);
             }
             TAG_CTX_1 => {
-                let (oid, _) = read_tlv(content, 0, TAG_OBJECT)?;
+                let (oid, _) = if content.first() == Some(&TAG_OBJECT) {
+                    read_tlv(content, 0, TAG_OBJECT)?
+                } else {
+                    (content, 0)
+                };
                 out.supported_mech = Some(oid.to_vec());
             }
             // Implicit tagging means the bytes are the content; some clients (and this crate until
@@ -389,35 +402,33 @@ pub fn encode_resp_token(
 ) -> Vec<u8> {
     let mut seq = Vec::new();
 
-    // [0] negState. Kept as an explicit ENUMERATED inside the context tag: this is what Windows and
-    // Samba exchange, and it is the one field of this structure that was already accepted by every
-    // client seen so far.
+    // Every field is written **explicitly** - the context tag, then the field's own tag - because
+    // that is what Samba's SPNEGO parser accepts: an implicitly tagged `negResult` (`a0 01 00`) and an
+    // implicitly tagged `responseToken` (`a2 5a <token>`), in any combination, are both answered
+    // "Invalid SPNEGO request" with the frame printed. Measured, three encodings, one client.
+    //
+    // RFC 4178 §4.2.2 says implicit, and the ASN.1 module reads that way too; what is on the wire
+    // between the implementations that matter is this. The decoder below reads both, so a peer that
+    // writes the RFC's form is understood.
     {
         let mut en = Vec::new();
         write_tlv(TAG_ENUMERATED, &[state as u8], &mut en);
         write_tlv(TAG_CTX_0, &en, &mut seq);
     }
-    // [1] supportedMech, explicit like the rest: the client refused the bare OID bytes with
-    // "Invalid SPNEGO request" and showed `a1 09 2a 86 ...`, wanting the OBJECT IDENTIFIER tag back.
     if let Some(oid) = supported_mech {
         let mut o = Vec::new();
         write_tlv(TAG_OBJECT, oid, &mut o);
         write_tlv(TAG_CTX_1, &o, &mut seq);
     }
-    // [2] responseToken and [3] mechListMIC keep an explicit OCTET STRING inside the context tag.
-    // RFC 4178 makes them implicit, and an implicit encoding was tried: the client answered
-    // "Invalid SPNEGO request" and printed the frame, which is how this was settled. Whatever the
-    // RFC says, what Samba and Windows exchange - and what every client this server has met parses -
-    // is the explicit form, so that is what is written.
+    // The response token is an OCTET STRING inside [2], carrying the mechanism's own token - for
+    // Kerberos an AP-REP, which is itself `TOK_ID (02 00)` followed by `[APPLICATION 15]`.
     if let Some(tok) = response_token {
         let mut o = Vec::new();
         write_tlv(TAG_OCTET, tok, &mut o);
         write_tlv(TAG_CTX_2, &o, &mut seq);
     }
     if let Some(mic) = mech_list_mic {
-        let mut o = Vec::new();
-        write_tlv(TAG_OCTET, mic, &mut o);
-        write_tlv(TAG_CTX_3, &o, &mut seq);
+        write_tlv(TAG_CTX_3, mic, &mut seq);
     }
 
     let mut inner = Vec::new();

@@ -132,7 +132,7 @@ pub(crate) async fn serve(
         // The two calls that write: they ask whoever owns the accounts and need the server state
         // that remembers the handles those writes hand out.
         OPNUM_CREATE_USER2 => create_user2(server, stub).await,
-        OPNUM_SET_INFO_USER2 => set_information_user2(server, stub),
+        OPNUM_SET_INFO_USER2 => set_information_user2(server, _caller, stub).await,
         OPNUM_QUERY_INFO_USER => query_information_user(server, stub).await,
         OPNUM_DELETE_USER => delete_user(stub),
         OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
@@ -504,6 +504,9 @@ fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Ve
     Ok(writer.finish())
 }
 
+/// MS-ERREF: the handle was not one this server issued.
+const NTSTATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+
 /// MS-ERREF: no such domain.
 const STATUS_NO_SUCH_DOMAIN: u32 = 0xC000_00DF;
 
@@ -686,26 +689,32 @@ async fn create_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Faul
     Ok(writer.finish())
 }
 
-/// `samr_SetInformationUser2`: read, named, and refused - the write belongs to the directory.
+/// `samr_SetInformationUser2`: `[in] handle`, `[in] USER_INFORMATION_CLASS`, `[in] buffer`.
 ///
-/// MS-SAMR 3.1.5.6.34 sends a user handle, a `USER_INFORMATION_CLASS` and a union whose arm the
-/// class selects. This crate holds no store, so the honest answer is `NOT_SUPPORTED`; what makes the
-/// answer useful is naming the class, because "the client asked for something" and "the client asked
-/// for `UserAccountInformation`" are different pieces of work for whoever implements the hook.
+/// The call a join makes to set its account's password, and the password arrives **encrypted under
+/// the SMB session key**: a server without that key cannot read what it is being asked to store, and
+/// one that answers `success` without storing leaves the directory on no password at all while the
+/// member holds one - the next secure channel is then refused for an account that exists.
 ///
-/// The enum travels as a half word, like `secure_channel_type` in the Netlogon interface (measured
-/// there: `0200`); the union's discriminant on the wire is the same value.
-fn set_information_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+/// Class 25, `UserInternal4InformationNew`, is `SAMPR_USER_ALL_INFORMATION` followed by
+/// `SAMPR_ENCRYPTED_USER_PASSWORD_NEW` (MS-SAMR 2.2.6.25): 516 octets of RC4 ciphertext and the
+/// sixteen-octet salt they were encrypted under, keyed `MD5(salt || session key)` (3.2.2.1). The
+/// cleartext inside is `SAMPR_USER_PASSWORD` (2.2.6.21) - a 512-octet buffer whose *last* `Length`
+/// octets, counted from its end, are the password as UTF-16LE.
+///
+/// The plaintext is handed to whoever owns the accounts and not hashed here: one derivation serves
+/// both an LDAP write of `unicodePwd` and this, and a second one would be a second place to be wrong
+/// about a key nobody can check afterwards.
+async fn set_information_user2(
+    server: &ServerState,
+    caller: &crate::server::Caller,
+    stub: &[u8],
+) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     let Some(handle) = reader.bytes(20) else {
         return Err(malformed_at("user_handle", stub));
     };
-    // Which account the handle names: a handle this server did not issue is a client writing to an
-    // account that does not exist here, and saying so is better than a status with no name in it.
     let account = server.samr_user(handle);
-    // Both widths are read: a producer that declares the enum `v1_enum` sends four octets, and
-    // reading the wrong width would name the class from half a number and the first two octets of
-    // the union.
     let narrow = reader.u16();
     let wide = {
         let mut again = NdrReader::new(stub);
@@ -714,19 +723,139 @@ fn set_information_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, F
     };
     let class = narrow.map(u32::from).or(wide).unwrap_or(u32::MAX);
 
-    tracing::warn!(
-        class,
-        name = info_class_name(class),
-        account = ?account,
-        octets = stub.len(),
-        stub = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-        "samr: SetInformationUser2 is a directory write this server does not implement yet"
-    );
+    // The account has to be one this server handed a handle for: a handle it did not issue names
+    // nothing, and a password written to nothing is worse than a refusal.
+    let Some(account) = account else {
+        tracing::warn!(
+            octets = stub.len(),
+            "samr: SetInformationUser2 for a handle this server never issued"
+        );
+        let mut writer = NdrWriter::new();
+        writer.u32(NTSTATUS_INVALID_HANDLE);
+        return Ok(writer.finish());
+    };
 
-    // The reply to this call has no out parameters beyond the status.
     let mut writer = NdrWriter::new();
-    writer.u32(NTSTATUS_NOT_SUPPORTED);
+    match class {
+        USER_INTERNAL4_INFORMATION_NEW => {
+            let Some((cipher, salt)) = encrypted_password(stub) else {
+                tracing::warn!(
+                    account = %account,
+                    octets = stub.len(),
+                    "samr: SetInformationUser2 with a password block this server could not find \
+                     where the structure puts it"
+                );
+                writer.u32(NTSTATUS_NOT_SUPPORTED);
+                return Ok(writer.finish());
+            };
+            if std::env::var_os("RRL_PW_DIAG").is_some() {
+                let _ = std::fs::write("/stand/setinfo.bin", stub);
+                let _ = std::fs::write(
+                    "/stand/sessionkey.txt",
+                    caller
+                        .session_key
+                        .0
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                );
+            }
+            let Some(password) = open_password(cipher, salt, caller.session_key) else {
+                tracing::warn!(
+                    account = %account,
+                    "samr: the password a join sent does not open under this session's key"
+                );
+                writer.u32(NTSTATUS_NOT_SUPPORTED);
+                return Ok(writer.finish());
+            };
+            let stored = match server.config.machine_passwords.as_ref() {
+                Some(passwords) => passwords.set_password(&account, &password).await,
+                None => false,
+            };
+            tracing::info!(
+                account = %account,
+                octets = password.len(),
+                stored,
+                "samr: the machine password a join set"
+            );
+            writer.u32(if stored {
+                NTSTATUS_SUCCESS
+            } else {
+                NTSTATUS_NOT_SUPPORTED
+            });
+        }
+        other => {
+            tracing::warn!(
+                class = other,
+                name = info_class_name(other),
+                account = %account,
+                octets = stub.len(),
+                "samr: SetInformationUser2 - a class this server cannot answer"
+            );
+            writer.u32(NTSTATUS_NOT_SUPPORTED);
+        }
+    }
     Ok(writer.finish())
+}
+
+/// `USER_INFORMATION_CLASS` 25 (MS-SAMR 2.2.6.28): every attribute, plus an encrypted password.
+const USER_INTERNAL4_INFORMATION_NEW: u32 = 25;
+
+/// `SAMPR_ENCRYPTED_USER_PASSWORD_NEW` (MS-SAMR 2.2.6.22): the ciphertext, then its salt.
+const ENCRYPTED_PASSWORD_LEN: usize = 516;
+const ENCRYPTED_SALT_LEN: usize = 16;
+
+/// Where the password block sits in a class 25 request.
+///
+/// After the handle, the class and the union's discriminant (two octets each, MS-SAMR 2.2.6.28 as a
+/// `v1_enum` narrowed to `switch_is`), the in-line part of `SAMPR_USER_ALL_INFORMATION` follows. It
+/// is 196 octets for the shape every client sends - measured on a Windows Server 2022 join, and
+/// checkable in the same capture: the block is followed only by the account's name, deferred as a
+/// conformant array, and 220 + 532 + 32 + 4 octets account for the whole stub.
+///
+/// A client that sent a different in-line shape would be refused rather than mis-read, because the
+/// block is *verified* below: a wrong offset does not decrypt to a length that fits a password.
+const PASSWORD_BLOCK_AT: usize = 220;
+
+/// The encrypted password and its salt, or `None` when this stub does not carry them.
+fn encrypted_password(stub: &[u8]) -> Option<(&[u8], [u8; ENCRYPTED_SALT_LEN])> {
+    let block = stub.get(PASSWORD_BLOCK_AT..PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN)?;
+    let salt = stub.get(
+        PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN
+            ..PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN + ENCRYPTED_SALT_LEN,
+    )?;
+    Some((block, <[u8; ENCRYPTED_SALT_LEN]>::try_from(salt).ok()?))
+}
+
+/// The password inside the block, as UTF-16LE octets, when it opens under `key`.
+///
+/// The key is `MD5(salt || session key)` (MS-SAMR 3.2.2.1) and the ciphertext is one RC4 stream.
+/// What the decryption has to produce is `SAMPR_USER_PASSWORD`: 512 octets of buffer followed by a
+/// length, and the password is the last `length` octets of that buffer - which is why a password is
+/// read from the end and not from the start.
+fn open_password(
+    cipher: &[u8],
+    salt: [u8; ENCRYPTED_SALT_LEN],
+    key: crate::server::SessionKey,
+) -> Option<Vec<u8>> {
+    use md5::{Digest, Md5};
+    use rc4::{KeyInit, Rc4, StreamCipher};
+
+    let mut digest = Md5::new();
+    digest.update(salt);
+    digest.update(key.0);
+    let rc4_key = digest.finalize();
+
+    let mut plain = cipher.to_vec();
+    let mut stream = Rc4::new_from_slice(&rc4_key).expect("a 16-octet RC4 key");
+    stream.apply_keystream(&mut plain);
+
+    // `wchar_t Buffer[256]` and then `unsigned long Length`, both inline.
+    let length = u32::from_le_bytes(plain.get(512..516)?.try_into().ok()?) as usize;
+    if length == 0 || length > 512 || length % 2 != 0 {
+        return None;
+    }
+    Some(plain[512 - length..512].to_vec())
 }
 
 /// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.6.28).
@@ -823,6 +952,14 @@ mod tests {
             },
             Vec::new(),
         )
+    }
+
+    fn caller() -> crate::server::Caller {
+        crate::server::Caller {
+            session_key: crate::server::SessionKey([0x11; 16]),
+            identity: crate::proto::auth::ntlm::Identity::Anonymous,
+            can_encrypt: true,
+        }
     }
 
     fn config() -> ServerConfig {
@@ -944,19 +1081,97 @@ mod tests {
         assert_eq!(word(status), NTSTATUS_SUCCESS);
     }
 
+    /// A 516-octet password block: `Pässwörd-123` behind `Length`, filled with a pattern, RC4-encrypted
+    /// under `MD5(salt || key)` with the key and salt below.
+    ///
+    /// Built **outside** this crate on purpose: a fixture produced by the same code that reads it
+    /// agrees with its own mistakes. This one was made by an RC4 and an MD5 that share nothing with
+    /// the ones below but the published algorithms.
+    #[rustfmt::skip]
+    const PASSWORD_BLOCK: &[u8] = &[
+            0xff, 0xbe, 0x53, 0xf6, 0xe5, 0xb8, 0xd5, 0xf3, 0x1c, 0x70, 0x00, 0x53, 0x15, 0x65, 0x6d, 0x33,
+            0xda, 0x57, 0x63, 0x4e, 0x19, 0x7a, 0xe3, 0x8a, 0x5e, 0x9b, 0x6a, 0x91, 0xc0, 0x8e, 0x8f, 0xe7,
+            0x6c, 0x4b, 0xa6, 0x90, 0x77, 0x34, 0xd4, 0x56, 0x03, 0x7f, 0x60, 0xff, 0x22, 0xee, 0x8b, 0xa4,
+            0xba, 0x68, 0xe1, 0x94, 0xcd, 0x0f, 0xb5, 0xcd, 0xd1, 0xd2, 0xe0, 0xbb, 0xcf, 0xfb, 0x63, 0xd9,
+            0xae, 0xc8, 0xf6, 0xd1, 0xbe, 0x87, 0x59, 0xaa, 0x66, 0xf7, 0x8e, 0x36, 0x33, 0x7c, 0x52, 0x8a,
+            0x7f, 0x38, 0xd8, 0x8a, 0x36, 0x46, 0x33, 0x68, 0x40, 0x88, 0x47, 0x50, 0xc7, 0xb9, 0x39, 0x19,
+            0x18, 0x2f, 0x33, 0xae, 0xfe, 0x34, 0xe3, 0xbf, 0x8c, 0x9b, 0x1b, 0x48, 0x09, 0xc3, 0xd7, 0x9c,
+            0x76, 0xa0, 0x72, 0xbe, 0xa4, 0xb1, 0xd2, 0x5b, 0xab, 0x06, 0x94, 0xac, 0x05, 0xd7, 0x6e, 0x6b,
+            0x70, 0xbc, 0x12, 0x72, 0xf1, 0x68, 0x98, 0xae, 0x6e, 0xb9, 0xb1, 0x1a, 0xe5, 0xea, 0x4d, 0x55,
+            0x56, 0xc3, 0x43, 0x7c, 0x4e, 0x62, 0xce, 0x38, 0x36, 0xa1, 0x7e, 0xd0, 0x3e, 0xfb, 0x4d, 0x0a,
+            0xc6, 0x7e, 0x58, 0x6d, 0xe2, 0xa5, 0x22, 0x82, 0x47, 0x86, 0x1b, 0xd1, 0xad, 0x21, 0xad, 0x3d,
+            0x0a, 0xdf, 0x94, 0xa0, 0xb5, 0x30, 0xee, 0x63, 0xc7, 0x1f, 0xfd, 0x47, 0x18, 0x57, 0x32, 0x03,
+            0x2c, 0xe3, 0xe9, 0x44, 0xdb, 0xb2, 0x03, 0x1d, 0xd0, 0x7e, 0x67, 0x17, 0x12, 0xa7, 0x97, 0xf6,
+            0xd4, 0x89, 0x83, 0xbc, 0x13, 0x2b, 0x9f, 0x16, 0xd5, 0x08, 0xb2, 0x7c, 0xb0, 0x8a, 0x6c, 0xf2,
+            0x4a, 0x4a, 0xf3, 0xa5, 0x68, 0x38, 0x25, 0xac, 0x11, 0xdf, 0x3d, 0xda, 0x6b, 0xef, 0xed, 0x55,
+            0x85, 0x84, 0x2a, 0x23, 0x58, 0x81, 0xd7, 0x78, 0x20, 0x8f, 0x3a, 0x34, 0x4b, 0x3a, 0x86, 0xd5,
+            0xbc, 0x9b, 0x3e, 0x54, 0x5b, 0x95, 0x40, 0x38, 0x3a, 0x11, 0x52, 0xf5, 0x87, 0xd6, 0x68, 0x62,
+            0x75, 0xad, 0xd1, 0x9c, 0xdb, 0x9d, 0xff, 0x51, 0xf5, 0x8e, 0x73, 0x93, 0x1c, 0xc2, 0xf7, 0xda,
+            0xc1, 0xaa, 0x1c, 0x78, 0x84, 0x8f, 0x6b, 0x90, 0x22, 0x92, 0x80, 0x99, 0x56, 0x07, 0x65, 0xb8,
+            0x20, 0x45, 0xca, 0xc1, 0x2a, 0x0d, 0x75, 0xe8, 0xac, 0xd0, 0x09, 0x5d, 0x59, 0xd7, 0x01, 0xe6,
+            0xc8, 0x59, 0xf9, 0x3c, 0xaa, 0xf0, 0x8e, 0xb4, 0x97, 0x59, 0x0c, 0x21, 0x54, 0x7e, 0x69, 0x75,
+            0x19, 0x91, 0xc5, 0x5e, 0x7e, 0xce, 0xfa, 0x25, 0x04, 0xf7, 0xda, 0xd1, 0x3e, 0x48, 0xb7, 0x19,
+            0xee, 0x4b, 0x78, 0xd5, 0x97, 0xca, 0x27, 0xa2, 0x20, 0x0b, 0x94, 0x26, 0xc1, 0x56, 0x03, 0xf5,
+            0x3f, 0xfb, 0x02, 0x02, 0x19, 0x20, 0x89, 0x87, 0xac, 0x41, 0x47, 0x4f, 0x2e, 0x28, 0xf5, 0xdb,
+            0x20, 0xe8, 0x99, 0xdc, 0x4c, 0xc0, 0xf9, 0x1b, 0x42, 0x2c, 0xbc, 0xf7, 0xec, 0x20, 0xc0, 0x86,
+            0xc8, 0x33, 0xf5, 0x3d, 0x7a, 0x1b, 0x68, 0xd3, 0x30, 0xb4, 0x63, 0xef, 0x9b, 0xa9, 0xd1, 0x01,
+            0x45, 0xa7, 0x8b, 0x38, 0x5c, 0x90, 0x59, 0xc9, 0x67, 0x80, 0xe6, 0x68, 0x9f, 0x9d, 0xd4, 0x9f,
+            0x27, 0x87, 0x92, 0x9d, 0x91, 0xe7, 0x2c, 0xc1, 0xc3, 0x3b, 0xa4, 0x9e, 0x06, 0x75, 0x5f, 0x88,
+            0x94, 0x08, 0xd5, 0xc5, 0xec, 0x8f, 0xb5, 0xa9, 0xe3, 0xc9, 0x56, 0x92, 0x5e, 0x92, 0x7e, 0xad,
+            0x4d, 0xd7, 0xf7, 0x2d, 0xc7, 0xbd, 0x6b, 0xe7, 0x65, 0xa2, 0xda, 0xeb, 0x17, 0xa9, 0xd7, 0x13,
+            0x0f, 0x41, 0xba, 0x68, 0x46, 0xf8, 0x37, 0xb6, 0x53, 0xef, 0xb0, 0x3b, 0xa1, 0x1c, 0xcd, 0x46,
+            0x0c, 0xfa, 0x3c, 0x93, 0x9c, 0xc1, 0x99, 0xf5, 0x58, 0x5e, 0x27, 0x42, 0x0d, 0x50, 0xf9, 0x0c,
+            0x1d, 0xc2, 0xd9, 0x20
+    ];
+
     #[test]
-    fn set_information_user2_names_the_class_and_refuses() {
-        // The call a join makes last. This crate has no store, so the answer is `NOT_SUPPORTED` - and
-        // the class has to be read correctly anyway, because the log line is the only thing that says
-        // which write is missing. Reading the enum as a word instead of a half word would name the
-        // class from half a number and the first two octets of the union.
+    fn a_password_a_client_encrypted_opens_under_its_session_key() {
+        let password = open_password(
+            PASSWORD_BLOCK,
+            [0x22; 16],
+            crate::server::SessionKey([0x11; 16]),
+        )
+        .expect("the block must open under the key it was sealed with");
+
+        let text = String::from_utf16_lossy(
+            &password
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(text, "Pässwörd-123", "read from the end of the buffer");
+    }
+
+    #[test]
+    fn the_same_password_block_does_not_open_under_another_key() {
+        // The salt is what makes this so: two sessions never share one, so a block captured from one
+        // is worthless in the other, and a server that ignored the salt would auth the wrong thing.
+        assert!(
+            open_password(
+                PASSWORD_BLOCK,
+                [0x22; 16],
+                crate::server::SessionKey([0x12; 16]),
+            )
+            .is_none(),
+            "another session key must not produce a password"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_information_user2_names_the_class_and_refuses() {
+        // The class has to be read correctly even when it is not answered, because the log line is
+        // the only thing that says which write is missing. Reading the enum as a word instead of a
+        // half word would name the class from half a number and the first two octets of the union.
+        let server = state(config());
+        let handle = server.remember_samr_user("samba$");
         let mut writer = NdrWriter::new();
-        writer.bytes(&samr_handle());
+        writer.bytes(&handle);
         writer.u16(4); // UserAccountInformation
         writer.raw(&[0u8; 32]); // the union's arm, unread
         let stub = writer.finish();
-
-        let body = set_information_user2(&state(config()), &stub).expect("answered");
+        let body = set_information_user2(&server, &caller(), &stub)
+            .await
+            .expect("answered");
         assert_eq!(body.len(), 4, "only a status comes back");
         assert_eq!(
             u32::from_le_bytes(body[..4].try_into().unwrap()),

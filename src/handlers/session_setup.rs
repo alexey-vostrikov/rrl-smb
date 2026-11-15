@@ -296,6 +296,23 @@ async fn accept_kerberos(
     // different one - `1.2.840.113554.1.2.2` when it asked for `1.2.840.48018.1.2.2` - is what an SMB
     // client reports as `SEC_E_INVALID_TOKEN`, having no field to say which mechanism it disliked.
     let selected_mech = crate::proto::auth::spnego::offered_kerberos(&init.mech_types);
+    // RFC 4121 §4.1: a mechanism token is a two-octet `TOK_ID` and then the message - `01 00` for an
+    // AP-REQ, `02 00` for an AP-REP. Sending the bare `[APPLICATION 15]` is a token a Samba or MIT
+    // client refuses while parsing it: measured, `smbclient -k` answered "ASN.1 identifier doesn't
+    // match expected value" for an AP-REP whose DER was correct, because the identifier it read first
+    // was the application tag where the TOK_ID belongs.
+    let ap_rep = identity.ap_rep.as_deref().map(|token| {
+        let inner = mechanism_token(token);
+        // `RRL_SMB_KRB_GSS` keeps the GSS envelope in `identity.ap_rep`; the `TOK_ID` is inside it
+        // already, and prepending another would make the token unreadable.
+        if std::env::var_os("RRL_SMB_KRB_GSS").is_some() {
+            return inner.to_vec();
+        }
+        let mut framed = Vec::with_capacity(2 + inner.len());
+        framed.extend_from_slice(&[0x02, 0x00]);
+        framed.extend_from_slice(inner);
+        framed
+    });
     let response_token = encode_resp_token(
         if two_rounds {
             NegState::AcceptIncomplete
@@ -303,7 +320,7 @@ async fn accept_kerberos(
             NegState::AcceptCompleted
         },
         selected_mech,
-        identity.ap_rep.as_deref().map(mechanism_token),
+        ap_rep.as_deref(),
         None,
     );
     if tracing::enabled!(tracing::Level::DEBUG) {

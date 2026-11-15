@@ -58,12 +58,30 @@ impl ShareAcl {
     }
 }
 
+/// The key a client encrypted something with, which only the session holds.
+///
+/// `samr` needs it for one thing: the password a join sets arrives RC4-encrypted under the SMB
+/// session key, so a server without the key cannot read the value it is being asked to store. Kept
+/// apart from a bare `[u8; 16]` because this type ends up inside `Caller`, which is logged: the key
+/// is a credential, and a `Debug` that printed it would put it in a terminal and in every log that
+/// follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionKey(pub(crate) [u8; 16]);
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionKey(<redacted>)")
+    }
+}
+
 /// A session as share admission sees it.
 #[derive(Debug, Clone)]
 pub(crate) struct Caller {
     pub identity: Identity,
     /// The session has encryption keys.
     pub can_encrypt: bool,
+    /// The session key, for the one call that carries a password the client encrypted.
+    pub session_key: SessionKey,
 }
 
 impl Caller {
@@ -71,6 +89,7 @@ impl Caller {
         Self {
             identity: session.identity.clone(),
             can_encrypt: session.cipher.is_some(),
+            session_key: SessionKey(session.session_base_key),
         }
     }
 }
