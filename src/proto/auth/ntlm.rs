@@ -924,10 +924,15 @@ impl NtlmServer {
             let _ = std::fs::write(
                 format!("/stand/ntlm-keys-{seq}.txt"),
                 format!(
-                    "flags={:08x}\nmic_present={}\nkey_exchange_key={}\nunwrapped={}\nsession_key={}\n",
+                    "flags={:08x}\nmic_present={}\nkey_exchange_key={}\nencrypted_session_key={}\nunwrapped={}\nsession_key={}\n",
                     auth.flags,
                     auth.mic.is_some(),
                     hex(&key_exchange_key),
+                    hex(auth
+                        .encrypted_random_session_key
+                        .as_slice()
+                        .try_into()
+                        .unwrap_or(&[0u8; 16]),),
                     unwrapped.map(|key| hex(&key)).unwrap_or_default(),
                     hex(&session_key),
                 ),

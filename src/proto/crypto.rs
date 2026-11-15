@@ -16,6 +16,6 @@ pub mod preauth;
 pub mod sign;
 
 pub use encrypt::{Cipher, SessionCipher, TRANSFORM_HEADER_LEN};
-pub use kdf::{signing_key_30, signing_key_311};
+pub use kdf::{application_key_30, application_key_311, signing_key_30, signing_key_311};
 pub use preauth::PreauthIntegrity;
 pub use sign::{SigningAlgo, sign, verify};

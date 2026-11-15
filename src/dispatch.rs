@@ -896,6 +896,18 @@ async fn dispatch_one(
                             Some(&snap),
                         )));
                     }
+                    // MS-SMB2 §3.2.5.3: the key an RPC payload is sealed with. Samba's
+                    // `smb2_signing_derivation` switches the label to `SMBAppKey` with this
+                    // pre-auth hash as the context as soon as the dialect reaches 3.1.1, and this is
+                    // the key a client uses - not the base key, and not the 3.0 `SMB2APP`/`SmbRpc`.
+                    // Measured: with the base key a Windows join's password block never opened;
+                    // with this one it does, and the join goes on past `SetInformationUser2`.
+                    if !sess.is_anonymous() {
+                        sess.application_key = crate::proto::crypto::application_key_311(
+                            &sess.session_base_key,
+                            &snap,
+                        );
+                    }
                     // Diagnostic, under `RRL_PW_DIAG`: the keys SMB 3.1.1 actually runs on. The
                     // question `samr` cannot answer - "which key sealed this password block" - is
                     // answered by trying the derived ones beside the raw session key, and they only
@@ -1126,6 +1138,24 @@ async fn verify_request_signature(
         if let Err(e) = crate::proto::crypto::verify(frame, &key, algo) {
             warn!(error = %e, "request signature verification failed");
             return Err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+        // Diagnostic, under `RRL_PW_DIAG`: a *successful* check, written down. "No failures in the
+        // log" is not evidence that signatures were checked at all, and the whole argument that the
+        // session key is right rests on this test having run.
+        if std::env::var_os("RRL_PW_DIAG").is_some() {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/stand/signatures.log")
+            {
+                let _ = writeln!(
+                    file,
+                    "ok {:?} key={}",
+                    hdr.command,
+                    key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                );
+            }
         }
     } else if hdr.command != Command::SessionSetup {
         let sess = sess_arc.read().await;

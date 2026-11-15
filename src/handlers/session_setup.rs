@@ -406,6 +406,14 @@ async fn finish_kerberos(
     };
 
     let session_base_key = identity.session_key;
+    // MS-SMB2 §3.2.5.3: from 3.0 the key an RPC payload is sealed with is derived from this one.
+    // 3.1.1 derives it once its pre-auth hash is known, in `dispatch`.
+    let application_key = match dialect {
+        Dialect::Smb300 | Dialect::Smb302 => {
+            crate::proto::crypto::application_key_30(&session_base_key)
+        }
+        _ => session_base_key,
+    };
     let cipher = *conn.cipher.read().await;
     let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
     let session_flags = if encrypt_data {
@@ -441,6 +449,7 @@ async fn finish_kerberos(
         None,
     );
     session.encrypt_data = encrypt_data;
+    session.application_key = application_key;
     // SMB 3.1.1 keys come from the preauth hash, once it is known.
     if dialect != Dialect::Smb311
         && let Some(cipher) = cipher
@@ -803,6 +812,16 @@ async fn continue_exchange(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
 
+    // MS-SMB2 §3.2.5.3: from 3.0 the key an RPC payload is sealed with is derived, not the base key.
+    // 3.1.1 derives it in `dispatch`, once the pre-auth hash is known; below 3.0 nothing is derived.
+    let application_key = match dialect {
+        Dialect::Smb300 | Dialect::Smb302 => {
+            crate::proto::crypto::application_key_30(&session_base_key)
+        }
+        Dialect::Smb311 => [0u8; 16],
+        _ => session_base_key,
+    };
+
     // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL, guest
     // sessions IS_GUEST. Authenticated sessions on a connection with a
     // cipher get encryption keys, and are encrypted when the server
@@ -866,6 +885,7 @@ async fn continue_exchange(
         None,
     );
     session.encrypt_data = encrypt_data;
+    session.application_key = application_key;
     // SMB 3.1.1 keys come from the preauth hash, once it is known.
     if dialect != Dialect::Smb311
         && let Some(cipher) = cipher

@@ -73,6 +73,25 @@ pub fn signing_key_311(session_key: &[u8], preauth_hash: &[u8; 64]) -> [u8; 16] 
     smb2_kdf(session_key, b"SMBSigningKey\x00", preauth_hash)
 }
 
+/// Application key for SMB 3.0 / 3.0.2.
+///
+/// Label `"SMB2APP\x00"`, context `"SmbRpc\x00"` — `smb2_signing.c` in Samba derives exactly these
+/// for `protocol >= PROTOCOL_SMB3_00` and below 3.1.1.
+pub fn application_key_30(session_key: &[u8]) -> [u8; 16] {
+    smb2_kdf(session_key, b"SMB2APP\x00", b"SmbRpc\x00")
+}
+
+/// Application key for SMB 3.1.1.
+///
+/// Label `"SMBAppKey\x00"`, context the pre-auth integrity hash. Not `SMB2APP`/`SmbRpc`: Samba's
+/// `smb2_signing_derivation` switches both names when the dialect reaches 3.1.1, and this is the key
+/// a client seals an RPC password block with. Measured: a Windows Server 2022 join's block opens
+/// under this key and under no other, and the whole `samr_SetInformationUser2` failure was this
+/// derivation.
+pub fn application_key_311(session_key: &[u8], preauth_hash: &[u8; 64]) -> [u8; 16] {
+    smb2_kdf(session_key, b"SMBAppKey\x00", preauth_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
