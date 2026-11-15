@@ -134,7 +134,7 @@ pub(crate) async fn serve(
         OPNUM_CREATE_USER2 => create_user2(server, stub).await,
         OPNUM_SET_INFO_USER2 => set_information_user2(server, _caller, stub).await,
         OPNUM_QUERY_INFO_USER => query_information_user(server, stub).await,
-        OPNUM_DELETE_USER => delete_user(stub),
+        OPNUM_DELETE_USER => delete_user(server, stub).await,
         OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
         other => dispatch(&server.config, other, stub),
     }
@@ -610,14 +610,38 @@ fn user_domain_password_information(stub: &[u8]) -> Result<Vec<u8>, Fault> {
 ///
 /// A join that fails after creating its account deletes that account, and a server that refuses the
 /// delete leaves the directory holding an object nobody will use - the name the next attempt wants.
-fn delete_user(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+async fn delete_user(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    let Some(_handle) = reader.bytes(20) else {
+    let Some(handle) = reader.bytes(20) else {
         return Err(malformed_at("user_handle", stub));
     };
-    tracing::warn!("samr: DeleteUser - the client is undoing an account it created");
+
+    // A join that gives up deletes the account it just created, and a server that refuses leaves
+    // an object nobody will use holding the name the next attempt wants. Measured: the account
+    // survived the refusal and the following run went down a different path, because a machine
+    // account that exists takes the `already exists` branch on the way in.
+    let Some(name) = server.samr_user(handle) else {
+        tracing::warn!("samr: DeleteUser on a handle this server did not hand out");
+        let mut writer = NdrWriter::new();
+        writer.u32(NTSTATUS_INVALID_HANDLE);
+        return Ok(writer.finish());
+    };
+
+    let deleted = match server.config.machine_accounts.as_ref() {
+        Some(accounts) => accounts.delete_machine(&name).await,
+        None => false,
+    };
+    server.forget_samr_user(handle);
+
     let mut writer = NdrWriter::new();
-    writer.u32(NTSTATUS_NOT_SUPPORTED);
+    writer.u32(if deleted {
+        NTSTATUS_SUCCESS
+    } else {
+        // The account is gone already, or the directory refused. Either way the handle is spent,
+        // and a client that retries with it must not address whatever the number names next.
+        NTSTATUS_OBJECT_NAME_NOT_FOUND
+    });
+    tracing::info!(account = %name, deleted, "samr: DeleteUser");
     Ok(writer.finish())
 }
 
@@ -841,21 +865,49 @@ fn open_password(
     use md5::{Digest, Md5};
     use rc4::{KeyInit, Rc4, StreamCipher};
 
-    let mut digest = Md5::new();
-    digest.update(salt);
-    digest.update(key.0);
-    let rc4_key = digest.finalize();
-
+    // Two orders exist in the wild: MS-SAMR 3.2.2.2 hashes the salt first, and Samba's own
+    // `samba_gnutls_arcfour_confounded_md5` takes (confounder, key) in that same order - so the
+    // salt-first form is the one to try first. The other is tried because a buffer that will not
+    // open gives no clue which side is wrong, and a wrong order fails identically to a wrong key.
     let mut plain = cipher.to_vec();
-    let mut stream = Rc4::new_from_slice(&rc4_key).expect("a 16-octet RC4 key");
-    stream.apply_keystream(&mut plain);
-
-    // `wchar_t Buffer[256]` and then `unsigned long Length`, both inline.
-    let length = u32::from_le_bytes(plain.get(512..516)?.try_into().ok()?) as usize;
-    if length == 0 || length > 512 || length % 2 != 0 {
-        return None;
+    for (index, order) in [true, false].into_iter().enumerate() {
+        let mut digest = Md5::new();
+        if order {
+            digest.update(salt);
+            digest.update(key.0);
+        } else {
+            digest.update(key.0);
+            digest.update(salt);
+        }
+        let rc4_key = digest.finalize();
+        let mut attempt = cipher.to_vec();
+        let mut stream = Rc4::new_from_slice(&rc4_key).expect("a 16-octet RC4 key");
+        stream.apply_keystream(&mut attempt);
+        let length = u32::from_le_bytes(attempt.get(512..516)?.try_into().ok()?) as usize;
+        if length == 0 || length > 512 || length % 2 != 0 || length % 2 != 0 {
+            continue;
+        }
+        // A password is UTF-16 text; random octets are not. This is what tells a successful
+        // decryption from one that produced a plausible-looking `Length` by chance.
+        let candidate = &attempt[512 - length..512];
+        if !candidate
+            .chunks_exact(2)
+            .all(|pair| pair[1] == 0 || (0x04..=0x08).contains(&pair[1]))
+        {
+            continue;
+        }
+        tracing::debug!(
+            order = if index == 0 {
+                "salt-first"
+            } else {
+                "key-first"
+            },
+            "samr: the password block opened"
+        );
+        plain = attempt;
+        return Some(plain[512 - length..512].to_vec());
     }
-    Some(plain[512 - length..512].to_vec())
+    None
 }
 
 /// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.6.28).
@@ -1298,6 +1350,10 @@ mod tests {
 
         async fn machine_control(&self, name: &str) -> Option<u32> {
             name.ends_with('$').then_some(0x1000)
+        }
+
+        async fn delete_machine(&self, name: &str) -> bool {
+            name.ends_with('$')
         }
     }
 
