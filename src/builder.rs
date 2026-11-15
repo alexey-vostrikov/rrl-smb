@@ -338,6 +338,7 @@ pub struct SmbServerBuilder {
     machine_secrets: Option<std::sync::Arc<dyn crate::server::MachineSecrets>>,
     logon_users: Option<std::sync::Arc<dyn crate::server::LogonUsers>>,
     machine_passwords: Option<std::sync::Arc<dyn crate::server::MachinePasswords>>,
+    machine_accounts: Option<std::sync::Arc<dyn crate::server::MachineAccounts>>,
     netlogon_des: bool,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
     domain_netbios: Option<String>,
@@ -398,6 +399,7 @@ impl SmbServerBuilder {
             machine_secrets: None,
             logon_users: None,
             machine_passwords: None,
+            machine_accounts: None,
             netlogon_des: false,
             domain_netbios: None,
             max_read_size: 1024 * 1024,
@@ -470,6 +472,18 @@ impl SmbServerBuilder {
         passwords: std::sync::Arc<dyn crate::server::MachinePasswords>,
     ) -> Self {
         self.machine_passwords = Some(passwords);
+        self
+    }
+
+    /// Where `samr_CreateUser2` creates the machine account a join asks for.
+    ///
+    /// Without it a join stops at `0x32` (`ERROR_NOT_SUPPORTED`): everything before the account
+    /// creation answers, and the account the member needs is the one call this crate cannot make.
+    pub fn machine_accounts(
+        mut self,
+        accounts: std::sync::Arc<dyn crate::server::MachineAccounts>,
+    ) -> Self {
+        self.machine_accounts = Some(accounts);
         self
     }
 
@@ -842,6 +856,7 @@ impl SmbServerBuilder {
             machine_secrets: self.machine_secrets.clone(),
             logon_users: self.logon_users.clone(),
             machine_passwords: self.machine_passwords.clone(),
+            machine_accounts: self.machine_accounts.clone(),
             netlogon_des: self.netlogon_des,
             domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,

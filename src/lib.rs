@@ -440,8 +440,8 @@ pub use proto::auth::ntlm::{AuthOutcome, Identity, NtlmServer, NtlmTargetInfo, U
 // `NegTokenResp` is not SMB's and a second encoder would be a second place to be wrong about DER.
 pub use proto::auth::spnego::{NegState, encode_resp_token};
 pub use server::{
-    ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachinePasswords,
-    MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
+    ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachineAccounts,
+    MachinePasswords, MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
 };
 pub use stream::{StreamInfo, StreamName};
 
