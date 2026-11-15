@@ -330,6 +330,22 @@ impl Association {
                 "rpc: authenticated pdu"
             );
         }
+        // What the client attached to *this* call, under the diagnostic switch: a password that
+        // will not open is either a wrong key or a different key, and `auth_type` on the request
+        // PDU is what tells the two apart. A client that authenticates the RPC association itself
+        // (MS-RPCE, `RPC_C_AUTHN_WINNT`) encrypts under that conversation's key, not the SMB
+        // session's, and reading the code cannot say which one arrived.
+        if std::env::var_os("RRL_PW_DIAG").is_some()
+            && let Some(auth) = pdu.auth.as_ref()
+        {
+            debug!(
+                ptype = header.ptype,
+                auth_type = auth.auth_type,
+                auth_level = auth.auth_level,
+                token = auth.token.len(),
+                "rpc: a PDU carrying an auth verifier"
+            );
+        }
         let step = self.dispatch(&header, pdu.body, pdu.auth.as_ref(), key_for);
         self.current_call_id = self.current_call_id.max(header.call_id);
         step

@@ -785,6 +785,19 @@ async fn continue_exchange(
     }
 
     let session_base_key = outcome.session_key;
+    // Diagnostic only, under `RRL_PW_DIAG`: the key this session will hand to `samr`, written per
+    // session so it can be compared with the one the samr call reports. Deleting the answer to
+    // "which key encrypted the join's password" by reading the code is how the offset was guessed
+    // wrong once already.
+    if std::env::var_os("RRL_PW_DIAG").is_some() {
+        let _ = std::fs::write(
+            format!("/stand/setup-key-{sid}.txt"),
+            session_base_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+    }
     let dialect = *conn.dialect.read().await;
     let Some(dialect) = dialect else {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
