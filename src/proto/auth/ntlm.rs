@@ -922,7 +922,7 @@ impl NtlmServer {
             let hex =
                 |bytes: &[u8; 16]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let _ = std::fs::write(
-                "/stand/ntlm-keys.txt",
+                format!("/stand/ntlm-keys-{seq}.txt"),
                 format!(
                     "flags={:08x}\nmic_present={}\nkey_exchange_key={}\nunwrapped={}\nsession_key={}\n",
                     auth.flags,

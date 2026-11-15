@@ -38,6 +38,7 @@ const SAMR_CONNECT_AFTER_W2K: u32 = 3;
 
 /// MS-ERREF: the call is understood and this server does not do it.
 const NTSTATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const NTSTATUS_WRONG_PASSWORD: u32 = 0xC000_006A;
 const NTSTATUS_SUCCESS: u32 = 0x0000_0000;
 /// `STATUS_NONE_MAPPED`: none of the names resolved. An error, not a warning: a client that read
 /// RID 0 with success would treat account zero as the account it asked for.
@@ -808,6 +809,56 @@ async fn set_information_user2(
                 NTSTATUS_NOT_SUPPORTED
             });
         }
+        // `UserInternal4Information` (23): the same structure as 25 with the **older** password
+        // block - `SAMPR_ENCRYPTED_USER_PASSWORD` (MS-SAMR 2.2.6.20), 516 octets with no salt,
+        // encrypted with the session key itself. This is the class `rpcclient setuserinfo2` and
+        // Samba's `net rpc password` send, and answering it is what turns a second, independent
+        // client into a test of the key: its password is one the operator typed.
+        USER_INTERNAL4_INFORMATION => {
+            let Some(cipher) =
+                stub.get(PASSWORD_BLOCK_AT..PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN)
+            else {
+                tracing::warn!(account = %account, octets = stub.len(), "samr: class 23 without a password block");
+                writer.u32(NTSTATUS_NOT_SUPPORTED);
+                return Ok(writer.finish());
+            };
+            if std::env::var_os("RRL_PW_DIAG").is_some() {
+                let _ = std::fs::write("/stand/setinfo23.bin", stub);
+                let _ = std::fs::write(
+                    "/stand/sessionkey23.txt",
+                    caller
+                        .session_key
+                        .0
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                );
+            }
+            let Some(password) = open_password_unsalted(cipher, caller.session_key) else {
+                tracing::warn!(
+                    account = %account,
+                    "samr: the password in class 23 does not open under this session's key"
+                );
+                writer.u32(NTSTATUS_WRONG_PASSWORD);
+                return Ok(writer.finish());
+            };
+            let stored = match server.config.machine_passwords.as_ref() {
+                Some(passwords) => passwords.set_password(&account, &password).await,
+                None => false,
+            };
+            tracing::info!(
+                account = %account,
+                octets = password.len(),
+                stored,
+                class = 23,
+                "samr: a password was set"
+            );
+            writer.u32(if stored {
+                NTSTATUS_SUCCESS
+            } else {
+                NTSTATUS_NOT_SUPPORTED
+            });
+        }
         other => {
             tracing::warn!(
                 class = other,
@@ -823,6 +874,7 @@ async fn set_information_user2(
 }
 
 /// `USER_INFORMATION_CLASS` 25 (MS-SAMR 2.2.6.28): every attribute, plus an encrypted password.
+const USER_INTERNAL4_INFORMATION: u32 = 23;
 const USER_INTERNAL4_INFORMATION_NEW: u32 = 25;
 
 /// `SAMPR_ENCRYPTED_USER_PASSWORD_NEW` (MS-SAMR 2.2.6.22): the ciphertext, then its salt.
@@ -869,7 +921,6 @@ fn open_password(
     // `samba_gnutls_arcfour_confounded_md5` takes (confounder, key) in that same order - so the
     // salt-first form is the one to try first. The other is tried because a buffer that will not
     // open gives no clue which side is wrong, and a wrong order fails identically to a wrong key.
-    let mut plain = cipher.to_vec();
     for (index, order) in [true, false].into_iter().enumerate() {
         let mut digest = Md5::new();
         if order {
@@ -883,19 +934,11 @@ fn open_password(
         let mut attempt = cipher.to_vec();
         let mut stream = Rc4::new_from_slice(&rc4_key).expect("a 16-octet RC4 key");
         stream.apply_keystream(&mut attempt);
-        let length = u32::from_le_bytes(attempt.get(512..516)?.try_into().ok()?) as usize;
-        if length == 0 || length > 512 || length % 2 != 0 || length % 2 != 0 {
-            continue;
-        }
         // A password is UTF-16 text; random octets are not. This is what tells a successful
         // decryption from one that produced a plausible-looking `Length` by chance.
-        let candidate = &attempt[512 - length..512];
-        if !candidate
-            .chunks_exact(2)
-            .all(|pair| pair[1] == 0 || (0x04..=0x08).contains(&pair[1]))
-        {
+        let Some(password) = password_at_the_end(&attempt) else {
             continue;
-        }
+        };
         tracing::debug!(
             order = if index == 0 {
                 "salt-first"
@@ -904,10 +947,44 @@ fn open_password(
             },
             "samr: the password block opened"
         );
-        plain = attempt;
-        return Some(plain[512 - length..512].to_vec());
+        return Some(password);
     }
     None
+}
+
+/// The password inside a 516-octet block encrypted with the session key itself.
+///
+/// `SAMPR_ENCRYPTED_USER_PASSWORD` (MS-SAMR 2.2.6.20): no salt and no MD5, unlike the `_NEW` form -
+/// the RC4 key *is* the session key. Class 23 is where a client that is not a Windows join puts a
+/// password, and answering it is what makes a second client a usable test of the key: its password
+/// is one an operator typed, so a block that opens proves the key and one that does not disproves it.
+fn open_password_unsalted(cipher: &[u8], key: crate::server::SessionKey) -> Option<Vec<u8>> {
+    use rc4::{KeyInit, Rc4, StreamCipher};
+
+    let mut plain = cipher.to_vec();
+    let mut stream = Rc4::new_from_slice(&key.0).expect("a 16-octet RC4 key");
+    stream.apply_keystream(&mut plain);
+    password_at_the_end(&plain)
+}
+
+/// The password at the end of a `SAMPR_USER_PASSWORD` buffer, if the buffer reads like one.
+///
+/// `WCHAR Buffer[256]` then `ULONG Length`: the value occupies the *last* `Length` octets, so a
+/// buffer whose length word is nonsense is not a password at all. Checked for the shape of UTF-16
+/// text as well, because a wrong key can produce a `Length` that happens to fit.
+fn password_at_the_end(plain: &[u8]) -> Option<Vec<u8>> {
+    let length = u32::from_le_bytes(plain.get(512..516)?.try_into().ok()?) as usize;
+    if length == 0 || length > 512 || length % 2 != 0 {
+        return None;
+    }
+    let candidate = plain.get(512 - length..512)?;
+    if !candidate
+        .chunks_exact(2)
+        .all(|pair| pair[1] == 0 || (0x04..=0x08).contains(&pair[1]))
+    {
+        return None;
+    }
+    Some(candidate.to_vec())
 }
 
 /// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.6.28).
