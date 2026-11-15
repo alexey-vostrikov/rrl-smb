@@ -903,6 +903,37 @@ impl NtlmServer {
             }
         }
 
+        // Diagnostic only, under `RRL_PW_DIAG`, for the one question the code below cannot answer
+        // by being read: which of the two candidate session keys the client actually used to
+        // encrypt the password a join sets. `samr` gets `session_key` and nothing else, so when a
+        // password arrives that will not open, the material to test against is the only thing that
+        // settles it. Never written unless the operator asks, and the values are gone at restart.
+        if std::env::var_os("RRL_PW_DIAG").is_some() {
+            // The whole conversation, so the key can be recomputed from the password by hand: a
+            // session key that is wrong on both sides looks exactly like a password that will not
+            // open, and only the transcript tells them apart.
+            // One file per conversation: a join runs two of them (the pipe and the directory), and
+            // whichever finishes last would otherwise be the only one kept.
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(format!("/stand/auth-{seq}.bin"), &auth.raw);
+            let _ = std::fs::write(format!("/stand/challenge-{seq}.bin"), self.server_challenge);
+            let _ = std::fs::write(format!("/stand/negotiate-{seq}.bin"), &self.negotiate_bytes);
+            let hex =
+                |bytes: &[u8; 16]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let _ = std::fs::write(
+                "/stand/ntlm-keys.txt",
+                format!(
+                    "flags={:08x}\nmic_present={}\nkey_exchange_key={}\nunwrapped={}\nsession_key={}\n",
+                    auth.flags,
+                    auth.mic.is_some(),
+                    hex(&key_exchange_key),
+                    unwrapped.map(|key| hex(&key)).unwrap_or_default(),
+                    hex(&session_key),
+                ),
+            );
+        }
+
         Ok(AuthOutcome {
             identity: Identity::User {
                 user: auth.user.clone(),
