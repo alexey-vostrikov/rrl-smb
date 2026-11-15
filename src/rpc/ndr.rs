@@ -70,6 +70,9 @@ impl<'a> NdrReader<'a> {
         let len = actual_count as usize * 2;
         let bytes = self.stub.get(self.at..self.at + len)?;
         self.at += len;
+        // `chunks_exact(2)` here is two octets at a time in a loop that also has to work on the
+        // empty slice below, and `as_chunks` would change the type at every call site for nothing.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let mut units: Vec<u16> = bytes
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -78,6 +81,31 @@ impl<'a> NdrReader<'a> {
             units.pop();
         }
         Some(units)
+    }
+
+    /// A conformant varying string that is allowed to be **empty**.
+    ///
+    /// [`Self::string`] refuses `actual_count == 0`, which is right for a name that has to name
+    /// something - an empty one there is a malformed request, not a short answer. It is wrong for a
+    /// parameter where the empty string is a question of its own: `samr_LookupDomain` is called with
+    /// one by a Windows join asking "which domain is this server?", and reading its absence as a
+    /// parse failure answered `STATUS_NO_SUCH_DOMAIN` instead.
+    pub(crate) fn string_or_empty(&mut self) -> Option<Vec<u16>> {
+        let saved = self.at;
+        if let Some(units) = self.string() {
+            return Some(units);
+        }
+        // Not a string with content: try the empty form, which is a zero maximum, a zero offset and
+        // a zero actual count.
+        self.at = saved;
+        let max_count = self.u32()?;
+        let offset = self.u32()?;
+        let actual_count = self.u32()?;
+        if offset == 0 && actual_count == 0 && max_count == 0 {
+            return Some(Vec::new());
+        }
+        self.at = saved;
+        None
     }
 }
 
