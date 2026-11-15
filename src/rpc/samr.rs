@@ -420,19 +420,40 @@ fn open_domain(stub: &[u8]) -> Result<Vec<u8>, Fault> {
 fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     let _handle = reader.bytes(20);
-    // `RPC_UNICODE_STRING` is `{ Length <H, MaximumLength <H, Data LPWSTR }` - two two-octet
-    // lengths and *then* the pointer to the characters. Reading it as a bare pointer consumed the
-    // two lengths as that pointer and then read the pointer as a string header, so every name came
-    // out as nonsense, `matches` was false, and the client was told `STATUS_NO_SUCH_DOMAIN` for the
-    // domain it had just enumerated: `NetpProvisionComputerAccount: 0x54b`.
+    // The order is the pointer *first* and the struct after it, because the parameter is a
+    // `[in,string] RPC_UNICODE_STRING *`: NDR writes the referent id, then the constructed type -
+    // `{ Length <H, MaximumLength <H, Data LPWSTR }` - and only then the characters behind their own
+    // pointer. Reading the lengths first consumed the referent as `Length = 1, MaximumLength = 0`,
+    // the name came out as `None`, and the client was told `STATUS_NO_SUCH_DOMAIN` for the domain it
+    // had just enumerated: `NetpProvisionComputerAccount: 0x54b`.
+    //
+    // The bytes, from a Windows Server 2022 join - twenty-eight of them, with no pointer to the
+    // characters at all:
+    //     <handle 20>  01 00 00 00  00 00  00 00
+    //                  referent    Length  Max
+    let _present = reader.pointer();
     let _length = reader.u16();
     let _maximum = reader.u16();
-    let _present = reader.pointer();
-    let name = reader
-        .string()
-        .map(|units| String::from_utf16_lossy(&units).trim().to_string());
+    // Both lengths zero *is* the empty name, and a Windows join sends exactly that - 28 octets in
+    // all: the handle, the referent, and two zero half-words. The client does not even write the
+    // pointer to the characters when there are none, so reading one here consumed nothing and
+    // everything after it failed.
+    let empty = _length == Some(0) && _maximum == Some(0);
+    let _buffer = reader.pointer();
+    let name = if empty {
+        Some(String::new())
+    } else {
+        reader
+            .string_or_empty()
+            .map(|units| String::from_utf16_lossy(&units).trim().to_string())
+    };
 
+    // An **empty** name is the question "which domain is this?", and it is the one a Windows join
+    // actually asks: the capture above carries `Length = 0`. Answering it with this server's SID is
+    // not the leniency the next paragraph refuses - nothing was claimed to exist - and refusing it
+    // leaves the client with `0x54b` for the domain it just enumerated.
     let matches = match (&name, &config.domain_netbios, &config.dns_domain) {
+        (Some(name), _netbios, _dns) if name.is_empty() => true,
         (Some(name), Some(netbios), dns) => {
             name.eq_ignore_ascii_case(netbios)
                 || dns
@@ -442,6 +463,15 @@ fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Ve
         _ => false,
     };
 
+    tracing::debug!(
+        stub = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        name = ?name,
+        netbios = ?config.domain_netbios,
+        dns = ?config.dns_domain,
+        matches,
+        sid = config.domain_sid.is_some(),
+        "samr: LookupDomain"
+    );
     let sid = config.domain_sid.as_deref().filter(|_| matches);
     let mut writer = NdrWriter::new();
     match sid {
@@ -609,11 +639,31 @@ mod tests {
         let mut reader = NdrWriter::new();
         reader.bytes(&samr_handle());
         let octets = u16::try_from(name.encode_utf16().count() * 2).expect("a short name");
+        reader.pointer(true); // the referent, before the struct it points at
         reader.u16(octets); // Length
         reader.u16(octets); // MaximumLength
-        reader.pointer(true);
+        reader.pointer(true); // the characters, behind a pointer of their own
         reader.string(name);
         reader.finish()
+    }
+
+    /// The exact 28 octets a Windows Server 2022 sends as `samr_LookupDomain`, with an empty name.
+    #[test]
+    fn the_lookup_domain_a_windows_join_sends_is_read_and_answered() {
+        let stub = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x73, 0x61, 0x6d, 0x72, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let body = dispatch(&config(), OPNUM_LOOKUP_DOMAIN, &stub).expect("answered");
+
+        // `[out,ref] dom_sid2 *`: a referent, the SID, then the status.
+        assert_ne!(&body[..4], &[0, 0, 0, 0], "the SID is a real pointer");
+        let status = &body[body.len() - 4..];
+        assert_eq!(
+            u32::from_le_bytes(status.try_into().unwrap()),
+            NTSTATUS_SUCCESS,
+            "an empty name is the question \"which domain is this?\", not a name to refuse"
+        );
     }
 
     #[test]

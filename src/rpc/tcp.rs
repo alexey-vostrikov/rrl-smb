@@ -332,7 +332,6 @@ fn spnego_answer(
     }
 }
 
-
 /// Opens a call sealed at level 6, or says why it cannot be.
 ///
 /// The token is in two pieces: the sixteen-octet RFC 4121 header travels in the verifier and the
@@ -704,12 +703,7 @@ fn answer(
             // what a join reports as `RPC_X_BAD_STUB_DATA`.
             let level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level);
             let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
-            let pad = usize::from(
-                parsed
-                    .auth
-                    .as_ref()
-                    .map_or(0, |auth| auth.auth_pad_length),
-            );
+            let pad = usize::from(parsed.auth.as_ref().map_or(0, |auth| auth.auth_pad_length));
             let unsealed = match (level, verifier_token) {
                 (6, Some(header)) => match open_sealed_call(header, request.stub, pad, exchange) {
                     Ok(opened) => opened,
