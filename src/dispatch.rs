@@ -896,6 +896,24 @@ async fn dispatch_one(
                             Some(&snap),
                         )));
                     }
+                    // Diagnostic, under `RRL_PW_DIAG`: the keys SMB 3.1.1 actually runs on. The
+                    // question `samr` cannot answer - "which key sealed this password block" - is
+                    // answered by trying the derived ones beside the raw session key, and they only
+                    // exist here, where the preauth hash of this exchange is known.
+                    if std::env::var_os("RRL_PW_DIAG").is_some() {
+                        let hex = |bytes: &[u8]| {
+                            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        };
+                        let _ = std::fs::write(
+                            format!("/stand/smb311-keys-{sid}.txt"),
+                            format!(
+                                "session_base_key={}\nsigning_key={}\npreauth={}\n",
+                                hex(&sess.session_base_key),
+                                hex(&sess.signing_key),
+                                hex(&snap)
+                            ),
+                        );
+                    }
                 }
             }
         }
