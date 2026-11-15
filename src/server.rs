@@ -211,6 +211,31 @@ pub trait MachinePasswords: Send + Sync + std::fmt::Debug {
     async fn set_password(&self, account: &str, password: &[u8]) -> bool;
 }
 
+/// Creating a machine account, which only the daemon with a directory can do.
+///
+/// `Add-Computer` creates the account over `samr_CreateUser2` and not over LDAP, and it does it
+/// **before** it has a ticket: the domain it is joining has not issued it one. So the call arrives on
+/// a pipe authenticated by NTLM, naming a machine that does not exist yet, and a server that refuses
+/// it leaves the join at `0x32` while everything before it - DNS, LDAP, the NTLM bind, the domain
+/// SID, the directory's own lookup - has already answered correctly.
+///
+/// `None` is a refusal, and the refusal is what a client reports: the status this crate answers is
+/// `NOT_SUPPORTED` whether the hook is absent or declined the name, because a machine account is
+/// not something a client may learn exists already.
+#[async_trait::async_trait]
+pub trait MachineAccounts: Send + Sync + std::fmt::Debug {
+    /// Creates the machine account `name` - with its trailing `$`, as the wire carries it - and
+    /// returns the RID the directory gave it.
+    async fn create_machine(&self, name: &str) -> Option<u32>;
+
+    /// The account's `userAccountControl`, which `samr_QueryInformationUser` reports back.
+    ///
+    /// Read and not remembered here: the flags are the directory's, and a join acts on the answer -
+    /// it enables an account it finds disabled - so a value this crate invented would be a
+    /// disagreement with the directory that nothing would ever correct.
+    async fn machine_control(&self, name: &str) -> Option<u32>;
+}
+
 /// Where a domain account's NT hash comes from, when this deployment has a directory.
 ///
 /// NTLM is how a Windows client authenticates to `IPC$` when it has no ticket yet - which is the
@@ -311,6 +336,12 @@ pub struct ServerConfig {
     /// Where `netr_ServerPasswordSet2` writes the password it carried, when this deployment has a
     /// directory to write it to.
     pub machine_passwords: Option<Arc<dyn MachinePasswords>>,
+    /// Where `samr_CreateUser2` creates the account a join asks for.
+    ///
+    /// Absent means this server cannot create one, and `samr` says `NOT_SUPPORTED` rather than
+    /// pretending: the account that does not exist is then missing from the directory, which is a
+    /// state an operator can see, instead of a handle that resolves to nothing.
+    pub machine_accounts: Option<Arc<dyn MachineAccounts>>,
     /// Where a domain account's NT hash comes from, for the NTLM logon a machine without a ticket
     /// makes: `Add-Computer` has no ticket yet, because the domain it is joining has not issued one.
     pub logon_users: Option<Arc<dyn LogonUsers>>,
@@ -352,6 +383,7 @@ impl ServerConfig {
             limits: Limits::default(),
             machine_secrets: None,
             machine_passwords: None,
+            machine_accounts: None,
             logon_users: None,
             netlogon_des: false,
             share_listing: true,
@@ -521,6 +553,14 @@ pub struct ServerState {
     /// computer name the channel negotiated, upper-cased.
     pub(crate) schannel_channels:
         std::sync::RwLock<std::collections::HashMap<String, ChannelState>>,
+    /// The account each `samr` user handle stands for.
+    ///
+    /// A handle is opaque to the client and only has to be stable across the calls that follow
+    /// `samr_CreateUser2` - `samr_SetInformationUser2` sends it back to name the account whose
+    /// password it carries. Remembering it is what a handle table is for; the alternative, deriving
+    /// the name from the handle's own bytes, would put the name on the wire inside a field the
+    /// client is free to invent.
+    pub(crate) samr_users: std::sync::RwLock<std::collections::HashMap<[u8; 20], String>>,
 }
 
 impl ServerState {
@@ -540,6 +580,38 @@ impl ServerState {
             Err(poisoned) => poisoned.into_inner(),
         };
         channels.insert(computer.to_ascii_uppercase(), state);
+    }
+
+    /// Remembers that a fresh handle names `account`, and answers the handle to hand back.
+    ///
+    /// The first four octets are the context type every `samr` handle in this crate carries and the
+    /// next four are a counter, so two accounts created in one session get different handles without
+    /// a random number generator in a call that must not fail.
+    pub(crate) fn remember_samr_user(&self, account: &str) -> [u8; 20] {
+        let mut table = match self.samr_users.write() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut counter = u32::try_from(table.len()).unwrap_or(0).wrapping_add(1);
+        loop {
+            let mut handle = [0u8; 20];
+            handle[..4].copy_from_slice(&1u32.to_le_bytes());
+            handle[4..8].copy_from_slice(&counter.to_le_bytes());
+            if table.insert(handle, account.to_string()).is_none() {
+                return handle;
+            }
+            counter = counter.wrapping_add(1);
+        }
+    }
+
+    /// The account `handle` names, when this server gave it out.
+    pub(crate) fn samr_user(&self, handle: &[u8]) -> Option<String> {
+        let key: [u8; 20] = handle.try_into().ok()?;
+        let table = match self.samr_users.read() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        table.get(&key).cloned()
     }
 
     /// The channel `computer` proved, when it has one.
@@ -592,6 +664,7 @@ impl ServerState {
                 crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             ),
             schannel_channels: std::sync::RwLock::new(std::collections::HashMap::new()),
+            samr_users: std::sync::RwLock::new(std::collections::HashMap::new()),
             max_locks_per_open: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),

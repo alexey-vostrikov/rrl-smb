@@ -103,9 +103,16 @@ pub(crate) const OPNUM_LOOKUP_DOMAIN: u16 = 5;
 /// `samr_LookupNames` (0x11): a name to a RID and a name type. What a join calls on the machine
 /// account it has just created, before it can set that account's password.
 pub(crate) const OPNUM_LOOKUP_NAMES: u16 = 17;
+/// `SamrDeleteUser` (MS-SAMR 3.1.5.5.7): a client undoing an account it created.
+pub(crate) const OPNUM_DELETE_USER: u16 = 35;
+/// `SamrQueryInformationUser` (MS-SAMR 3.1.5.6.37): the same as the `2` call with a class.
+pub(crate) const OPNUM_QUERY_INFO_USER: u16 = 36;
+/// `SamrGetUserDomainPasswordInformation` (MS-SAMR 3.1.5.9.5): the domain's password policy.
+pub(crate) const OPNUM_USER_DOMAIN_PASSWORD: u16 = 44;
 /// `samr_OpenDomain` (opnum 7).
 pub(crate) const OPNUM_OPEN_DOMAIN: u16 = 7;
-/// `samr_CreateUser2` (opnum 50): where the machine account would be created.
+/// `samr_CreateUser2` (opnum 50): where a join creates the account it cannot create over LDAP,
+/// because the domain it is joining has not issued it a ticket yet.
 pub(crate) const OPNUM_CREATE_USER2: u16 = 50;
 /// `samr_SetInformationUser2` (opnum 58): what a join calls last, to set the flags and the name.
 pub(crate) const OPNUM_SET_INFO_USER2: u16 = 58;
@@ -121,7 +128,16 @@ pub(crate) async fn serve(
     opnum: u16,
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
-    dispatch(&server.config, opnum, stub)
+    match opnum {
+        // The two calls that write: they ask whoever owns the accounts and need the server state
+        // that remembers the handles those writes hand out.
+        OPNUM_CREATE_USER2 => create_user2(server, stub).await,
+        OPNUM_SET_INFO_USER2 => set_information_user2(server, stub),
+        OPNUM_QUERY_INFO_USER => query_information_user(server, stub).await,
+        OPNUM_DELETE_USER => delete_user(stub),
+        OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
+        other => dispatch(&server.config, other, stub),
+    }
 }
 
 /// Which call an opnum reaches, and what it answers.
@@ -142,8 +158,6 @@ pub(crate) fn dispatch(
         OPNUM_ENUMERATE_DOMAINS => enumerate_domains(config),
         OPNUM_LOOKUP_DOMAIN => lookup_domain(config, stub),
         OPNUM_LOOKUP_NAMES => lookup_names(config, stub),
-        OPNUM_CREATE_USER2 => create_user2(stub),
-        OPNUM_SET_INFO_USER2 => set_information_user2(stub),
         other => {
             // The number goes to the log: a client reports only "the procedure number is out of
             // range", and which number is the difference between a missing feature and a typo.
@@ -493,38 +507,182 @@ fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Ve
 /// MS-ERREF: no such domain.
 const STATUS_NO_SUCH_DOMAIN: u32 = 0xC000_00DF;
 
-/// `samr_CreateUser2`: refused, because the write belongs to the directory that owns it.
+/// `samr_QueryInformationUser` (36): `[in] handle`, `[in] USER_INFORMATION_CLASS`, out a union.
 ///
-/// The shape of the reply is the shape a successful one would have - a handle, the granted access
-/// and a RID, all empty - so that a client's unmarshalling cannot fail before it reads the status.
-/// An empty stub with a non-zero status would make `ndr_pull` complain about missing `[out,ref]`
-/// pointers, and the client would report a marshalling error for a refusal it could have read.
-fn create_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+/// The class is the union's discriminant and it is **not** repeated on the wire - the method
+/// correlates it with the parameter - so the reply is the `[out,ref]` referent and then the arm.
+///
+/// The class a join asks for is `UserControlInformation` (**16**), immediately after `CreateUser2`
+/// and before any password call: it is reading back the flags it has just asked for. Its arm is one
+/// word, and answering it wrongly is not something a client can describe - it unmarshals the arm as
+/// the shape its class names and reports `0x6c5`, `RPC_S_INVALID_BOUND`.
+async fn query_information_user(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    let _handle = reader.bytes(20);
-    let _present = reader.pointer();
-    let name = reader
-        .string()
-        .map(|units| String::from_utf16_lossy(&units));
-
-    tracing::warn!(
-        account = name.as_deref().unwrap_or(""),
-        "samr: a machine account was asked for over RPC. Creating one is a directory write, and \
-         this server does not read a directory: the daemon that owns one has to answer \
-         CreateUser2, and until it does the account is not created and this join cannot finish. \
-         Over LDAP the same write is implemented and tested (rust-rest-ldap, the computer-account \
-         path)."
-    );
+    let Some(handle) = reader.bytes(20) else {
+        return Err(malformed_at("user_handle", stub));
+    };
+    let account = server.samr_user(handle).unwrap_or_default();
+    // Both widths are read, as in `set_information_user2`: a producer that declares the enum
+    // `v1_enum` sends four octets.
+    let narrow = reader.u16();
+    let wide = {
+        let mut again = NdrReader::new(stub);
+        let _ = again.bytes(20);
+        again.u32()
+    };
+    let class = narrow.map(u32::from).or(wide).unwrap_or(u32::MAX);
 
     let mut writer = NdrWriter::new();
-    // The layout a successful answer has, as the client reads it: the (empty) user handle and the
-    // two scalars inline, then the status. Measured - written with referents, the client read the
-    // second referent id as the status and reported `NT code 0x00020004`, which is this server's
-    // marshalling talking to itself rather than a status at all.
-    writer.bytes(&[0u8; 20]);
-    writer.u32(0);
-    writer.u32(0);
+    match class {
+        USER_CONTROL_INFORMATION => {
+            let control = match server.config.machine_accounts.as_ref() {
+                Some(accounts) => accounts.machine_control(&account).await,
+                None => None,
+            };
+            match control {
+                Some(control) => {
+                    tracing::debug!(account = %account, control, "samr: QueryInformationUser");
+                    writer.pointer(true);
+                    // The union's discriminant travels on the wire: the `[out]` shape carries its
+                    // own tag, and a reply without it is read as an arm of a different number -
+                    // `0x6c5`, `RPC_S_INVALID_BOUND`, from the client's unmarshalling.
+                    writer.u32(USER_CONTROL_INFORMATION);
+                    writer.u32(control);
+                    writer.u32(NTSTATUS_SUCCESS);
+                }
+                None => {
+                    tracing::warn!(
+                        account = %account,
+                        "samr: QueryInformationUser for an account this server cannot read"
+                    );
+                    writer.pointer(false);
+                    writer.u32(NTSTATUS_OBJECT_NAME_NOT_FOUND);
+                }
+            }
+        }
+        other => {
+            tracing::warn!(
+                class = other,
+                name = info_class_name(other),
+                account = %account,
+                octets = stub.len(),
+                "samr: QueryInformationUser - a class this server cannot answer"
+            );
+            writer.pointer(false);
+            writer.u32(NTSTATUS_NOT_SUPPORTED);
+        }
+    }
+    Ok(writer.finish())
+}
+
+/// `USER_INFORMATION_CLASS` 16 (MS-SAMR 2.2.6.28): the account's own flags.
+const USER_CONTROL_INFORMATION: u32 = 16;
+
+/// MS-ERREF: the object asked about does not exist.
+const NTSTATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+
+/// `samr_GetUserDomainPasswordInformation` (44): `[in] handle`, out the domain's password policy.
+///
+/// A join asks this before it sets the machine's password - the answer says how long one has to be -
+/// and a fault here is a join that stops one call short of the write. This domain enforces no
+/// minimum and no complexity: the values are the account's own business, and a machine password is
+/// generated by the client anyway.
+fn user_domain_password_information(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    if reader.bytes(20).is_none() {
+        return Err(malformed_at("user_handle", stub));
+    }
+    let mut writer = NdrWriter::new();
+    // `[out] PUSER_DOMAIN_PASSWORD_INFORMATION`: a referent, then the struct - two octets of
+    // minimum length, two of padding, and the flags word.
+    writer.pointer(true);
+    writer.u16(0); // MinimumPasswordLength
+    writer.u16(0); // padding
+    writer.u32(0); // PasswordProperties
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
+}
+
+/// `samr_DeleteUser` (35): `[in] handle`.
+///
+/// A join that fails after creating its account deletes that account, and a server that refuses the
+/// delete leaves the directory holding an object nobody will use - the name the next attempt wants.
+fn delete_user(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(_handle) = reader.bytes(20) else {
+        return Err(malformed_at("user_handle", stub));
+    };
+    tracing::warn!("samr: DeleteUser - the client is undoing an account it created");
+    let mut writer = NdrWriter::new();
     writer.u32(NTSTATUS_NOT_SUPPORTED);
+    Ok(writer.finish())
+}
+
+/// `samr_CreateUser2`: `[in] handle`, `[in,string] PRPC_UNICODE_STRING *name`, `[in] uint32 access`,
+/// `[in] uint32 unknown`, out a user handle, the granted access and a RID.
+///
+/// Asked of whoever owns the accounts, and never answered with a handle this server did not create:
+/// the handle it returns is what `samr_SetInformationUser2` sends back to name the account whose
+/// password it carries, so a fabricated one would be a password written nowhere.
+///
+/// The reply's layout is the one a real client reads - the handle inline, the two scalars, the
+/// status - and not the referent-per-field shape the IDL might suggest: measured, written with
+/// referents the client read the second referent id as the status and reported `NT code 0x00020004`,
+/// which is this server's marshalling talking to itself rather than a status at all.
+async fn create_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let _handle = reader.bytes(20);
+    // The name is `[in,string] PRPC_UNICODE_STRING` **by value**, so the struct starts here: the two
+    // lengths, then the referent of the characters, then the conformant varying array. Not the shape
+    // `samr_LookupDomain` sends - there the parameter is `[in,ref]` and the referent comes first -
+    // and reading this one that way consumed `Length` as a referent and reported the machine's name
+    // as the empty string, which the directory then refused as "an account with no name".
+    //
+    // From a Windows Server 2022 join, in full:
+    //     <handle 20> | 20 00 22 00 | 00 00 02 00 | 11 00 00 00 00 00 00 00 10 00 00 00 | chars
+    //                  Length Max    referent      count       offset      present
+    let length = reader.u16();
+    let maximum = reader.u16();
+    let name = if length == Some(0) && maximum == Some(0) {
+        String::new()
+    } else {
+        let _buffer = reader.pointer();
+        reader
+            .string_or_empty()
+            .map(|units| String::from_utf16_lossy(&units).trim().to_string())
+            .unwrap_or_default()
+    };
+    let access = reader.u32().unwrap_or(0);
+
+    let rid = match server.config.machine_accounts.as_ref() {
+        Some(accounts) => accounts.create_machine(&name).await,
+        None => None,
+    };
+
+    let mut writer = NdrWriter::new();
+    match rid {
+        Some(rid) => {
+            let handle = server.remember_samr_user(&name);
+            tracing::info!(account = %name, rid, "samr: machine account created");
+            writer.bytes(&handle);
+            // The access the caller asked for, granted in full: a client that reads back less than
+            // it requested treats the account as one it cannot finish setting up.
+            writer.u32(access);
+            writer.u32(rid);
+            writer.u32(NTSTATUS_SUCCESS);
+        }
+        None => {
+            tracing::warn!(
+                account = %name,
+                "samr: a machine account was asked for and refused - the directory declined it or \
+                 this server has no directory to write to, and the join cannot finish without one"
+            );
+            writer.bytes(&[0u8; 20]);
+            writer.u32(0);
+            writer.u32(0);
+            writer.u32(NTSTATUS_NOT_SUPPORTED);
+        }
+    }
     Ok(writer.finish())
 }
 
@@ -537,11 +695,14 @@ fn create_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
 ///
 /// The enum travels as a half word, like `secure_channel_type` in the Netlogon interface (measured
 /// there: `0200`); the union's discriminant on the wire is the same value.
-fn set_information_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+fn set_information_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
-    let Some(_handle) = reader.bytes(20) else {
+    let Some(handle) = reader.bytes(20) else {
         return Err(malformed_at("user_handle", stub));
     };
+    // Which account the handle names: a handle this server did not issue is a client writing to an
+    // account that does not exist here, and saying so is better than a status with no name in it.
+    let account = server.samr_user(handle);
     // Both widths are read: a producer that declares the enum `v1_enum` sends four octets, and
     // reading the wrong width would name the class from half a number and the first two octets of
     // the union.
@@ -556,10 +717,10 @@ fn set_information_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     tracing::warn!(
         class,
         name = info_class_name(class),
-        stub = stub.len(),
-        "samr: SetInformationUser2 is a directory write, and this server has no directory to write \
-         it to. The class is named so the missing hook is a known piece of work rather than a \
-         number in a log."
+        account = ?account,
+        octets = stub.len(),
+        stub = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "samr: SetInformationUser2 is a directory write this server does not implement yet"
     );
 
     // The reply to this call has no out parameters beyond the status.
@@ -568,27 +729,39 @@ fn set_information_user2(stub: &[u8]) -> Result<Vec<u8>, Fault> {
     Ok(writer.finish())
 }
 
-/// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.5.20).
+/// The `USER_INFORMATION_CLASS` names a log line is worth reading with (MS-SAMR 2.2.6.28).
+///
+/// The enumeration starts at **1** and skips numbers, which is not a detail: read as if it were
+/// dense from zero, the class a join asks for - 16 - names the wrong structure, and answering the
+/// wrong arm is a client that reports `0x6c5` (`RPC_S_INVALID_BOUND`) when it reads an array where
+/// a word should be. Measured: 16 is `UserControlInformation`, the account's own flags.
 fn info_class_name(class: u32) -> &'static str {
     match class {
-        0 => "UserGeneralInformation",
-        1 => "UserPreferencesInformation",
-        2 => "UserLogonInformation",
-        3 => "UserLogonHoursInformation",
-        4 => "UserAccountInformation",
-        5 => "UserNameInformation",
-        6 => "UserAccountNameInformation",
-        7 => "UserFullNameInformation",
-        8 => "UserPrimaryGroupInformation",
-        9 => "UserHomeInformation",
-        10 => "UserScriptInformation",
-        11 => "UserProfileInformation",
-        12 => "UserAdminCommentInformation",
-        13 => "UserWorkStationsInformation",
-        14 => "UserControlInformation",
-        15 => "UserExpiresInformation",
-        16 => "UserParametersInformation",
-        17 => "UserAllInformation",
+        1 => "UserGeneralInformation",
+        2 => "UserPreferencesInformation",
+        3 => "UserLogonInformation",
+        4 => "UserLogonHoursInformation",
+        5 => "UserAccountInformation",
+        6 => "UserNameInformation",
+        7 => "UserAccountNameInformation",
+        8 => "UserFullNameInformation",
+        9 => "UserPrimaryGroupInformation",
+        10 => "UserHomeInformation",
+        11 => "UserScriptInformation",
+        12 => "UserProfileInformation",
+        13 => "UserAdminCommentInformation",
+        14 => "UserWorkStationsInformation",
+        16 => "UserControlInformation",
+        17 => "UserExpiresInformation",
+        18 => "UserInternal1Information",
+        20 => "UserParametersInformation",
+        21 => "UserAllInformation",
+        23 => "UserInternal4Information",
+        24 => "UserInternal5Information",
+        25 => "UserInternal4InformationNew",
+        26 => "UserInternal5InformationNew",
+        31 => "UserInternal7Information",
+        32 => "UserInternal8Information",
         _ => "unknown",
     }
 }
@@ -614,6 +787,43 @@ fn write_dom_sid2(writer: &mut NdrWriter, sid: &[u8]) {
 mod tests {
     use super::*;
     use crate::server::ServerConfig;
+
+    /// `samr_CreateUser2` as a client writes it: the domain handle, the name behind its referent and
+    /// its two lengths, then the access and the unknown word.
+    /// The 80 octets a Windows Server 2022 sends for `DOCKERW-K5E4442$`, taken from the stand.
+    const CREATE_USER2: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x73, 0x61, 0x6d, 0x72, 0x20, 0x00, 0x22, 0x00, 0x00, 0x00, 0x02, 0x00, 0x11, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x44, 0x00, 0x4f, 0x00, 0x43,
+        0x00, 0x4b, 0x00, 0x45, 0x00, 0x52, 0x00, 0x57, 0x00, 0x2d, 0x00, 0x4b, 0x00, 0x35, 0x00,
+        0x45, 0x00, 0x34, 0x00, 0x34, 0x00, 0x34, 0x00, 0x32, 0x00, 0x24, 0x00, 0x80, 0x00, 0x00,
+        0x00, 0xb0, 0x00, 0x05, 0xe0,
+    ];
+
+    /// `samr_CreateUser2` as a client writes it, for a name of the caller's choosing.
+    fn create_stub(name: &str) -> Vec<u8> {
+        let mut writer = NdrWriter::new();
+        writer.bytes(&samr_handle());
+        let octets = u16::try_from(name.encode_utf16().count() * 2).expect("a short name");
+        writer.u16(octets); // Length
+        writer.u16(octets + 2); // MaximumLength, with the terminating NUL
+        writer.pointer(true); // the referent of the characters
+        writer.string(name);
+        writer.u32(0x0080);
+        writer.u32(0x0000_0002);
+        writer.finish()
+    }
+
+    /// A whole server state, because the two writing calls read it: the handle table lives there.
+    fn state(config: ServerConfig) -> ServerState {
+        ServerState::new(
+            config,
+            crate::server::ServerUsers {
+                table: Default::default(),
+            },
+            Vec::new(),
+        )
+    }
 
     fn config() -> ServerConfig {
         let mut config = ServerConfig::for_test();
@@ -746,7 +956,7 @@ mod tests {
         writer.raw(&[0u8; 32]); // the union's arm, unread
         let stub = writer.finish();
 
-        let body = dispatch(&config(), OPNUM_SET_INFO_USER2, &stub).expect("answered");
+        let body = set_information_user2(&state(config()), &stub).expect("answered");
         assert_eq!(body.len(), 4, "only a status comes back");
         assert_eq!(
             u32::from_le_bytes(body[..4].try_into().unwrap()),
@@ -757,9 +967,12 @@ mod tests {
     #[test]
     fn every_information_class_has_a_name() {
         // A number in a log is a chore; the name is a piece of work with a scope.
-        assert_eq!(info_class_name(4), "UserAccountInformation");
-        assert_eq!(info_class_name(14), "UserControlInformation");
-        assert_eq!(info_class_name(17), "UserAllInformation");
+        // The enum starts at one and skips: 16 is the flags, 21 everything, 20 the TS parameters.
+        // Read as if it were dense from zero, 16 would name `UserParametersInformation`.
+        assert_eq!(info_class_name(5), "UserAccountInformation");
+        assert_eq!(info_class_name(16), "UserControlInformation");
+        assert_eq!(info_class_name(20), "UserParametersInformation");
+        assert_eq!(info_class_name(21), "UserAllInformation");
         assert_eq!(info_class_name(9999), "unknown");
     }
 
@@ -857,20 +1070,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn creating_a_machine_account_is_refused_and_the_reply_still_has_its_shape() {
+    /// A directory that creates one account and remembers nothing else: enough to see that the
+    /// handle comes back, that it names the account, and that the RID is the directory's.
+    #[derive(Debug)]
+    struct CreatesAccounts;
+
+    #[async_trait::async_trait]
+    impl crate::server::MachineAccounts for CreatesAccounts {
+        async fn create_machine(&self, name: &str) -> Option<u32> {
+            name.ends_with('$').then_some(1234)
+        }
+
+        async fn machine_control(&self, name: &str) -> Option<u32> {
+            name.ends_with('$').then_some(0x1000)
+        }
+    }
+
+    /// The capture itself: the name has to come out of these octets as the client wrote it, and the
+    /// access as `0x80`. Measured - read with the referent first, this stub yielded no name at all
+    /// and the directory refused an account called `""`.
+    #[tokio::test]
+    async fn the_create_user2_a_windows_join_sends_names_its_machine() {
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(CreatesAccounts));
+        let body = create_user2(&state(config), CREATE_USER2)
+            .await
+            .expect("answered");
+        let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            word(body.len() - 4),
+            NTSTATUS_SUCCESS,
+            "a name read correctly is an account the directory can create"
+        );
+        assert_eq!(word(20), 0x80, "the access the capture asked for");
+    }
+
+    #[tokio::test]
+    async fn a_machine_account_the_directory_creates_comes_back_as_a_handle_that_names_it() {
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(CreatesAccounts));
+        let server = state(config);
+
+        let stub = create_stub("DOCKERW-K5E4442$");
+
+        let body = create_user2(&server, &stub).await.expect("answered");
+        let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+
+        assert_eq!(word(body.len() - 4), NTSTATUS_SUCCESS);
+        assert_eq!(word(20), 0x0080, "the access the caller asked for");
+        assert_eq!(word(24), 1234, "the RID the directory gave the account");
+        assert_ne!(
+            &body[..20],
+            &[0u8; 20],
+            "a handle this server can resolve, not an empty one"
+        );
+        assert_eq!(
+            server.samr_user(&body[..20]).as_deref(),
+            Some("DOCKERW-K5E4442$"),
+            "and the password that follows names this account through it"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_machine_account_is_refused_and_the_reply_still_has_its_shape() {
         // `[out,ref]` pointers are non-null, so a client's unmarshalling needs them present before
         // it reads the status: an empty stub with a non-zero status reports a marshalling error
         // instead of the refusal it carried.
-        let mut writer = NdrWriter::new();
-        writer.bytes(&samr_handle());
-        writer.pointer(true);
-        writer.string("samba$");
-        writer.u32(0x0080);
-        writer.u32(0x0000_0002);
-        let stub = writer.finish();
+        let stub = create_stub("samba$");
 
-        let body = dispatch(&config(), OPNUM_CREATE_USER2, &stub).expect("refused, not failed");
+        let body = create_user2(&state(config()), &stub)
+            .await
+            .expect("refused, not failed");
 
         assert_eq!(
             u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap()),
