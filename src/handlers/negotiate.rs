@@ -379,10 +379,19 @@ pub async fn handle(
 /// The greatest dialect in `offered` that the server implements.
 pub(crate) fn select_dialect(offered: &[u16]) -> Option<Dialect> {
     const SUPPORTED: &[u16] = &[0x0202, 0x0210, 0x0300, 0x0302, 0x0311];
+    // `RRL_SMB_MAX_DIALECT`, in hex (`0x0210` for 2.1): the ceiling this server will answer. Not a
+    // configuration - a diagnostic switch, and it exists because the key a `samr` password block is
+    // sealed with is *not* the same under every dialect: 3.1.1 derives an application key from the
+    // session key and the preauth hash, and everything earlier uses the session key itself. Being
+    // able to pin the ceiling is what turns "which key is it" into an experiment instead of a guess.
+    let ceiling = std::env::var("RRL_SMB_MAX_DIALECT")
+        .ok()
+        .and_then(|value| u16::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(u16::MAX);
     offered
         .iter()
         .copied()
-        .filter(|d| SUPPORTED.contains(d))
+        .filter(|d| SUPPORTED.contains(d) && *d <= ceiling)
         .max()
         .and_then(Dialect::from_u16)
 }

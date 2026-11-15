@@ -80,7 +80,8 @@ pub(crate) struct Caller {
     pub identity: Identity,
     /// The session has encryption keys.
     pub can_encrypt: bool,
-    /// The session key, for the one call that carries a password the client encrypted.
+    /// The key a client seals an RPC payload with, for the one call that carries a password the
+    /// client encrypted. Derived (see `Session::application_key`), not the base key.
     pub session_key: SessionKey,
 }
 
@@ -89,7 +90,7 @@ impl Caller {
         Self {
             identity: session.identity.clone(),
             can_encrypt: session.cipher.is_some(),
-            session_key: SessionKey(session.session_base_key),
+            session_key: SessionKey(session.application_key),
         }
     }
 }

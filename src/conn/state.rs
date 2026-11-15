@@ -353,6 +353,15 @@ async fn detach_tree(tree_arc: &Arc<RwLock<TreeConnect>>) -> Vec<Arc<RwLock<Open
 pub struct Session {
     pub identity: Identity,
     pub session_base_key: [u8; 16],
+    /// The key a client seals an RPC payload with — `Session.SessionKey` in MS-SMB2's sense.
+    ///
+    /// Not the base key: from SMB 3.0 the session key is *derived*, `SMB2APP`/`SmbRpc` for 3.0.x and
+    /// `SMBAppKey`/preauth for 3.1.1, and a client that asks the server to read an RPC payload sealed
+    /// its own copy with the derived one. Samba calls the result `application_key` and hands it to
+    /// the RPC layer as `session_wire_key`.
+    ///
+    /// Equal to `session_base_key` below 3.0, where nothing is derived.
+    pub application_key: [u8; 16],
     pub signing_key: [u8; 16],
     /// Whether signing is required for this session's traffic.
     pub signing_required: bool,
@@ -380,6 +389,7 @@ impl Session {
         Self {
             identity,
             session_base_key,
+            application_key: session_base_key,
             signing_key,
             signing_required,
             encrypt_data: false,
