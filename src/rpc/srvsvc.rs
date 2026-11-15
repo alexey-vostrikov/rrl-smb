@@ -868,6 +868,7 @@ mod tests {
             None => Identity::Anonymous,
         };
         Caller {
+            session_key: crate::server::SessionKey([0u8; 16]),
             identity,
             can_encrypt,
         }

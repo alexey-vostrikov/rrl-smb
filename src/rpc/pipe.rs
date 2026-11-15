@@ -362,6 +362,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let open = OpenSlot::acquire(&count, 1).expect("a slot");
         let caller = Caller {
+            session_key: crate::server::SessionKey([0u8; 16]),
             identity: crate::proto::auth::ntlm::Identity::Anonymous,
             can_encrypt: false,
         };
