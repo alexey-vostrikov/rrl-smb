@@ -836,7 +836,16 @@ impl NtlmServer {
 
         let proof_ok = ct_eq_16(nt_proof_supplied, &nt_proof_computed);
         if !(proof_ok && known_user) {
-            return Err(ProtoError::Auth("NT proof mismatch"));
+            // Which of the two happened, in the answer and not in the timing: the work above is the
+            // same for an account that does not exist (the fixed zero hash) and for one whose
+            // password is wrong, so a caller can be told the truth without handing an attacker a
+            // way to count the accounts by the clock. The distinction belongs to the protocol that
+            // reads this, so it travels as the message.
+            return Err(ProtoError::Auth(if known_user {
+                "NT proof mismatch: the password is wrong, the account exists"
+            } else {
+                "no such account: nothing here is called that"
+            }));
         }
 
         // ---- SessionBaseKey = HMAC_MD5(response_key_nt, NTProofStr)
