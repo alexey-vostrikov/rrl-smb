@@ -253,6 +253,13 @@ pub trait MachineAccounts: Send + Sync + std::fmt::Debug {
     /// it enables an account it finds disabled - so a value this crate invented would be a
     /// disagreement with the directory that nothing would ever correct.
     async fn machine_control(&self, name: &str) -> Option<u32>;
+
+    /// Removes the machine account `name`, and answers whether it was there.
+    ///
+    /// `samr_DeleteUser` is what a join calls when it gives up, and the account it removes is the
+    /// one it created a round earlier - which is why this takes the name rather than a SID: the
+    /// caller already knows it, and a lookup by name is the same one `create_machine` makes.
+    async fn delete_machine(&self, name: &str) -> bool;
 }
 
 /// Where a domain account's NT hash comes from, when this deployment has a directory.
@@ -621,6 +628,18 @@ impl ServerState {
             }
             counter = counter.wrapping_add(1);
         }
+    }
+
+    /// Drops a handle this server handed out, after the account it named is gone.
+    pub(crate) fn forget_samr_user(&self, handle: &[u8]) {
+        let Ok(key) = <[u8; 20]>::try_from(handle) else {
+            return;
+        };
+        let mut table = match self.samr_users.write() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        table.remove(&key);
     }
 
     /// The account `handle` names, when this server gave it out.
