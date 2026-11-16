@@ -47,6 +47,8 @@ use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
 use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
 use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
 
+pub use super::epm::Published;
+
 /// What this endpoint needs in order to answer a client's SPNEGO exchange.
 ///
 /// The names are the ones a client compares against its own configuration: `nb_domain` is what it
@@ -69,6 +71,12 @@ pub struct Endpoint {
     /// Absent means this endpoint accepts NTLM only - a different statement from "the keytab is
     /// broken", which is a startup error.
     pub keytab: Option<std::path::PathBuf>,
+    /// What an endpoint mapper on this listener should name for `drsuapi`.
+    ///
+    /// Set on the listener bound to TCP 135: the mapper answers with the port named here, and that
+    /// answer is the only way a client learns where `drsuapi` lives. `None` is a listener that does
+    /// not serve the mapper at all.
+    pub publish: Option<Published>,
 }
 
 /// What one association has proved so far.
@@ -516,7 +524,14 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
             Some(Arc::new(keytab))
         }
     };
-    info!(%local, "rpc: serving drsuapi over ncacn_ip_tcp");
+    match endpoint.publish {
+        Some(published) => info!(
+            %local,
+            drsuapi_port = published.drsuapi_port,
+            "rpc: serving the endpoint mapper over ncacn_ip_tcp"
+        ),
+        None => info!(%local, "rpc: serving drsuapi over ncacn_ip_tcp"),
+    }
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -723,6 +738,21 @@ fn answer(
                 Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => {
                     super::drsuapi::serve(request.opnum, stub)
                 }
+                Some(syntax) if syntax.uuid == pdu::EPM.uuid => match endpoint.publish {
+                    Some(published) => super::epm::serve(request.opnum, stub, published),
+                    // A listener that does not publish anything would answer the mapper with a
+                    // tower for an endpoint it does not serve, so it says so instead.
+                    None => {
+                        tracing::warn!(
+                            opnum = request.opnum,
+                            "rpc: the endpoint mapper is not published on this listener"
+                        );
+                        Err(super::association::Fault {
+                            status: pdu::NCA_UNK_IF,
+                            did_not_execute: true,
+                        })
+                    }
+                },
                 other => {
                     warn!(
                         interface = ?other,
@@ -787,7 +817,13 @@ fn answer(
 fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<ContextResult> {
     let mut results = Vec::with_capacity(bind.contexts.len());
     for element in &bind.contexts {
-        let serves_interface = element.abstract_syntax.uuid == pdu::DRSUAPI.uuid;
+        // Two interfaces on one listener: `drsuapi` itself, and the endpoint mapper that tells a
+        // client where `drsuapi` is. They are served together because a client binds both to the
+        // same address - the mapper at 135 and the interface it names.
+        let serves_interface = matches!(
+            element.abstract_syntax.uuid,
+            uuid if uuid == pdu::DRSUAPI.uuid || uuid == pdu::EPM.uuid
+        );
         let speaks_ndr32 = element
             .transfer_syntaxes
             .iter()
@@ -799,7 +835,7 @@ fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<Context
                 transfer_syntax: pdu::NDR,
             });
             if !contexts.iter().any(|(id, _)| *id == element.id) {
-                contexts.push((element.id, pdu::DRSUAPI));
+                contexts.push((element.id, element.abstract_syntax));
             }
         } else {
             // Two refusals that read the same to a client and differently to whoever reads the log:
@@ -891,6 +927,7 @@ mod tests {
             nb_computer: "SAMBA".to_string(),
             dns_computer: "samba.ad.example.com".to_string(),
             keytab: None,
+            publish: None,
         }
     }
 

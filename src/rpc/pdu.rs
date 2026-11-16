@@ -80,6 +80,19 @@ pub(crate) const DRSUAPI: SyntaxId = SyntaxId {
     version: 4,
 };
 
+/// The endpoint mapper 3.0, e1af8308-5d1f-11c9-91a4-08002b14a0fa (MS-RPCE 2.2.2.1).
+///
+/// The interface at TCP 135 that every client asks where an interface lives. A Windows join reaches
+/// `drsuapi` only after it has been answered here, so this is not an optional service for a domain
+/// controller - without it `DsBind` fails with `RPC_S_SERVER_UNAVAILABLE`.
+pub(crate) const EPM: SyntaxId = SyntaxId {
+    uuid: [
+        0x08, 0x83, 0xaf, 0xe1, 0x1f, 0x5d, 0xc9, 0x11, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0,
+        0xfa,
+    ],
+    version: 3,
+};
+
 /// lsarpc 0.0, 12345778-1234-abcd-ef00-0123456789ab (MS-LSAD 2.1).
 ///
 /// The interface a Samba member's join asks for first: `net ads join` opens it, then

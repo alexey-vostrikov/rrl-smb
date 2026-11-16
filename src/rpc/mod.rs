@@ -29,6 +29,7 @@ pub(crate) const DRSUAPI_PIPE: &str = "drsuapi";
 pub(crate) const NETLOGON_PIPE: &str = "netlogon";
 
 pub(crate) mod drsuapi;
+pub(crate) mod epm;
 pub(crate) mod lsarpc;
 pub(crate) mod netlogon;
 pub(crate) mod samr;
