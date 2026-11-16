@@ -173,6 +173,10 @@ fn spnego_answer(
     if auth.auth_type != pdu::AuthVerifier::TYPE_GSS_NEGOTIATE {
         debug!(
             auth_type = auth.auth_type,
+            auth_level = auth.auth_level,
+            token = auth.token.len(),
+            first = ?auth.token.first(),
+            hex = %auth.token.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "rpc: authentication this endpoint cannot answer"
         );
         return None;
