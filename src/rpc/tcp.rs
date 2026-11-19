@@ -83,6 +83,14 @@ pub struct Endpoint {
     /// answer is the only way a client learns where `drsuapi` lives. `None` is a listener that does
     /// not serve the mapper at all.
     pub publish: Option<Published>,
+    /// The server whose machine channels this endpoint answers.
+    ///
+    /// `netlogon` over `ncacn_ip_tcp` is where a joined member proves its secure channel, and the
+    /// challenge-and-credential machinery lives on `ServerState` - the same one SMB answers with, so
+    /// a channel set up over either transport is one channel. `None` means this listener does not
+    /// answer `netlogon` at all, which is a listener that says so by number rather than by
+    /// pretending the interface is absent.
+    pub channel_state: Option<ChannelState>,
 }
 
 /// What one association has proved so far.
@@ -131,6 +139,11 @@ struct Exchange {
     key: Option<(u32, [u8; 16])>,
     /// Which reading of the signed message this client uses, once a signature has proved it.
     sig_style: Option<SigStyle>,
+    /// The secure channel this association has opened, if any.
+    ///
+    /// Per association, not per endpoint: a challenge is a property of one conversation, and a
+    /// second client must not be able to prove itself against a challenge the first was given.
+    netlogon: Option<crate::rpc::netlogon::Session>,
 }
 
 /// What an NTLM signature covers (MS-RPCE 2.2.2.9.1).
@@ -198,7 +211,42 @@ impl Default for Exchange {
             sign: None,
             key: None,
             sig_style: None,
+            netlogon: None,
         }
+    }
+}
+
+/// The server state a `netlogon` endpoint answers on `ServerState`, without its `Debug`.
+///
+/// `Endpoint` is logged when a listener starts, and `ServerState` holds the accounts and the machine
+/// secrets: a `Debug` there would print credentials the first time somebody traced a startup. This
+/// prints the fact that the endpoint answers secure channels and nothing else.
+#[derive(Clone)]
+pub struct ChannelState(pub std::sync::Arc<crate::server::ServerState>);
+
+impl std::fmt::Debug for ChannelState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ChannelState(<server state>)")
+    }
+}
+
+/// What a call on this association has proved, in the shape the interface handlers take.
+///
+/// A DCE/RPC association over TCP has no SMB session behind it, so nothing here seals anything: the
+/// key is absent and `can_encrypt` is false. What it does have is the principal an NTLM or Kerberos
+/// binding proved, and that is what a handler reads when it needs to know who is asking.
+pub(crate) fn caller(exchange: &Exchange) -> crate::server::Caller {
+    let identity = match exchange.principal.as_deref() {
+        Some(user) => crate::proto::auth::ntlm::Identity::User {
+            user: user.to_string(),
+            domain: String::new(),
+        },
+        None => crate::proto::auth::ntlm::Identity::Anonymous,
+    };
+    crate::server::Caller {
+        identity,
+        can_encrypt: false,
+        session_key: crate::server::SessionKey([0_u8; 16]),
     }
 }
 
@@ -976,7 +1024,9 @@ async fn connection(
                 endpoint,
                 kerberos,
                 &mut exchange,
-            ) {
+            )
+            .await
+            {
                 if std::env::var_os("RRL_EPM_DIAG").is_some() {
                     warn!(hex = %hex(&reply), "rpc: a PDU leaves this endpoint");
                 }
@@ -990,7 +1040,7 @@ async fn connection(
 ///
 /// Split out from [`connection`] so it can be tested without a socket: the interesting decisions are
 /// which contexts are taken and what a call is answered with, and neither needs a peer.
-fn answer(
+async fn answer(
     parsed: &Pdu<'_>,
     raw: &[u8],
     contexts: &mut Vec<(u16, SyntaxId)>,
@@ -1168,10 +1218,34 @@ fn answer(
                 // Named by the mapper but not answered here yet: the call is logged with its opnum
                 // so the sequence a client expects can be read from a trace, and refused by number
                 // rather than with a protocol error - those two read very differently to a client.
+                // The secure channel a member proves after it has joined, and the interface a
+                // password change goes through. Answered on this transport because that is where a
+                // Windows member looks for it: it asks the mapper for `netlogon`, and a server that
+                // names the interface and then refuses the call leaves it reporting
+                // `ERROR_NO_LOGON_SERVERS` for a domain it is a member of.
+                Some(syntax) if syntax.uuid == pdu::NETLOGON.uuid => {
+                    match &endpoint.channel_state {
+                        Some(state) => {
+                            let mut channel = exchange.netlogon.take().unwrap_or_default();
+                            let answer = super::netlogon::serve(
+                                &state.0,
+                                &super::tcp::caller(&exchange),
+                                &mut channel,
+                                request.opnum,
+                                stub,
+                            )
+                            .await;
+                            exchange.netlogon = Some(channel);
+                            answer
+                        }
+                        None => Err(super::association::Fault {
+                            status: pdu::NCA_OP_RNG_ERROR,
+                            did_not_execute: true,
+                        }),
+                    }
+                }
                 Some(syntax)
-                    if syntax.uuid == pdu::NETLOGON.uuid
-                        || syntax.uuid == pdu::LSARPC.uuid
-                        || syntax.uuid == pdu::SAMR.uuid =>
+                    if syntax.uuid == pdu::LSARPC.uuid || syntax.uuid == pdu::SAMR.uuid =>
                 {
                     tracing::info!(
                         interface = %hex(&syntax.uuid),
@@ -1398,6 +1472,7 @@ mod tests {
             keytab: None,
             logon_users: None,
             publish: None,
+            channel_state: None,
         }
     }
 
@@ -1450,8 +1525,8 @@ mod tests {
         out
     }
 
-    #[test]
-    fn a_spnego_init_gets_an_ntlmssp_challenge_inside_a_response_token() {
+    #[tokio::test]
+    async fn a_spnego_init_gets_an_ntlmssp_challenge_inside_a_response_token() {
         let raw = alter_context_with(&spnego_init());
         let parsed = pdu::parse(&raw).expect("an alter_context with a verifier");
         let mut contexts = Vec::new();
@@ -1464,7 +1539,8 @@ mod tests {
             &endpoint(),
             None,
             &mut exchange,
-        )[0];
+        )
+        .await[0];
 
         assert!(exchange.ntlm.is_some(), "an NTLM exchange was started");
         // `auth_length` counts the token only, not the eight-octet `sec_trailer` before it.
@@ -1479,8 +1555,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_ticket_offer_without_a_keytab_keeps_the_exchange_alive() {
+    #[tokio::test]
+    async fn a_ticket_offer_without_a_keytab_keeps_the_exchange_alive() {
         // The offer's token is not NTLMSSP but a Kerberos AP-REQ (`6e`), and there is no keytab to
         // accept it with. The answer must name NTLMSSP and leave the negotiation running: a
         // `reject` would end it, and no answer at all is what the client reports as
@@ -1508,7 +1584,8 @@ mod tests {
             &endpoint(),
             None,
             &mut exchange,
-        )[0];
+        )
+        .await[0];
 
         let auth_len = usize::from(u16::from_le_bytes([answer[10], answer[11]]));
         assert!(auth_len > 0, "the answer carries a token");
@@ -1522,8 +1599,8 @@ mod tests {
         assert!(!exchange.ntlm.is_some(), "no NTLM exchange was started");
     }
 
-    #[test]
-    fn a_bind_for_drsuapi_over_ndr_is_accepted() {
+    #[tokio::test]
+    async fn a_bind_for_drsuapi_over_ndr_is_accepted() {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
@@ -1535,7 +1612,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
         assert_eq!(replies.len(), 1);
         assert_eq!(contexts, vec![(0, pdu::DRSUAPI)]);
 
@@ -1555,8 +1633,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_bind_for_another_interface_is_refused() {
+    #[tokio::test]
+    async fn a_bind_for_another_interface_is_refused() {
         let raw = bind_pdu(&[context(0, pdu::SRVSVC, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
@@ -1568,7 +1646,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
         assert!(contexts.is_empty(), "nothing was taken");
         let ack = &replies[0];
         let results_at = ack.len() - 24;
@@ -1584,8 +1663,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_call_on_drsuapi_reaches_the_handler() {
+    #[tokio::test]
+    async fn a_call_on_drsuapi_reaches_the_handler() {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
@@ -1597,7 +1676,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
 
         // `IDL_DRSBind` takes two pointers, both absent: a client with no DSA GUID yet.
         let stub = [0_u8; 8];
@@ -1611,7 +1691,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
         assert_eq!(replies.len(), 1);
         let reply = &replies[0];
         assert_eq!(reply[2], pdu::PTYPE_RESPONSE, "a handler answered");
@@ -1623,8 +1704,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_bind_ack_carries_no_verifier_when_it_has_no_token() {
+    #[tokio::test]
+    async fn a_bind_ack_carries_no_verifier_when_it_has_no_token() {
         // C706 chap. 12: the verifier is present iff `auth_length != 0`. Eight octets of
         // `sec_trailer` with a zero `auth_length` are octets a client cannot place, so their
         // absence is part of the format, not an omission.
@@ -1639,7 +1720,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        )[0];
+        )
+        .await[0];
         assert_eq!(u16::from_le_bytes([ack[10], ack[11]]), 0, "no auth_length");
         // frag_length is the whole PDU, so nothing trails the result list.
         let frag = usize::from(u16::from_le_bytes([ack[8], ack[9]]));
@@ -1654,8 +1736,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_bind_ack_names_an_association_group_of_its_own() {
+    #[tokio::test]
+    async fn a_bind_ack_names_an_association_group_of_its_own() {
         // Measured: Samba answers 3181 to a request carrying 0. A zero in the answer is the one
         // value that reads as "no group", so the answer must carry a number.
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
@@ -1669,13 +1751,14 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        )[0];
+        )
+        .await[0];
         let group = u32::from_le_bytes([ack[20], ack[21], ack[22], ack[23]]);
         assert_ne!(group, 0, "a zero group is what a client reads as none");
     }
 
-    #[test]
-    fn an_alter_context_response_keeps_the_secondary_address_field_empty() {
+    #[tokio::test]
+    async fn an_alter_context_response_keeps_the_secondary_address_field_empty() {
         // The field is in the IDL and its value is ignored; dropping it would shift every result.
         let mut raw = bind_pdu(&[context(2, pdu::DRSUAPI, pdu::NDR)]);
         raw[2] = pdu::PTYPE_ALTER_CONTEXT;
@@ -1689,7 +1772,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        )[0];
+        )
+        .await[0];
         assert_eq!(ack[2], pdu::PTYPE_ALTER_CONTEXT_RESP);
         assert_eq!(
             u16::from_le_bytes([ack[24], ack[25]]),
@@ -1700,8 +1784,8 @@ mod tests {
         assert_eq!(contexts, vec![(2, pdu::DRSUAPI)]);
     }
 
-    #[test]
-    fn a_call_on_an_unaccepted_context_is_a_fault() {
+    #[tokio::test]
+    async fn a_call_on_an_unaccepted_context_is_a_fault() {
         let mut contexts = Vec::new();
         let call = request_pdu(0, &[0_u8; 8]);
         let parsed = pdu::parse(&call).expect("a request");
@@ -1714,7 +1798,8 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
         assert_eq!(replies[0][2], pdu::PTYPE_FAULT);
     }
 
@@ -1767,7 +1852,7 @@ mod tests {
     }
 
     /// A context accepted on this association, the way a bind leaves it.
-    fn accepted_context() -> Vec<(u16, SyntaxId)> {
+    async fn accepted_context() -> Vec<(u16, SyntaxId)> {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
         let mut contexts = Vec::new();
@@ -1779,16 +1864,17 @@ mod tests {
             &endpoint(),
             None,
             &mut Exchange::default(),
-        );
+        )
+        .await;
         contexts
     }
 
     /// The acceptance of the level-6 path: a sealed call is opened, and the answer comes back
     /// sealed, with the token's header in the verifier and its ciphertext in the body.
-    #[test]
-    fn a_sealed_call_is_opened_and_the_answer_is_sealed_back() {
+    #[tokio::test]
+    async fn a_sealed_call_is_opened_and_the_answer_is_sealed_back() {
         let (server, client) = endpoints_of_one_context();
-        let mut contexts = accepted_context();
+        let mut contexts = accepted_context().await;
         let mut exchange = Exchange {
             seal: Some(server),
             ..Exchange::default()
@@ -1808,7 +1894,8 @@ mod tests {
             &endpoint(),
             None,
             &mut exchange,
-        );
+        )
+        .await;
 
         assert_eq!(replies.len(), 1, "a sealed call is answered");
         let reply = &replies[0];
@@ -1859,10 +1946,10 @@ mod tests {
     /// The pad MS-RPCE counts in `auth_pad_length` travels inside the seal, so it is stripped after
     /// the token opens. Stripping it from the ciphertext instead would shorten a stub that still
     /// parses - the failure would be a handler reading somebody else's octets.
-    #[test]
-    fn the_pad_reported_by_the_trailer_is_removed_after_the_seal_opens() {
+    #[tokio::test]
+    async fn the_pad_reported_by_the_trailer_is_removed_after_the_seal_opens() {
         let (server, client) = endpoints_of_one_context();
-        let mut contexts = accepted_context();
+        let mut contexts = accepted_context().await;
         let mut exchange = Exchange {
             seal: Some(server),
             ..Exchange::default()
@@ -1883,7 +1970,8 @@ mod tests {
             &endpoint(),
             None,
             &mut exchange,
-        );
+        )
+        .await;
 
         assert_eq!(replies.len(), 1);
         assert_eq!(
@@ -1895,10 +1983,10 @@ mod tests {
 
     /// A token sealed under a key this context does not hold is refused, and nothing is sent: an
     /// answer built from ciphertext nobody can read would be a protocol error invented here.
-    #[test]
-    fn a_call_sealed_under_another_key_is_refused_without_an_answer() {
+    #[tokio::test]
+    async fn a_call_sealed_under_another_key_is_refused_without_an_answer() {
         let (server, _client) = endpoints_of_one_context();
-        let mut contexts = accepted_context();
+        let mut contexts = accepted_context().await;
         let mut exchange = Exchange {
             seal: Some(server),
             ..Exchange::default()
@@ -1919,7 +2007,8 @@ mod tests {
             &endpoint(),
             None,
             &mut exchange,
-        );
+        )
+        .await;
 
         assert!(
             replies.is_empty(),
