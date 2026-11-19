@@ -116,7 +116,13 @@ fn interface_tower(syntax: SyntaxId, port: u16) -> Vec<u8> {
     interface_floor(&mut tower, &syntax.uuid, syntax.version, 0);
     interface_floor(&mut tower, &NDR.uuid, NDR.version, 0);
     transport_floor(&mut tower, PROTOCOL_NCACN, &0_u16.to_le_bytes());
-    transport_floor(&mut tower, PROTOCOL_TCP, &port.to_le_bytes());
+    // **Big-endian**, and this one cost a day: C706's tower floors carry their right-hand side in
+    // network order, unlike everything else in an NDR stub. Measured on a live Samba controller -
+    // it answers `c0 01` for a server listening on 49153, and the client connects to 49153, not to
+    // the 448 those octets read as in little-endian. Written little-endian, this server advertised a
+    // port it was not listening on, and a client that dialled it reported `RPC_S_SERVER_UNAVAILABLE`
+    // (0x6ba) for an endpoint that was up the whole time.
+    transport_floor(&mut tower, PROTOCOL_TCP, &port.to_be_bytes());
     transport_floor(&mut tower, PROTOCOL_IP, &[0, 0, 0, 0]);
     tower
 }
@@ -529,10 +535,16 @@ mod tests {
             .position(|window| window == [0x01, 0x00, PROTOCOL_TCP, 0x02])
             .expect("a tcp floor");
         // `01 00` the left-hand side, `07` the protocol, `02 00` the right-hand side's length, then
-        // the port: two octets of length come before it, not one.
+        // the port **big-endian**: C706's tower floors are in network order while the rest of an NDR
+        // stub is not, and a port read the other way is a port nothing listens on.
         assert_eq!(
-            u16::from_le_bytes([tower[port_at + 5], tower[port_at + 6]]),
+            u16::from_be_bytes([tower[port_at + 5], tower[port_at + 6]]),
             49152
+        );
+        assert_eq!(
+            &tower[port_at + 5..port_at + 7],
+            &[0xc0, 0x00],
+            "49152 as network order"
         );
         assert_eq!(tower.len(), 75, "the size a live controller sends");
     }
