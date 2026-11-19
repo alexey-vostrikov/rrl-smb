@@ -261,6 +261,14 @@ pub trait MachineAccounts: Send + Sync + std::fmt::Debug {
     /// one it created a round earlier - which is why this takes the name rather than a SID: the
     /// caller already knows it, and a lookup by name is the same one `create_machine` makes.
     async fn delete_machine(&self, name: &str) -> bool;
+
+    /// The account that holds `rid`, as the wire names it - `DOCKERW-1$`.
+    ///
+    /// `samr_OpenUser` names a user by RID and nothing else, and every call after it goes through
+    /// the handle this server hands back: a server that answered the open without resolving the RID
+    /// would have a handle naming no account, and the password change that follows would be applied
+    /// to nobody. `None` is a RID this directory does not have, which is `STATUS_NO_SUCH_USER`.
+    async fn account_of_rid(&self, rid: u32) -> Option<String>;
 }
 
 /// Where a domain account's NT hash comes from, when this deployment has a directory.
