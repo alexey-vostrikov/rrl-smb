@@ -33,7 +33,7 @@ bytes = "1.7"
 async-trait = "0.1"
 tracing = "0.1"
 thiserror = "1"
-uuid = { version = "1.10", features = ["v4"] }
+uuid = { version = "1.10", features = ["v4", "v5"] }
 cap-std = "3"
 cap-primitives = "~3.4"
 
@@ -57,7 +57,7 @@ bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4", "v5"] }
 binrw = { workspace = true }
 getrandom = "0.4"
 cap-std = { workspace = true, optional = true }

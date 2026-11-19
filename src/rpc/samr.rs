@@ -138,7 +138,18 @@ pub(crate) async fn serve(
     opnum: u16,
     stub: &[u8],
 ) -> Result<Vec<u8>, Fault> {
-    match opnum {
+    // Every call and its answer, behind `RRL_SAMR_DUMP`: a client that reports a status this server
+    // never produced is a client reading an answer shaped differently from what it expected, and the
+    // only way to see which field is to look at both halves.
+    let dump = std::env::var_os("RRL_SAMR_DUMP").is_some();
+    if dump {
+        tracing::warn!(
+            opnum,
+            stub = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "samr: call"
+        );
+    }
+    let answer = match opnum {
         // The two calls that write: they ask whoever owns the accounts and need the server state
         // that remembers the handles those writes hand out.
         OPNUM_CREATE_USER2 => create_user2(server, stub).await,
@@ -148,7 +159,22 @@ pub(crate) async fn serve(
         OPNUM_DELETE_USER => delete_user(server, stub).await,
         OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
         other => dispatch(&server.config, other, stub),
+    };
+    if dump {
+        match &answer {
+            Ok(body) => tracing::warn!(
+                opnum,
+                answer = %body.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "samr: answer"
+            ),
+            Err(fault) => tracing::warn!(
+                opnum,
+                status = format_args!("{:#x}", fault.status),
+                "samr: fault"
+            ),
+        }
     }
+    answer
 }
 
 /// Which call an opnum reaches, and what it answers.

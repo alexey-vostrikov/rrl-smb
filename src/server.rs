@@ -387,6 +387,15 @@ pub struct ServerConfig {
     /// With it off, a client that does not offer `NETLOGON_NEG_SUPPORTS_AES` is refused with
     /// `NOT_SUPPORTED` and a line naming the setting, instead of being told its password is wrong.
     pub netlogon_des: bool,
+    /// The address this server advertises to a client that asks where the domain controller is.
+    ///
+    /// `netr_DsRGetDCNameEx2` answers with an address, and the right one is the address the client
+    /// can reach - which is not the address this process bound. Measured on the AD-join stand: the
+    /// controllers bind `127.0.0.1` and the client sees the host as `10.0.2.2`, so a server that
+    /// answered with its bind address sent the client to a machine it could not reach.
+    ///
+    /// `None` means nothing is configured, and the answer falls back to the bind address.
+    pub dc_address: Option<std::net::Ipv4Addr>,
     /// IPC$ serves the srvsvc pipe, so clients can list the shares.
     pub share_listing: bool,
     /// The model string of `AAPL` replies; `None` when the server ignores
@@ -421,6 +430,7 @@ impl ServerConfig {
             machine_accounts: None,
             logon_users: None,
             netlogon_des: false,
+            dc_address: None,
             share_listing: true,
             apple_model: None,
             #[cfg(feature = "discovery")]
