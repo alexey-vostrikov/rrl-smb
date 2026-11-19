@@ -72,6 +72,15 @@ const INQUIRY_MATCH_BY_BOTH: u32 = 0x0000_0003;
 pub struct Published {
     /// The port `drsuapi` answers on.
     pub drsuapi_port: u16,
+    /// The port `netlogon` answers on.
+    ///
+    /// A port of its own, and not the `drsuapi` one: measured against Samba - which answers
+    /// `netlogon` on a port beside `drsuapi`, `49153` against `49152` - a Windows member asked the
+    /// mapper for `netlogon`, then reached the controller over **`ncacn_ip_tcp`** on that port.
+    /// Announced on the same port as another interface, the tower is one the client does not use:
+    /// it fell back to the named pipe, established a channel there, and refused it afterwards at
+    /// `NlConfirmCapabilities` with nothing to say why.
+    pub netlogon_port: u16,
 }
 
 /// Answers one call on the endpoint mapper.
@@ -101,11 +110,23 @@ pub(crate) fn serve(opnum: u16, stub: &[u8], published: Published) -> Result<Vec
 /// controller - it never gets as far as the interface it actually needed. All three are named on the
 /// port this server answers RPC on; a client reads the number from the tower and does not care which
 /// interface it came with.
-fn published_towers(port: u16) -> Vec<(SyntaxId, &'static str, Vec<u8>)> {
+fn published_towers(published: Published) -> Vec<(SyntaxId, &'static str, Vec<u8>)> {
     vec![
-        (DRSUAPI, "drsuapi", interface_tower(DRSUAPI, port)),
-        (NETLOGON, "netlogon", interface_tower(NETLOGON, port)),
-        (LSARPC, "lsarpc", interface_tower(LSARPC, port)),
+        (
+            DRSUAPI,
+            "drsuapi",
+            interface_tower(DRSUAPI, published.drsuapi_port),
+        ),
+        (
+            NETLOGON,
+            "netlogon",
+            interface_tower(NETLOGON, published.netlogon_port),
+        ),
+        (
+            LSARPC,
+            "lsarpc",
+            interface_tower(LSARPC, published.drsuapi_port),
+        ),
     ]
 }
 
@@ -198,7 +219,7 @@ fn lookup(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     let chosen: Vec<(SyntaxId, &'static str, Vec<u8>)> = if already {
         Vec::new()
     } else {
-        published_towers(published.drsuapi_port)
+        published_towers(published)
             .into_iter()
             .filter(|(syntax, _, _)| match (filtered, ifid) {
                 // The version is not compared: a client asks with the one it will bind, and this
@@ -286,7 +307,7 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     // statement from a tower naming a service that would refuse the client.
     let wanted = asked
         .as_deref()
-        .and_then(|tower| published_interface(tower, published.drsuapi_port));
+        .and_then(|tower| published_interface(tower, published));
     let serves = wanted.is_some();
     tracing::info!(
         asked = %asked
@@ -402,13 +423,16 @@ fn tower_size(tower: &[u8]) -> Option<usize> {
 /// Read from the floors rather than searched for: the first floor carries the interface, and one of
 /// the later ones names the transport. A tower for an interface this server does not publish over a
 /// transport it does not serve is `None`.
-fn published_interface(tower: &[u8], port: u16) -> Option<(SyntaxId, &'static str, Vec<u8>)> {
+fn published_interface(
+    tower: &[u8],
+    published: Published,
+) -> Option<(SyntaxId, &'static str, Vec<u8>)> {
     let floors = floors_of(tower)?;
     let (protocol, uuid, _version) = floors.first().and_then(interface_of)?;
     if protocol != PROTOCOL_UUID || !floors.iter().any(|floor| floor.protocol == PROTOCOL_TCP) {
         return None;
     }
-    published_towers(port)
+    published_towers(published)
         .into_iter()
         .find(|(syntax, _, _)| syntax.uuid == uuid)
 }
@@ -497,6 +521,7 @@ mod tests {
     fn published() -> Published {
         Published {
             drsuapi_port: 49152,
+            netlogon_port: 49153,
         }
     }
 
@@ -581,7 +606,8 @@ mod tests {
         assert_eq!(names, ["drsuapi", "netlogon", "lsarpc"]);
 
         // Then the towers, in the same order, each length written twice.
-        for syntax in [DRSUAPI, NETLOGON, LSARPC] {
+        // Each interface on the port it answers on: `netlogon` beside `drsuapi`, not on top of it.
+        for (syntax, port) in [(DRSUAPI, 49152), (NETLOGON, 49153), (LSARPC, 49152)] {
             let len = word(&body, at) as usize;
             assert_eq!(
                 word(&body, at + 4) as usize,
@@ -590,7 +616,7 @@ mod tests {
             );
             assert_eq!(
                 &body[at + 8..at + 8 + len],
-                &interface_tower(syntax, 49152)[..]
+                &interface_tower(syntax, port)[..]
             );
             at = (at + 8 + len).next_multiple_of(4);
         }
@@ -624,7 +650,8 @@ mod tests {
         let tower_len = word(&body, tower_at) as usize;
         assert_eq!(
             &body[tower_at + 8..tower_at + 8 + tower_len],
-            &interface_tower(NETLOGON, 49152)[..]
+            // The port `netlogon` answers on, which is not the `drsuapi` one.
+            &interface_tower(NETLOGON, published().netlogon_port)[..]
         );
     }
 
@@ -706,7 +733,7 @@ mod tests {
         let asked = tower_in(&stub).expect("the tower is found by its own length");
         assert_eq!(asked.len(), 75);
         assert!(
-            published_interface(&asked, 49152).is_some(),
+            published_interface(&asked, published()).is_some(),
             "it asks for drsuapi over tcp"
         );
 
