@@ -70,6 +70,14 @@ pub(crate) const OPNUM_OPEN_POLICY2: u16 = 44;
 /// [`policy_level`] reads both widths.
 pub(crate) const OPNUM_QUERY_INFO_POLICY: u16 = 7;
 
+/// `lsa_OpenPolicy3` (opnum 0x82): the policy handle, and the revision the server speaks.
+///
+/// The call a modern Windows member makes before it reads anything else, because the revision decides
+/// whether the two sides can talk about trust authentication at all. Measured: `netdom resetpwd` on a
+/// joined member sends it first, and a server that answers "procedure number out of range" leaves the
+/// client at `0x6d1` with nothing in the trace to say which call it wanted.
+pub(crate) const OPNUM_OPEN_POLICY3: u16 = 130;
+
 /// `lsa_QueryInfoPolicy2` (MS-LSAD 3.1.4.4.10). The same union as `lsa_QueryInfoPolicy`, with the
 /// level carried as a `ushort` rather than an `enum`, which is the whole difference between them.
 pub(crate) const OPNUM_QUERY_INFO_POLICY2: u16 = 46;
@@ -130,6 +138,7 @@ pub(crate) fn dispatch(
         OPNUM_CLOSE => close_handle(stub),
         OPNUM_OPEN_POLICY => open_policy_v1(stub),
         OPNUM_OPEN_POLICY2 => open_policy(stub),
+        OPNUM_OPEN_POLICY3 => open_policy3(stub),
         OPNUM_QUERY_INFO_POLICY | OPNUM_QUERY_INFO_POLICY2 => query_info(config, stub),
         other => {
             // A client sees only "the procedure number is out of range" and cannot say which
@@ -138,6 +147,7 @@ pub(crate) fn dispatch(
             tracing::warn!(
                 opnum = other,
                 stub = stub.len(),
+                hex = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "lsarpc: no handler for this call"
             );
             Err(Fault {
@@ -197,6 +207,44 @@ fn open_policy_v1(stub: &[u8]) -> Result<Vec<u8>, Fault> {
         });
     }
     Ok(handle_response())
+}
+
+/// The revision this server speaks in `lsa_OpenPolicy3`.
+///
+/// One, which is the only revision the protocol defines for this call: the field exists so that a
+/// later one can be negotiated, and answering anything else is claiming to speak something no
+/// specification describes.
+const REVISION_1: u32 = 1;
+
+/// `lsa_OpenPolicy3`: `[in,unique] string system_name`, object attributes, access mask, then the
+/// revision the client speaks as `[in] uint32` and its `lsa_revision_info` behind a referent.
+///
+/// Only the name is read. The reply does not depend on the rest: this server has no policy object
+/// whose attributes or access mask could change the answer, and the handle it returns names nothing
+/// the caller can open further - what a client asks the policy for is already answered from the
+/// domain's own data.
+fn open_policy3(stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    // The referent first: the parameter is a unique pointer to a conformant string, and reading the
+    // counts first takes the referent for `max_count` - the mistake `samr_LookupDomain` records.
+    let _present = reader.pointer();
+    let _name = reader.string();
+
+    let mut writer = NdrWriter::new();
+    // `[out,ref] uint32 *out_version`, then the union behind its own referent: case 1 is
+    // `{ uint32 revision; lsa_RevisionSupportedFeature supported_features; }`.
+    writer.pointer(true);
+    writer.u32(REVISION_1);
+    writer.pointer(true);
+    writer.u32(REVISION_1);
+    // No feature is claimed. The one the bitmap defines is AES in trust auth info, and this server
+    // keeps no trust objects at all: claiming it would promise a cipher nothing here implements.
+    writer.u32(0);
+    // The handle travels as its twenty octets with no referent - measured for opnum 44, and the same
+    // context-handle rule holds here.
+    writer.bytes(&policy_handle());
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
 }
 
 /// `PolicyDnsDomainInfo` for the domain this server answers for.

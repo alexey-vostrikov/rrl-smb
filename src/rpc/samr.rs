@@ -40,6 +40,8 @@ const SAMR_CONNECT_AFTER_W2K: u32 = 3;
 const NTSTATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const NTSTATUS_WRONG_PASSWORD: u32 = 0xC000_006A;
 const NTSTATUS_SUCCESS: u32 = 0x0000_0000;
+/// `STATUS_NO_SUCH_USER`: a RID this directory does not hold.
+const NTSTATUS_NO_SUCH_USER: u32 = 0xC000_0063;
 /// `STATUS_NONE_MAPPED`: none of the names resolved. An error, not a warning: a client that read
 /// RID 0 with success would treat account zero as the account it asked for.
 const STATUS_NONE_MAPPED: u32 = 0xC000_0073;
@@ -106,6 +108,13 @@ pub(crate) const OPNUM_LOOKUP_DOMAIN: u16 = 5;
 pub(crate) const OPNUM_LOOKUP_NAMES: u16 = 17;
 /// `SamrDeleteUser` (MS-SAMR 3.1.5.5.7): a client undoing an account it created.
 pub(crate) const OPNUM_DELETE_USER: u16 = 35;
+/// `samr_OpenUser` (opnum 0x22): a user handle, from a domain handle and a RID.
+///
+/// The call that makes every later user operation possible: the client names the user by RID and
+/// nothing else, and a handle this server did not hand out is one it cannot resolve back to an
+/// account. Measured against a Windows member running `netdom resetpwd`: it opens the machine's own
+/// user twice, with two read access masks, before it changes the password.
+pub(crate) const OPNUM_OPEN_USER: u16 = 34;
 /// `SamrQueryInformationUser` (MS-SAMR 3.1.5.6.37): the same as the `2` call with a class.
 pub(crate) const OPNUM_QUERY_INFO_USER: u16 = 36;
 /// `SamrGetUserDomainPasswordInformation` (MS-SAMR 3.1.5.9.5): the domain's password policy.
@@ -135,6 +144,7 @@ pub(crate) async fn serve(
         OPNUM_CREATE_USER2 => create_user2(server, stub).await,
         OPNUM_SET_INFO_USER2 => set_information_user2(server, _caller, stub).await,
         OPNUM_QUERY_INFO_USER => query_information_user(server, stub).await,
+        OPNUM_OPEN_USER => open_user(server, stub).await,
         OPNUM_DELETE_USER => delete_user(server, stub).await,
         OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
         other => dispatch(&server.config, other, stub),
@@ -165,6 +175,7 @@ pub(crate) fn dispatch(
             tracing::warn!(
                 opnum = other,
                 stub = stub.len(),
+                hex = %stub.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "samr: no handler for this call"
             );
             Err(Fault {
@@ -520,6 +531,55 @@ const STATUS_NO_SUCH_DOMAIN: u32 = 0xC000_00DF;
 /// and before any password call: it is reading back the flags it has just asked for. Its arm is one
 /// word, and answering it wrongly is not something a client can describe - it unmarshals the arm as
 /// the shape its class names and reports `0x6c5`, `RPC_S_INVALID_BOUND`.
+/// `samr_OpenUser` (opnum 0x22): a user handle, from a domain handle and a RID.
+///
+/// Every call after this one goes through the handle, and this server resolves a handle back to an
+/// account name - so the RID has to be resolved *here*, or a password change would be applied to
+/// nobody. `None` is `STATUS_NO_SUCH_USER` and not a handle: answering one would let a client
+/// believe it opened an account this directory does not have, and the write that followed would go
+/// nowhere while the client reported success.
+///
+/// The access mask is read and not enforced. What a client may do with the account is decided by
+/// who it proved to be, and this interface has no policy of its own to compare against.
+async fn open_user(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(_domain_handle) = reader.bytes(20) else {
+        return Err(malformed_at("domain_handle", stub));
+    };
+    let Some(_access) = reader.u32() else {
+        return Err(malformed_at("access_mask", stub));
+    };
+    let Some(rid) = reader.u32() else {
+        return Err(malformed_at("rid", stub));
+    };
+
+    let mut writer = NdrWriter::new();
+    let Some(accounts) = server.config.machine_accounts.as_ref() else {
+        tracing::warn!(
+            rid,
+            "samr: OpenUser on a server with no directory to resolve the RID against"
+        );
+        writer.bytes(&[0u8; 20]);
+        writer.u32(NTSTATUS_NO_SUCH_USER);
+        return Ok(writer.finish());
+    };
+    let Some(account) = accounts.account_of_rid(rid).await else {
+        tracing::warn!(
+            rid,
+            "samr: OpenUser named a RID this directory does not hold"
+        );
+        writer.bytes(&[0u8; 20]);
+        writer.u32(NTSTATUS_NO_SUCH_USER);
+        return Ok(writer.finish());
+    };
+
+    let handle = server.remember_samr_user(&account);
+    tracing::debug!(rid, account = %account, "samr: OpenUser");
+    writer.bytes(&handle);
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
+}
+
 async fn query_information_user(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
     let mut reader = NdrReader::new(stub);
     let Some(handle) = reader.bytes(20) else {
@@ -730,6 +790,35 @@ async fn create_user2(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Faul
 /// The plaintext is handed to whoever owns the accounts and not hashed here: one derivation serves
 /// both an LDAP write of `unicodePwd` and this, and a second one would be a second place to be wrong
 /// about a key nobody can check afterwards.
+/// Stores a password this server has already decrypted, and answers the status to hand back.
+///
+/// Shared by the classes a client uses to change a password: the decryption differs by class and the
+/// store does not, and two copies of "write it, log it, report it" is two places to be wrong about
+/// whether a password was written at all.
+async fn store_machine_password(
+    server: &ServerState,
+    account: &str,
+    password: &[u8],
+    class: u32,
+) -> u32 {
+    let stored = match server.config.machine_passwords.as_ref() {
+        Some(passwords) => passwords.set_password(account, password).await,
+        None => false,
+    };
+    tracing::info!(
+        account = %account,
+        octets = password.len(),
+        stored,
+        class,
+        "samr: a password was set"
+    );
+    if stored {
+        NTSTATUS_SUCCESS
+    } else {
+        NTSTATUS_NOT_SUPPORTED
+    }
+}
+
 async fn set_information_user2(
     server: &ServerState,
     caller: &crate::server::Caller,
@@ -763,7 +852,7 @@ async fn set_information_user2(
     let mut writer = NdrWriter::new();
     match class {
         USER_INTERNAL4_INFORMATION_NEW => {
-            let Some((cipher, salt)) = encrypted_password(stub) else {
+            let Some((cipher, salt)) = encrypted_password(stub, PASSWORD_BLOCK_AT) else {
                 tracing::warn!(
                     account = %account,
                     octets = stub.len(),
@@ -859,6 +948,30 @@ async fn set_information_user2(
                 NTSTATUS_NOT_SUPPORTED
             });
         }
+        USER_INTERNAL5_INFORMATION_NEW => {
+            let Some((cipher, salt)) = encrypted_password(stub, BUFFER_AT) else {
+                tracing::warn!(
+                    account = %account,
+                    octets = stub.len(),
+                    "samr: class 26 with the password block not where the union starts"
+                );
+                writer.u32(NTSTATUS_NOT_SUPPORTED);
+                return Ok(writer.finish());
+            };
+            let Some(password) = open_password(cipher, salt, caller.session_key) else {
+                tracing::warn!(
+                    account = %account,
+                    "samr: the password in class 26 does not open under this session's key"
+                );
+                // `WRONG_PASSWORD` and not "not supported": the block was there and the key does
+                // not open it, which is a different statement to a client than a class this server
+                // does not implement - and the one that tells an operator which side is wrong.
+                writer.u32(NTSTATUS_WRONG_PASSWORD);
+                return Ok(writer.finish());
+            };
+            let status = store_machine_password(server, &account, &password, class).await;
+            writer.u32(status);
+        }
         other => {
             tracing::warn!(
                 class = other,
@@ -876,6 +989,18 @@ async fn set_information_user2(
 /// `USER_INFORMATION_CLASS` 25 (MS-SAMR 2.2.6.28): every attribute, plus an encrypted password.
 const USER_INTERNAL4_INFORMATION: u32 = 23;
 const USER_INTERNAL4_INFORMATION_NEW: u32 = 25;
+/// `USER_INFORMATION_CLASS` 26 (MS-SAMR 2.2.6.26): the password block **alone** - no attribute
+/// structure in front of it - and one octet after it saying the password is expired.
+///
+/// Not "25 plus an old password": Samba's `samr.idl` spells it `samr_UserInfo26 = { samr_CryptPasswordEx
+/// password; uint8 password_expired; }`, so the block starts where the union starts. That is the
+/// whole difference from 25, and the reason the offset below is not `PASSWORD_BLOCK_AT`.
+///
+/// `netdom resetpwd` sends this class when a member changes its own password, so a server that
+/// answers only 25 replies "not supported" to a domain member's request to change its password.
+const USER_INTERNAL5_INFORMATION_NEW: u32 = 26;
+/// Where the union starts in a `SetInformationUser2` request: the twenty-octet handle and the class.
+const BUFFER_AT: usize = 24;
 
 /// `SAMPR_ENCRYPTED_USER_PASSWORD_NEW` (MS-SAMR 2.2.6.22): the ciphertext, then its salt.
 const ENCRYPTED_PASSWORD_LEN: usize = 516;
@@ -894,12 +1019,10 @@ const ENCRYPTED_SALT_LEN: usize = 16;
 const PASSWORD_BLOCK_AT: usize = 220;
 
 /// The encrypted password and its salt, or `None` when this stub does not carry them.
-fn encrypted_password(stub: &[u8]) -> Option<(&[u8], [u8; ENCRYPTED_SALT_LEN])> {
-    let block = stub.get(PASSWORD_BLOCK_AT..PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN)?;
-    let salt = stub.get(
-        PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN
-            ..PASSWORD_BLOCK_AT + ENCRYPTED_PASSWORD_LEN + ENCRYPTED_SALT_LEN,
-    )?;
+fn encrypted_password(stub: &[u8], at: usize) -> Option<(&[u8], [u8; ENCRYPTED_SALT_LEN])> {
+    let block = stub.get(at..at + ENCRYPTED_PASSWORD_LEN)?;
+    let salt =
+        stub.get(at + ENCRYPTED_PASSWORD_LEN..at + ENCRYPTED_PASSWORD_LEN + ENCRYPTED_SALT_LEN)?;
     Some((block, <[u8; ENCRYPTED_SALT_LEN]>::try_from(salt).ok()?))
 }
 
@@ -1070,6 +1193,50 @@ mod tests {
         writer.u32(0x0080);
         writer.u32(0x0000_0002);
         writer.finish()
+    }
+
+    /// The RID a Windows member opens its own account with, and the one it does not have.
+    ///
+    /// The bytes are a `netdom resetpwd` capture - `[handle 20][access 0xb0][rid]` - which is what
+    /// settles that the access mask comes before the RID and that the handle travels as twenty
+    /// octets. The RID here is the one the double answers for, because what is under test is the
+    /// resolution and the handle, not the directory.
+    #[tokio::test]
+    async fn open_user_resolves_the_rid_and_answers_a_handle_that_names_it() {
+        let mut stub = vec![0u8; 20];
+        stub[16..].copy_from_slice(b"samr");
+        stub.extend_from_slice(&0xb0_u32.to_le_bytes()); // access_mask
+        stub.extend_from_slice(&1234_u32.to_le_bytes()); // rid
+
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(CreatesAccounts));
+        let server = state(config);
+        let body = open_user(&server, &stub).await.expect("answered");
+        assert_eq!(body.len(), 24, "the handle, then the status");
+        let handle = &body[..20];
+        assert_eq!(server.samr_user(handle).as_deref(), Some("SAMBA$"));
+        assert_eq!(
+            u32::from_le_bytes(body[20..24].try_into().expect("four octets")),
+            0
+        );
+    }
+
+    /// A RID this directory does not hold is refused, and answered with no handle at all: a handle
+    /// here would name an account that does not exist, and the password change that follows would
+    /// be applied to nobody while the client reported success.
+    #[tokio::test]
+    async fn open_user_refuses_a_rid_the_directory_does_not_hold() {
+        let mut stub = vec![0u8; 20];
+        stub.extend_from_slice(&0xb0_u32.to_le_bytes());
+        stub.extend_from_slice(&999_u32.to_le_bytes());
+
+        let server = state(config());
+        let body = open_user(&server, &stub).await.expect("answered");
+        assert_eq!(&body[..20], &[0u8; 20], "no handle is handed out");
+        assert_eq!(
+            u32::from_le_bytes(body[20..24].try_into().expect("four octets")),
+            NTSTATUS_NO_SUCH_USER
+        );
     }
 
     /// A whole server state, because the two writing calls read it: the handle table lives there.
@@ -1431,6 +1598,10 @@ mod tests {
 
         async fn delete_machine(&self, name: &str) -> bool {
             name.ends_with('$')
+        }
+
+        async fn account_of_rid(&self, rid: u32) -> Option<String> {
+            (rid == 1234).then(|| "SAMBA$".to_string())
         }
     }
 
