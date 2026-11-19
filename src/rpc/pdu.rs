@@ -264,6 +264,13 @@ pub(crate) struct AuthVerifier<'a> {
 
 impl AuthVerifier<'_> {
     /// `RPC_C_AUTHN_NETLOGON`: schannel, the authentication Samba's netlogon pipe asks for.
+    ///
+    /// Not NTLM under another number. Its verifier is an `NL_AUTH_MESSAGE` (MS-NRPC 2.2.1.3.1) - a
+    /// message type, a flag word and, in the request, the names of the two sides - and once the
+    /// negotiation has an answer every following call carries an `NL_AUTH_SIGNATURE` computed with
+    /// the secure channel's session key. Measured: a Windows member that has just proved its channel
+    /// opens a **second** binding to `netlogon` with this type, and a server that answers "cannot
+    /// answer" leaves it reporting that the capabilities do not match.
     pub(crate) const TYPE_NETLOGON: u8 = 68;
     /// `RPC_C_AUTHN_WINNT`: NTLMSSP.
     pub(crate) const TYPE_NTLM: u8 = 10;

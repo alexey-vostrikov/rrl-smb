@@ -144,6 +144,8 @@ struct Exchange {
     /// Per association, not per endpoint: a challenge is a property of one conversation, and a
     /// second client must not be able to prove itself against a challenge the first was given.
     netlogon: Option<crate::rpc::netlogon::Session>,
+    /// Whether this association negotiated `RPC_C_AUTHN_NETLOGON`.
+    netlogon_negotiated: bool,
 }
 
 /// What an NTLM signature covers (MS-RPCE 2.2.2.9.1).
@@ -212,6 +214,7 @@ impl Default for Exchange {
             key: None,
             sig_style: None,
             netlogon: None,
+            netlogon_negotiated: false,
         }
     }
 }
@@ -228,6 +231,49 @@ impl std::fmt::Debug for ChannelState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ChannelState(<server state>)")
     }
+}
+
+/// `NL_AUTH_MESSAGE` message types this server answers (MS-NRPC 2.2.1.3.1).
+const NL_NEGOTIATE_REQUEST: u32 = 0;
+const NL_NEGOTIATE_RESPONSE: u32 = 1;
+
+/// The answer to a netlogon authentication verifier.
+///
+/// The negotiation is the whole of what a member needs before it will sign the calls that follow:
+/// the client names the two sides and a flag word, and the server answers with the flags it will
+/// actually enforce. Echoing the client's word is deliberate - what each bit means here is a
+/// statement about the *channel*, which this server has already established and proved, and the
+/// bits it must not claim are the ones about facilities (an RODC, cross-forest trusts) it does not
+/// have. A member that is told "the same as you offered" simply carries on.
+///
+/// `None` for a message this server cannot read, which the caller treats as a refusal: a binding
+/// answered with nothing is one the client abandons, and that is the correct outcome for a verifier
+/// nobody here understands.
+fn netlogon_answer(token: &[u8], exchange: &mut Exchange) -> Option<Vec<u8>> {
+    let message_type = u32::from_le_bytes(token.get(..4)?.try_into().ok()?);
+    let flags = u32::from_le_bytes(token.get(4..8)?.try_into().ok()?);
+    exchange.netlogon_negotiated = true;
+    if message_type != NL_NEGOTIATE_REQUEST {
+        // The signature of a call that follows the negotiation. Verified against the channel's key
+        // by the interface handler, which is where the sequence and the direction live; here it is
+        // only said out loud, so a trace shows what arrived.
+        debug!(
+            message_type,
+            flags = format_args!("{flags:#010x}"),
+            len = token.len(),
+            hex = %token.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "rpc: netlogon authentication after the negotiation"
+        );
+        return None;
+    }
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&NL_NEGOTIATE_RESPONSE.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    debug!(
+        flags = format_args!("{flags:#010x}"),
+        "rpc: netlogon authentication negotiated"
+    );
+    Some(out)
 }
 
 /// What a call on this association has proved, in the shape the interface handlers take.
@@ -307,6 +353,9 @@ fn auth_answer(
     });
     if auth.auth_type == pdu::AuthVerifier::TYPE_NTLM {
         return ntlm_answer(auth.token, endpoint, exchange);
+    }
+    if auth.auth_type == pdu::AuthVerifier::TYPE_NETLOGON {
+        return netlogon_answer(auth.token, exchange);
     }
     if auth.auth_type != pdu::AuthVerifier::TYPE_GSS_NEGOTIATE {
         debug!(
