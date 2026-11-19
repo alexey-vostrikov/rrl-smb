@@ -241,10 +241,13 @@ fn crack_names(stub: &[u8], names: Option<&CrackNames>) -> Result<Vec<u8>, Fault
     // version, the union, the counter and its array. Writing the values inline - which the
     // specification's IDL reads like, once the `[ref]` is skimmed - produces a stub a client cannot
     // unmarshal, and it answers by unbinding: measured, `opnum 12` then `opnum 1` and nothing more.
-    writer.pointer(true); // level_out ([out,ref] uint32)
-    writer.u32(1); // the reply's version
-    writer.pointer(true); // pmsgOut ([out,ref] drsuapi_DsNameCtr)
-    writer.u32(1); // its union tag: ctr1
+    // `[out,ref]` parameters are inline: a `ref` pointer is non-null by definition and NDR does not
+    // put a referent on the wire for it. Writing one - which is what this did - makes the client
+    // read our referent as the value and everything after it shifted by four, which it reports as
+    // `RPC_X_BAD_STUB_DATA` (0x6f7). Confirmed on the request side of the same call: the client's
+    // `[in,ref]` handle and union arrive inline, with no referents ahead of them.
+    writer.u32(1); // level_out
+    writer.u32(1); // the union's discriminant, which is `*level_out`
     writer.pointer(true); // ctr1 ([case(1)] drsuapi_DsNameCtr1 *)
     writer.u32(u32::try_from(items.len()).expect("a short list")); // cItems
     writer.pointer(true); // rItems
@@ -287,10 +290,17 @@ fn crack_one(
     match (offered, desired) {
         // The domain's canonical name, wanted in NT4 form: the NetBIOS name, which is what a client
         // puts in front of a machine account.
+        // `pName` is the NetBIOS name, which is what the client puts in front of a machine account;
+        // `dns_domain_name` is the DNS name of the domain the name belongs to, as MS-DRSR defines
+        // the field.
+        // MS-DRSR 4.1.4.1.7: the NT4 form of a domain is its NetBIOS name *and* the separator,
+        // `AD\`. The client takes this string and appends the account to it, so a controller that
+        // answers `AD` has the client ask about `ADHOST$` - an account that cannot exist. Measured
+        // against Samba, which answers `SAMBA\`, and whose joins complete.
         (FORMAT_CANONICAL, FORMAT_NT4_ACCOUNT) if is_domain => (
             NAME_ERROR_NONE,
-            Some(names.nb_domain.clone()),
-            Some(names.nb_domain.clone()),
+            Some(names.dns_domain.clone()),
+            Some(names.nb_domain.clone() + "\\"),
         ),
         // The same name wanted back as a distinguished name: the naming context.
         (FORMAT_CANONICAL, FORMAT_FQDN_1779) if is_domain => {
@@ -300,7 +310,7 @@ fn crack_one(
                 .map(|label| format!("dc={}", label.to_ascii_lowercase()))
                 .collect::<Vec<_>>()
                 .join(",");
-            (NAME_ERROR_NONE, Some(names.nb_domain.clone()), Some(dn))
+            (NAME_ERROR_NONE, Some(names.dns_domain.clone()), Some(dn))
         }
         // An NT4 account name: `AD\HOST$` or the domain alone.
         (FORMAT_NT4_ACCOUNT, FORMAT_FQDN_1779) => {
@@ -312,7 +322,7 @@ fn crack_one(
                     .map(|label| format!("dc={}", label.to_ascii_lowercase()))
                     .collect::<Vec<_>>()
                     .join(",");
-                (NAME_ERROR_NONE, Some(names.nb_domain.clone()), Some(dn))
+                (NAME_ERROR_NONE, Some(names.dns_domain.clone()), Some(dn))
             } else {
                 (NAME_ERROR_NO_MAPPING, None, None)
             }
