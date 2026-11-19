@@ -675,11 +675,42 @@ fn challenge_for(
     ))
 }
 
+impl Exchange {
+    /// Takes a sealed stub through the NTLM cipher, advancing the receive stream.
+    ///
+    /// `None` when this association has no NTLM sealing state, which is a call this method has
+    /// nothing to say about - not a call that failed.
+    fn unseal(&mut self, stub: &[u8]) -> Option<Vec<u8>> {
+        let (_, recv) = self.sign.as_mut()?;
+        let mut body = stub.to_vec();
+        // The stream has to advance by the message before `verify` can succeed, so this happens
+        // before the signature is checked, not after.
+        if recv.seal(&mut body) {
+            Some(body)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this association seals its calls with NTLM rather than with a GSS wrap.
+    fn seals_with_ntlm(&self) -> bool {
+        self.sign.is_some() && self.seal.is_none()
+    }
+}
+
 /// Whether a call's NTLM signature is the client's.
 ///
 /// An association that negotiated no integrity has nothing to check, and that is not a failure: the
 /// answer is `true` because there was no signature, which is different from one that did not verify.
-fn verify_signature(raw: &[u8], auth: &pdu::AuthVerifier<'_>, exchange: &mut Exchange) -> bool {
+fn verify_signature(
+    raw: &[u8],
+    auth: &pdu::AuthVerifier<'_>,
+    exchange: &mut Exchange,
+    // How far the receive stream has already been advanced by the message, when the call was
+    // sealed. A probe needs the same head start: the checksum is masked with the state *after* the
+    // message, so a fresh state cannot verify a sealed one.
+    advance: usize,
+) -> bool {
     if exchange.sign.is_none() {
         return true;
     }
@@ -694,7 +725,7 @@ fn verify_signature(raw: &[u8], auth: &pdu::AuthVerifier<'_>, exchange: &mut Exc
         let settled = exchange
             .key
             .as_ref()
-            .and_then(|(flags, key)| signature_style(raw, sig, *flags, key));
+            .and_then(|(flags, key)| signature_style(raw, sig, *flags, key, advance));
         match settled {
             Some(style) => {
                 info!(style = ?style, "rpc: this client's NTLM signatures cover that much");
@@ -724,15 +755,78 @@ fn verify_signature(raw: &[u8], auth: &pdu::AuthVerifier<'_>, exchange: &mut Exc
 }
 
 /// Which reading of the signed message produced `sig`, if either.
-fn signature_style(raw: &[u8], sig: &[u8], flags: u32, key: &[u8; 16]) -> Option<SigStyle> {
+fn signature_style(
+    raw: &[u8],
+    sig: &[u8],
+    flags: u32,
+    key: &[u8; 16],
+    advance: usize,
+) -> Option<SigStyle> {
     for style in [SigStyle::BeforeSignature, SigStyle::Zeroed] {
-        if let Some(mut probe) = NtlmMac::new(flags, key, Direction::ClientToServer)
-            && probe.verify(&style.message(raw, sig.len()), sig)
-        {
-            return Some(style);
+        if let Some(mut probe) = NtlmMac::new(flags, key, Direction::ClientToServer) {
+            if advance > 0 {
+                let mut taken = vec![0_u8; advance];
+                if !probe.seal(&mut taken) {
+                    continue;
+                }
+            }
+            if probe.verify(&style.message(raw, sig.len()), sig) {
+                return Some(style);
+            }
         }
     }
     None
+}
+
+/// Seals and signs one answer for an association that uses NTLM at level 6.
+///
+/// Two PDUs are built for one answer: the wire one carries the ciphertext, and the one the
+/// signature covers carries the plaintext. That is not an optimisation - it is what the client
+/// verifies against: the checksum of a Windows client's sealed call matches an HMAC over the
+/// *decrypted* arguments, and over the ciphertext it does not. The RC4 stream is advanced by the
+/// message first, because the checksum is masked with the state that leaves behind.
+fn seal_answer_ntlm(
+    parsed: &Pdu<'_>,
+    context_id: u16,
+    stub: &[u8],
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    let mut plain = stub.to_vec();
+    plain.resize(plain.len().next_multiple_of(4), 0);
+    let mut cipher = plain.clone();
+    let sealed = match exchange.sign.as_mut() {
+        Some((send, _)) => send.seal(&mut cipher),
+        None => false,
+    };
+    if !sealed {
+        warn!("rpc: the answer could not be sealed; sending an empty body");
+        return Vec::new();
+    }
+
+    // The signature covers this PDU with the plaintext in place and sixteen zero octets where the
+    // signature will go.
+    let zeros = [0_u8; 16];
+    let open = pdu::response(
+        parsed.header.call_id,
+        pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
+        u32::try_from(stub.len()).unwrap_or(u32::MAX),
+        context_id,
+        &plain,
+        reply_verifier(Some(&zeros), exchange).as_ref(),
+    );
+    let Some((send, _)) = exchange.sign.as_mut() else {
+        return Vec::new();
+    };
+    let signature = send.mac(&open[..open.len() - 16]);
+
+    // The same PDU with the ciphertext in the arguments' place.
+    let mut wire = open;
+    let from = wire.len() - 16 - 8 - cipher.len();
+    wire[from..from + cipher.len()].copy_from_slice(&cipher);
+    let at = wire.len() - 16;
+    wire[at..].copy_from_slice(&signature);
+    debug!("rpc: the answer was sealed and signed");
+    vec![wire]
 }
 
 /// Signs a built answer, in place of the zero placeholder its verifier carries.
@@ -915,8 +1009,13 @@ fn answer(
         call_id = parsed.header.call_id,
         auth_length = parsed.header.auth_length,
         body = ?parsed.body,
+        auth_level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level),
+        auth_type = parsed.auth.as_ref().map_or(0, |auth| auth.auth_type),
         "rpc: pdu"
     );
+    if std::env::var_os("RRL_EPM_DIAG").is_some() && parsed.header.ptype == 0 {
+        warn!(hex = %hex(raw), "rpc: a request arrives, as it came off the wire");
+    }
     match &parsed.body {
         Body::Bind(bind) => {
             // C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff
@@ -975,31 +1074,77 @@ fn answer(
                 .find(|(id, _)| *id == request.context_id)
                 .map(|(_, syntax)| *syntax);
 
-            // At level 6 the stub is not the arguments: it is a sealed RFC 4121 Wrap token whose
-            // sixteen-octet header travels in the verifier and whose ciphertext travels where the
-            // arguments would be. Handing the ciphertext to a handler parses nonsense - which is
-            // what a join reports as `RPC_X_BAD_STUB_DATA`.
+            // At level 6 the stub is not the arguments. Two ciphers are in use and they are not
+            // interchangeable: a GSS wrap puts the token header in the verifier and its ciphertext
+            // where the arguments would be, while NTLM - what a Windows join uses on this endpoint,
+            // measured - RC4s the stub in place and puts a sixteen-octet signature in the verifier.
+            // Handing either to a handler parses nonsense, which a client reports as a bad stub.
             let level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level);
             let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
             let pad = usize::from(parsed.auth.as_ref().map_or(0, |auth| auth.auth_pad_length));
-            let unsealed = match (level, verifier_token) {
-                (6, Some(header)) => match open_sealed_call(header, request.stub, pad, exchange) {
-                    Ok(opened) => opened,
-                    // A call that cannot be opened is not answered: the alternative is a handler
-                    // reading ciphertext as arguments, which is what a client reports as a bad stub.
-                    Err(detail) => {
-                        warn!(detail, "rpc: a sealed call could not be opened");
+            let ntlm_sealed = level == LEVEL_PRIVACY && exchange.seals_with_ntlm();
+            let unsealed = if ntlm_sealed {
+                // Decrypt first: the checksum of an NTLM signature is masked with the same RC4
+                // stream, advanced past the message, so the signature cannot verify before the
+                // message has been taken through the cipher.
+                match exchange.unseal(request.stub) {
+                    Some(opened) => Some(opened),
+                    None => {
+                        warn!("rpc: a sealed call could not be opened");
                         return Vec::new();
                     }
-                },
-                // Below level 6 the stub is the arguments, and padding it needs is the PDU's own.
+                }
+            } else {
+                match (level, verifier_token) {
+                    (6, Some(header)) => {
+                        match open_sealed_call(header, request.stub, pad, exchange) {
+                            Ok(opened) => opened,
+                            Err(detail) => {
+                                warn!(detail, "rpc: a sealed call could not be opened");
+                                return Vec::new();
+                            }
+                        }
+                    }
+                    // Below level 6 the stub is the arguments, and padding it needs is the PDU's own.
+                    _ => None,
+                }
+            };
+            // At level 5 the arguments travel in the clear and a signature stands beside them. It
+            // covers the PDU as the client wrote it, so it is checked on `raw`, before anything here
+            // has had a chance to rewrite it - and after any decryption, because the stream behind
+            // the checksum has to be advanced by the message first.
+            // A sealed message is signed over its **plaintext**: measured, the checksum of a
+            // Windows client's sealed `DsBind` matches an HMAC over the header, the decrypted
+            // arguments and the `sec_trailer` - and over the ciphertext it does not. So the octets
+            // the signature covers are rebuilt here, with the same length and the same offsets.
+            let signed_view = match (&unsealed, ntlm_sealed) {
+                (Some(opened), true) => {
+                    let mut view = raw.to_vec();
+                    let from = 24;
+                    if from + opened.len() <= view.len() {
+                        view[from..from + opened.len()].copy_from_slice(opened);
+                    }
+                    Some(view)
+                }
                 _ => None,
             };
-            // At level 5 the arguments are in the clear and the verifier is a signature, so the
-            // stub arrives untouched - including the `auth_pad_length` octets MS-RPCE puts at its
-            // end to align the `sec_trailer`. A handler that reads fields counts them as arguments
-            // unless they are taken off first, which is a misread rather than a short read.
-            let stub = match unsealed.as_deref() {
+            let checked = signed_view.as_deref().unwrap_or(raw);
+            if level >= LEVEL_INTEGRITY
+                && let Some(auth) = parsed.auth.as_ref()
+                && !verify_signature(
+                    checked,
+                    auth,
+                    exchange,
+                    ntlm_sealed.then_some(request.stub.len()).unwrap_or(0),
+                )
+            {
+                return Vec::new();
+            }
+            // The padding travels inside the seal, so it is taken off after the seal opens.
+            let stub: &[u8] = match unsealed.as_deref() {
+                Some(opened) if ntlm_sealed || level == LEVEL_PRIVACY => opened
+                    .get(..opened.len().saturating_sub(pad))
+                    .unwrap_or(opened),
                 Some(opened) => opened,
                 None if level == LEVEL_INTEGRITY && pad > 0 => request
                     .stub
@@ -1008,20 +1153,18 @@ fn answer(
                 None => request.stub,
             };
 
-            // At level 5 the arguments travel in the clear and a signature stands beside them. It
-            // covers the PDU as the client wrote it, so it is checked on `raw`, before anything here
-            // has had a chance to rewrite it.
-            if level == LEVEL_INTEGRITY
-                && let Some(auth) = parsed.auth.as_ref()
-                && !verify_signature(raw, auth, exchange)
-            {
-                return Vec::new();
-            }
-
             let result = match interface {
-                Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => {
-                    super::drsuapi::serve(request.opnum, stub)
-                }
+                Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => super::drsuapi::serve(
+                    request.opnum,
+                    stub,
+                    // What `DRSCrackNames` answers from: the two names this endpoint already knows.
+                    // Not gated on `publish` - that is set on the mapper's listener only, and the
+                    // interface a client cracks names on is this one.
+                    Some(&super::drsuapi::CrackNames {
+                        nb_domain: endpoint.nb_domain.clone(),
+                        dns_domain: endpoint.dns_domain.clone(),
+                    }),
+                ),
                 // Named by the mapper but not answered here yet: the call is logged with its opnum
                 // so the sequence a client expects can be read from a trace, and refused by number
                 // rather than with a protocol error - those two read very differently to a client.
@@ -1071,12 +1214,16 @@ fn answer(
             };
             match result {
                 Ok(stub) => {
+                    if level == LEVEL_PRIVACY && ntlm_sealed {
+                        return seal_answer_ntlm(parsed, request.context_id, &stub, exchange);
+                    }
                     let (body, header) = seal_answer(&stub, level, exchange);
                     // At level 5 the answer is signed rather than sealed: the verifier is a
                     // sixteen-octet signature, and the placeholder it occupies has to be part of the
                     // PDU while the signature over that PDU is computed.
-                    let signing = level == LEVEL_INTEGRITY && exchange.sign.is_some();
-                    let placeholder = signing.then_some([0_u8; 16]);
+                    let signing = exchange.sign.is_some()
+                        && (level == LEVEL_INTEGRITY || (level == LEVEL_PRIVACY && ntlm_sealed));
+                    let placeholder = signing.then(|| [0_u8; 16]);
                     // One token for two shapes: the seal's header, or the signature's placeholder.
                     let token: Option<&[u8]> = header
                         .as_deref()
