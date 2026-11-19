@@ -1231,8 +1231,13 @@ impl SmbServer {
         .await
     }
 
-    #[cfg(any(test, fuzzing))]
-    pub(crate) fn state(&self) -> Arc<ServerState> {
+    /// The state a caller outside this module needs to answer on the server's behalf.
+    ///
+    /// `netlogon` over `ncacn_ip_tcp` is one: the interface a member proves its secure channel on
+    /// lives on its own port, and the channel machinery (challenges, the stored machine secret) is
+    /// built on this state. Shared rather than copied, so a channel opened over either transport is
+    /// the same channel.
+    pub fn state(&self) -> Arc<ServerState> {
         self.state.clone()
     }
 }

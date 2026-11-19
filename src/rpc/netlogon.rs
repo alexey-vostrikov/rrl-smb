@@ -653,6 +653,42 @@ fn authenticate3(
             "netlogon-key"
         );
     }
+    if std::env::var_os("NETLOGON_KEY_DUMP").is_some() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        // Two readings of the AES session key, so one run says which the client uses: MS-NRPC
+        // 3.1.4.3.1 hashes the MD5 of the two challenges, and a server that hashes their
+        // concatenation answers a credential nobody computes.
+        use hmac::{Hmac, Mac};
+        let direct = {
+            let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&machine.nt_hash)
+                .expect("any key length");
+            mac.update(&challenge.client);
+            mac.update(&challenge.server);
+            let out: [u8; 32] = mac.finalize().into_bytes().into();
+            out
+        };
+        let via_md5 = {
+            use md5::digest::Digest as _;
+            let mut md5 = md5::Md5::new();
+            md5.update(challenge.client);
+            md5.update(challenge.server);
+            let digest = md5.finalize();
+            let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&machine.nt_hash)
+                .expect("any key length");
+            mac.update(&digest);
+            let out: [u8; 32] = mac.finalize().into_bytes().into();
+            out
+        };
+        // Only which reading matches: the credential is a secret of this channel, and a log line
+        // that printed it would be a log line that handed out the channel.
+        tracing::warn!(
+            client_challenge = %hex(&challenge.client),
+            server_challenge = %hex(&challenge.server),
+            direct_matches = credential_aes(&challenge.client, &direct) == client_credential,
+            md5_matches = credential_aes(&challenge.client, &via_md5) == client_credential,
+            "netlogon-keys"
+        );
+    }
     let answer = match verdict(&machine.nt_hash, aes, des, &challenge, &client_credential) {
         Verdict::Accepted(answer) => answer,
         Verdict::Unsupported => {
