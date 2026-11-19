@@ -64,6 +64,15 @@ pub(crate) const OPNUM_LOGON_GET_DOMAIN_INFO: u16 = 29;
 /// `netr_LogonGetCapabilities`. A join cannot finish without it: Samba's `libnet_join` proves its
 /// secure channel here, and treats a missing call as a downgrade whenever AES was negotiated.
 pub(crate) const OPNUM_LOGON_GET_CAPABILITIES: u16 = 21;
+/// `netr_DsRGetDCName` (opnum 0x0E) and `netr_DsRGetDCNameEx2` (opnum 0x22): where is a controller
+/// for this domain.
+///
+/// What a member calls when it wants to find its domain rather than prove a channel to it - and what
+/// `Remove-Computer` calls before it unjoins. Answered from this server's own configuration: there is
+/// one controller here, and it is this one.
+pub(crate) const OPNUM_DSR_GETDCNAME: u16 = 0x0E;
+pub(crate) const OPNUM_DSR_GETDCNAME_EX2: u16 = 0x22;
+
 /// `netr_ServerPasswordSet2` (opnum 46): the machine password a join picks, encrypted under the
 /// channel's session key.
 pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
@@ -118,6 +127,8 @@ pub(crate) async fn serve(
         OPNUM_SERVER_REQ_CHALLENGE => request_challenge(session, stub),
         OPNUM_SERVER_AUTHENTICATE3 => authenticate3(server, session, stub),
         OPNUM_SERVER_PASSWORD_SET2 => password_set2(server, stub).await,
+        OPNUM_DSR_GETDCNAME => get_dc_name(server, stub, false),
+        OPNUM_DSR_GETDCNAME_EX2 => get_dc_name(server, stub, true),
         OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(server, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => {
             // Said out loud because the client's own report names the step and not the cause: it
@@ -297,6 +308,153 @@ fn advance_credential(
     channel.client_credential = client;
     channel.server_credential = server;
     (client, server)
+}
+
+/// The site every domain has until an administrator creates another.
+///
+/// The same name the CLDAP answer carries: a client compares the site it was told by one call with
+/// the site another call gives it, and a domain whose answers disagree is a domain it re-asks about.
+const DEFAULT_SITE: &str = "Default-First-Site-Name";
+
+/// `DS_RETURN_DNS_NAME` (MS-NRPC 2.2.9.1): answer with DNS names rather than the flat NetBIOS one.
+const DS_RETURN_DNS_NAME: u32 = 0x4000_0000;
+/// `DS_RETURN_FLAT_NAME`: the flat name was explicitly asked for.
+const DS_RETURN_FLAT_NAME: u32 = 0x8000_0000;
+
+/// `DS_ADDRESS_TYPE_INET`: `dc_address` is an address, not a NetBIOS name.
+const DS_ADDRESS_TYPE_INET: u32 = 1;
+
+/// `DS_FLAG` bits this server sets (`MS-ADTS` 6.3.1.2), the same set its CLDAP answer carries.
+///
+/// The two answers are read by the same client for the same question, and a controller that named
+/// itself a KDC in one of them and not in the other would be a controller the client cannot decide
+/// about.
+mod dc_flags {
+    pub const DS_LDAP_FLAG: u32 = 0x0000_0008;
+    pub const DS_DS_FLAG: u32 = 0x0000_0010;
+    pub const DS_KDC_FLAG: u32 = 0x0000_0020;
+    pub const DS_WRITABLE_FLAG: u32 = 0x0000_0100;
+    pub const DS_DNS_CONTROLLER_FLAG: u32 = 0x2000_0000;
+    pub const DS_DNS_DOMAIN_FLAG: u32 = 0x4000_0000;
+    pub const DS_DNS_FOREST_FLAG: u32 = 0x8000_0000;
+}
+
+/// `netr_DsRGetDCName` and `netr_DsRGetDCNameEx2`: the controller a client should use.
+///
+/// One answer serves both: `Ex2` adds a client account, an account mask and a site name in front of
+/// the same tail, and none of the three changes what this server would answer - there is one
+/// controller here, at one address, in one site.
+///
+/// The reply is `netr_DsRGetDCNameInfo` (MS-NRPC 2.2.8.1.2): seven strings, the address type, the
+/// domain GUID, the flag words. Written inline, because NDR marshals in the order the struct
+/// declares and the strings are pointers to their own character arrays.
+fn get_dc_name(server: &ServerState, stub: &[u8], ex2: bool) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let _server_unc = optional_string(&mut reader);
+    if ex2 {
+        let _client_account = optional_string(&mut reader);
+        let Some(_mask) = reader.u32() else {
+            return Err(malformed_hex("mask", stub));
+        };
+    }
+    let _domain_name = optional_string(&mut reader);
+    // `[in,unique] GUID *`: the referent, and then the sixteen octets only when it is present.
+    if reader.pointer() == Some(true) {
+        let _guid = reader.bytes(16);
+    }
+    let _site_name = optional_string(&mut reader);
+    let flags = reader.u32().unwrap_or(0);
+
+    let config = &server.config;
+    let dns_domain = config.dns_domain.clone().unwrap_or_default();
+    let netbios_domain = config
+        .domain_netbios
+        .clone()
+        .unwrap_or_else(|| config.netbios_name.clone());
+    let dns_computer = if dns_domain.is_empty() {
+        config.netbios_name.clone()
+    } else {
+        format!(
+            "{}.{}",
+            config.netbios_name.to_ascii_lowercase(),
+            dns_domain.to_ascii_lowercase()
+        )
+    };
+    let address = config
+        .dc_address
+        .or(match config.listen_addr.ip() {
+            std::net::IpAddr::V4(address) if !address.is_unspecified() => Some(address),
+            _ => None,
+        })
+        // A wildcard bind names no address, and the specification's own fallback for that case is
+        // the loopback one: it is at least not a lie about a specific machine.
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+
+    // The flat name is answered only when it is asked for: a client that reads `ad.example.com`
+    // where it expected `AD` treats the controller as belonging to another domain.
+    let domain_name = if flags & DS_RETURN_FLAT_NAME != 0 && flags & DS_RETURN_DNS_NAME == 0 {
+        netbios_domain.clone()
+    } else if dns_domain.is_empty() {
+        netbios_domain.clone()
+    } else {
+        dns_domain.clone()
+    };
+
+    // The domain's GUID, derived from its DNS name the same way the CLDAP answer derives it: a
+    // client compares the GUID it was told by one call against the one another call gives it, and
+    // two answers that disagree describe two domains.
+    let domain_guid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        domain_name.to_ascii_lowercase().as_bytes(),
+    );
+
+    let site = DEFAULT_SITE;
+    let mut dc = dc_flags::DS_LDAP_FLAG
+        | dc_flags::DS_DS_FLAG
+        | dc_flags::DS_WRITABLE_FLAG
+        | dc_flags::DS_DNS_CONTROLLER_FLAG
+        | dc_flags::DS_DNS_DOMAIN_FLAG
+        | dc_flags::DS_DNS_FOREST_FLAG;
+    #[cfg(feature = "krb5")]
+    if server.kerberos.is_some() {
+        dc |= dc_flags::DS_KDC_FLAG;
+    }
+
+    let mut writer = NdrWriter::new();
+    // `[out,ref] netr_DsRGetDCNameInfo **info`: a pointer to a pointer, then the structure.
+    writer.pointer(true);
+    writer.pointer(true);
+    writer.pointer(true);
+    writer.string(&format!("\\\\{dns_computer}"));
+    writer.pointer(true);
+    writer.string(&format!("\\\\{address}"));
+    writer.u32(DS_ADDRESS_TYPE_INET);
+    // A GUID travels as its three numeric fields little-endian and its last eight octets as they
+    // are - `to_bytes_le` is that layout, and `to_bytes` (RFC order) is not.
+    writer.raw(&domain_guid.to_bytes_le());
+    writer.pointer(true);
+    writer.string(&domain_name);
+    writer.pointer(true);
+    writer.string(&dns_domain);
+    writer.u32(dc);
+    writer.pointer(true);
+    writer.string(site);
+    writer.pointer(true);
+    writer.string(site);
+    // `WERROR`: `ERROR_SUCCESS`, after the structure - the place every call in this module puts its
+    // return value.
+    writer.u32(0);
+    Ok(writer.finish())
+}
+
+/// A `[in,unique] [string] uint16 *` argument: the referent, and the string only when it is there.
+fn optional_string(reader: &mut NdrReader<'_>) -> Option<String> {
+    match reader.pointer() {
+        Some(true) => reader
+            .string()
+            .map(|units| String::from_utf16_lossy(&units).trim().to_string()),
+        _ => None,
+    }
 }
 
 /// `netr_LogonGetCapabilities`: what this server supports, said under the channel's own proof.

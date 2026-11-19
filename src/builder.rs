@@ -340,6 +340,7 @@ pub struct SmbServerBuilder {
     machine_passwords: Option<std::sync::Arc<dyn crate::server::MachinePasswords>>,
     machine_accounts: Option<std::sync::Arc<dyn crate::server::MachineAccounts>>,
     netlogon_des: bool,
+    dc_address: Option<std::net::Ipv4Addr>,
     /// The domain's NetBIOS name, answered by `lsarpc` as the domain's own name.
     domain_netbios: Option<String>,
     max_read_size: u32,
@@ -401,6 +402,7 @@ impl SmbServerBuilder {
             machine_passwords: None,
             machine_accounts: None,
             netlogon_des: false,
+            dc_address: None,
             domain_netbios: None,
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
@@ -508,6 +510,15 @@ impl SmbServerBuilder {
     ///
     /// Off by default: that channel's credential is two DES passes over a 56-bit key. A deployment
     /// that has to accept an old member turns it on knowingly; everything modern offers AES.
+    /// The address a client is told to reach this domain controller at.
+    ///
+    /// See [`ServerConfig::dc_address`]: the bind address is not the address a client outside the
+    /// host can reach, and `netr_DsRGetDCNameEx2` is where a client asks for the one it should use.
+    pub fn dc_address(mut self, address: std::net::Ipv4Addr) -> Self {
+        self.dc_address = Some(address);
+        self
+    }
+
     pub fn netlogon_des(mut self, enabled: bool) -> Self {
         self.netlogon_des = enabled;
         self
@@ -858,6 +869,7 @@ impl SmbServerBuilder {
             machine_passwords: self.machine_passwords.clone(),
             machine_accounts: self.machine_accounts.clone(),
             netlogon_des: self.netlogon_des,
+            dc_address: self.dc_address,
             domain_netbios: self.domain_netbios.clone(),
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
