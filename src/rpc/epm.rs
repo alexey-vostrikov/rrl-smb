@@ -247,8 +247,12 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     //
     // Measured: a Windows Server 2022 request carries it at octet 20, and zeroing that word makes a
     // real Samba answer "no more entries" instead of a tower.
+    // `max_towers` is the last word of the request: the arguments are `object`, `map_tower` (both
+    // deferred to the end), the handle inline and this bound after it. Measured against a live
+    // Samba controller: the same 132-octet request carries `04 00 00 00` there, and its answer
+    // declares exactly that bound.
     let max_towers = u32::from_le_bytes(
-        stub.get(20..24)
+        stub.get(stub.len().saturating_sub(4)..)
             .and_then(|word| word.try_into().ok())
             .unwrap_or([1, 0, 0, 0]),
     )
@@ -276,7 +280,11 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     writer.u32(max_towers); // the maximum
     writer.u32(0); // offset
     writer.u32(1); // actual
-    writer.pointer(true);
+    // The referent id is measured, not chosen: a live Samba controller answers `03 00 00 00` here,
+    // and a Windows client refuses an answer whose id is `0x00020000` with `RPC_X_BAD_STUB_DATA`
+    // (0x6f7) after accepting the rest of the stub. The value means nothing in NDR - only being
+    // non-zero and unique does - so the one a client is known to accept is the one to send.
+    writer.u32(TOWER_REFERENT);
     let size = u32::try_from(tower.len()).expect("a short tower");
     writer.u32(size);
     writer.u32(size);
@@ -285,6 +293,9 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     writer.u32(STATUS_OK);
     Ok(writer.finish())
 }
+
+/// The referent id a client is known to accept in an `ept_map` answer.
+const TOWER_REFERENT: u32 = 3;
 
 /// The tower in a request, found by its self-describing length.
 ///
@@ -599,8 +610,8 @@ mod tests {
         let body = serve(OPNUM_MAP, &stub, published()).expect("answered");
         assert_eq!(word(&body, 20), 1, "one tower is offered");
         // The conformant bound the client named is what the answer declares, not a number of this
-        // server's choosing: 2 in this capture.
-        assert_eq!(word(&body, 24), 2, "the client's own max_towers");
+        // server's choosing. In this capture it is the last word of the request, `04 00 00 00`.
+        assert_eq!(word(&body, 24), 4, "the client's own max_towers");
         assert_eq!(word(&body, body.len() - 4), STATUS_OK);
         // The port this server publishes is inside the tower it answers with.
         assert!(
