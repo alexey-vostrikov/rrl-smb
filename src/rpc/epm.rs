@@ -39,7 +39,7 @@
 
 use super::association::Fault;
 use super::ndr::{NdrReader, NdrWriter};
-use super::pdu::{DRSUAPI, NCA_OP_RNG_ERROR, NCA_PROTO_ERROR, NDR};
+use super::pdu::{DRSUAPI, LSARPC, NCA_OP_RNG_ERROR, NCA_PROTO_ERROR, NDR, NETLOGON, SyntaxId};
 
 /// `ept_lookup` (opnum 2): the call a client makes to learn where an interface lives.
 pub(crate) const OPNUM_LOOKUP: u16 = 2;
@@ -94,15 +94,27 @@ pub(crate) fn serve(opnum: u16, stub: &[u8], published: Published) -> Result<Vec
     }
 }
 
-/// The tower that names `drsuapi` on `port`.
-fn drsuapi_tower(port: u16) -> Vec<u8> {
+/// Every interface this server is willing to name, on one port.
+///
+/// Measured: a Windows join asks the mapper about `netlogon` and `lsarpc` as well as `drsuapi`, and
+/// a mapper that answers "nothing here" for the first two makes the client give up on the whole
+/// controller - it never gets as far as the interface it actually needed. All three are named on the
+/// port this server answers RPC on; a client reads the number from the tower and does not care which
+/// interface it came with.
+fn published_towers(port: u16) -> Vec<(SyntaxId, &'static str, Vec<u8>)> {
+    vec![
+        (DRSUAPI, "drsuapi", interface_tower(DRSUAPI, port)),
+        (NETLOGON, "netlogon", interface_tower(NETLOGON, port)),
+        (LSARPC, "lsarpc", interface_tower(LSARPC, port)),
+    ]
+}
+
+/// The tower that names any interface on `port`.
+fn interface_tower(syntax: SyntaxId, port: u16) -> Vec<u8> {
     let mut tower = Vec::new();
     tower.extend_from_slice(&5_u16.to_le_bytes());
-    // The interface floor: the id the client asked for, at the version it binds.
-    interface_floor(&mut tower, &DRSUAPI.uuid, DRSUAPI.version, 0);
-    // The data representation floor: NDR 2.0, which is the only one this server speaks.
+    interface_floor(&mut tower, &syntax.uuid, syntax.version, 0);
     interface_floor(&mut tower, &NDR.uuid, NDR.version, 0);
-    // The protocol floor, then the transport floors: no version, then port, then address.
     transport_floor(&mut tower, PROTOCOL_NCACN, &0_u16.to_le_bytes());
     transport_floor(&mut tower, PROTOCOL_TCP, &port.to_le_bytes());
     transport_floor(&mut tower, PROTOCOL_IP, &[0, 0, 0, 0]);
@@ -168,26 +180,45 @@ fn lookup(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
         "epm: ept_lookup"
     );
 
-    // An enumeration already answered is a finished one: this server publishes one endpoint, so
+    // An enumeration already answered is a finished one: this server publishes a fixed set, so
     // handing out the handle and stopping is the whole conversation.
     let already = handle
         .get(4..20)
         .is_some_and(|uuid| uuid.iter().any(|octet| *octet != 0));
-    // `RPC_C_EP_MATCH_BY_IF` and `_BY_BOTH` name an interface: anything else asked for is not here,
-    // and saying so is a different answer from "no more entries" only in how it reads in a trace.
-    let matches = match ifid {
-        Some((uuid, _major, _minor)) => {
-            let asked = matches!(inquiry, INQUIRY_MATCH_BY_IF | INQUIRY_MATCH_BY_BOTH);
-            !asked || uuid == DRSUAPI.uuid
-        }
-        // No interface id and a matching inquiry type is a question this server cannot answer.
-        None => !matches!(inquiry, INQUIRY_MATCH_BY_IF | INQUIRY_MATCH_BY_BOTH),
+    // What this request is entitled to see: the one interface its filter names, or everything this
+    // server publishes. A filter that names an interface without an id is malformed, and answering
+    // nothing is the honest reading of it.
+    let filtered = matches!(inquiry, INQUIRY_MATCH_BY_IF | INQUIRY_MATCH_BY_BOTH);
+    let chosen: Vec<(SyntaxId, &'static str, Vec<u8>)> = if already {
+        Vec::new()
+    } else {
+        published_towers(published.drsuapi_port)
+            .into_iter()
+            .filter(|(syntax, _, _)| match (filtered, ifid) {
+                // The version is not compared: a client asks with the one it will bind, and this
+                // server publishes exactly one per interface. Refusing on a version that differs in
+                // a way the client did not intend is how a mapper answers "nothing here" to a
+                // question it could have answered.
+                (true, Some((uuid, _major, _minor))) => uuid == syntax.uuid,
+                (true, None) => false,
+                (false, _) => true,
+            })
+            .take(usize::try_from(max_ents).unwrap_or(0))
+            .collect()
     };
+    tracing::info!(
+        answers = chosen.len(),
+        interfaces = ?chosen
+            .iter()
+            .map(|(syntax, name, _)| format!("{name} {}.{}", hex(&syntax.uuid), syntax.version))
+            .collect::<Vec<_>>(),
+        "epm: ept_lookup chooses"
+    );
 
     let mut writer = NdrWriter::new();
     // The handle the client may come back with, and must come back with to end the enumeration.
     writer.bytes(&lookup_handle());
-    if already || !matches {
+    if chosen.is_empty() {
         writer.u32(0); // num_ents
         writer.u32(max_ents);
         writer.u32(0); // offset
@@ -196,25 +227,32 @@ fn lookup(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
         return Ok(writer.finish());
     }
 
-    let tower = drsuapi_tower(published.drsuapi_port);
-    let annotation = b"drsuapi\0";
-    writer.u32(1); // num_ents
+    let count = u32::try_from(chosen.len()).expect("a short list");
+    writer.u32(count); // num_ents
     writer.u32(max_ents);
     writer.u32(0); // offset into the array
-    writer.u32(1); // actual count
-    // One entry: the object GUID (unset), a referent to its tower, then the annotation.
-    writer.bytes(&[0_u8; 16]);
-    writer.pointer(true);
-    writer.u32(0); // annotation offset
-    writer.u32(u32::try_from(annotation.len()).expect("a short annotation"));
-    writer.raw(annotation);
-    writer.align(4);
-    // The tower, deferred: `tower_length`, then the subcontext's own length, then its octets.
-    let size = u32::try_from(tower.len()).expect("a short tower");
-    writer.u32(size);
-    writer.u32(size);
-    writer.raw(&tower);
-    writer.align(4);
+    writer.u32(count); // actual count
+    for (_, name, _) in &chosen {
+        // One entry: the object GUID (unset), a referent to its tower, then the annotation - which
+        // names the interface, as a real controller's does.
+        writer.bytes(&[0_u8; 16]);
+        writer.pointer(true);
+        writer.u32(0); // annotation offset
+        let mut annotation = name.as_bytes().to_vec();
+        annotation.push(0);
+        writer.u32(u32::try_from(annotation.len()).expect("a short annotation"));
+        writer.raw(&annotation);
+        writer.align(4);
+    }
+    // The towers, deferred and in the order their referents appeared: `tower_length`, then the
+    // subcontext's own length, then the octets.
+    for (_, _, tower) in &chosen {
+        let size = u32::try_from(tower.len()).expect("a short tower");
+        writer.u32(size);
+        writer.u32(size);
+        writer.raw(tower);
+        writer.align(4);
+    }
     writer.u32(STATUS_OK);
     Ok(writer.finish())
 }
@@ -237,9 +275,22 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
         tracing::warn!(stub = %hex(stub), "epm: ept_map request bytes");
     }
     let asked = tower_in(stub);
-    let serves = asked
+    // Which interface the request's tower names, and the tower this server has for it. A request
+    // for something this server does not publish is answered "nothing here", which is a different
+    // statement from a tower naming a service that would refuse the client.
+    let wanted = asked
         .as_deref()
-        .is_some_and(|tower| publishes_drsuapi_over_tcp(tower));
+        .and_then(|tower| published_interface(tower, published.drsuapi_port));
+    let serves = wanted.is_some();
+    tracing::info!(
+        asked = %asked
+            .as_deref()
+            .map(|tower| hex(&tower[..tower.len().min(40)]))
+            .unwrap_or_default(),
+        interface = wanted.as_ref().map(|(_, name, _)| *name).unwrap_or("-"),
+        serves,
+        "epm: ept_map asked about this interface"
+    );
     // `max_towers` is a size parameter, and the answer's conformant array has to be sized by the
     // value the client named - not by what this server happens to return. Answering one tower in an
     // array declared with room for one, when the client asked for more, is what a client reports as
@@ -275,7 +326,7 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
         writer.u32(STATUS_NO_MORE_ENTRIES);
         return Ok(writer.finish());
     }
-    let tower = drsuapi_tower(published.drsuapi_port);
+    let (_, _, tower) = wanted.expect("checked above");
     writer.u32(1); // num_towers
     writer.u32(max_towers); // the maximum
     writer.u32(0); // offset
@@ -340,23 +391,20 @@ fn tower_size(tower: &[u8]) -> Option<usize> {
     Some(at)
 }
 
-/// Whether a tower asks for `drsuapi` at version 4.0 over `ncacn_ip_tcp`.
+/// The tower this server would answer with, for the interface a request's tower names.
 ///
-/// Read from the floors rather than searched for: the first floor carries the interface and its
-/// version, and one of the later ones names the transport. A tower for the right interface over a
-/// transport this server does not serve is not one it can answer.
-fn publishes_drsuapi_over_tcp(tower: &[u8]) -> bool {
-    let Some(floors) = floors_of(tower) else {
-        return false;
-    };
-    let Some((protocol, uuid, version)) = floors.first().and_then(|floor| interface_of(floor))
-    else {
-        return false;
-    };
-    protocol == PROTOCOL_UUID
-        && uuid == DRSUAPI.uuid
-        && u32::from(version) == DRSUAPI.version
-        && floors.iter().any(|floor| floor.protocol == PROTOCOL_TCP)
+/// Read from the floors rather than searched for: the first floor carries the interface, and one of
+/// the later ones names the transport. A tower for an interface this server does not publish over a
+/// transport it does not serve is `None`.
+fn published_interface(tower: &[u8], port: u16) -> Option<(SyntaxId, &'static str, Vec<u8>)> {
+    let floors = floors_of(tower)?;
+    let (protocol, uuid, _version) = floors.first().and_then(interface_of)?;
+    if protocol != PROTOCOL_UUID || !floors.iter().any(|floor| floor.protocol == PROTOCOL_TCP) {
+        return None;
+    }
+    published_towers(port)
+        .into_iter()
+        .find(|(syntax, _, _)| syntax.uuid == uuid)
 }
 
 /// One floor as the tower holds it.
@@ -465,7 +513,7 @@ mod tests {
     /// The tower, in the shape a live Samba controller answers with.
     #[test]
     fn the_tower_names_drsuapi_over_tcp_and_pads_nothing() {
-        let tower = drsuapi_tower(49152);
+        let tower = interface_tower(DRSUAPI, 49152);
         assert_eq!(&tower[..2], &[0x05, 0x00], "five floors");
         // Floor one: the interface floor, nineteen octets of left-hand side.
         assert_eq!(&tower[2..4], &[0x13, 0x00]);
@@ -492,37 +540,80 @@ mod tests {
     /// The acceptance of the whole interface: a client that asks for everything is told where
     /// `drsuapi` lives, and the answer is one entry with one tower behind a referent.
     #[test]
-    fn a_lookup_answers_one_entry_and_its_tower() {
+    fn a_lookup_answers_every_interface_this_server_publishes() {
         let stub = lookup_stub(500, &[0_u8; 20]);
         let body = serve(OPNUM_LOOKUP, &stub, published()).expect("answered");
 
         assert_eq!(word(&body, 0), 0, "the handle type the client sent");
         assert_eq!(&body[4..12], b"RRL-EPM!", "a handle that is not null");
-        assert_eq!(word(&body, 20), 1, "one endpoint");
+        // Three interfaces, because a client asks about more than the one it needs: measured, a
+        // join asks for `netlogon` and `lsarpc` as well, and a mapper that answers "nothing here"
+        // for those makes it give up on the controller.
+        assert_eq!(word(&body, 20), 3, "three endpoints");
         assert_eq!(word(&body, 24), 500, "the maximum the client offered");
         assert_eq!(word(&body, 28), 0, "offset into the array");
-        assert_eq!(word(&body, 32), 1, "actual count");
-        // The entry: sixteen octets of GUID, a referent, zero offset, then the name and its NUL.
-        assert_eq!(&body[36..52], &[0_u8; 16], "no object");
-        assert_ne!(word(&body, 52), 0, "the tower is behind a referent");
-        assert_eq!(word(&body, 56), 0, "the annotation offset");
-        assert_eq!(word(&body, 60), 8, "the annotation counts its NUL");
-        assert_eq!(&body[64..72], b"drsuapi\0");
+        assert_eq!(word(&body, 32), 3, "actual count");
 
-        let tower_at = 72;
-        let tower_len = word(&body, tower_at) as usize;
-        assert_eq!(tower_len, 75);
+        // Walk the entries: sixteen octets of GUID, a referent, then the annotation and its NUL.
+        let mut at = 36;
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(&body[at..at + 16], &[0_u8; 16], "no object");
+            assert_ne!(word(&body, at + 16), 0, "the tower is behind a referent");
+            assert_eq!(word(&body, at + 20), 0, "the annotation offset");
+            let len = word(&body, at + 24) as usize;
+            let name = &body[at + 28..at + 28 + len - 1];
+            names.push(String::from_utf8(name.to_vec()).expect("ascii"));
+            at = (at + 28 + len).next_multiple_of(4);
+        }
+        assert_eq!(names, ["drsuapi", "netlogon", "lsarpc"]);
+
+        // Then the towers, in the same order, each length written twice.
+        for syntax in [DRSUAPI, NETLOGON, LSARPC] {
+            let len = word(&body, at) as usize;
+            assert_eq!(
+                word(&body, at + 4) as usize,
+                len,
+                "the subcontext repeats it"
+            );
+            assert_eq!(
+                &body[at + 8..at + 8 + len],
+                &interface_tower(syntax, 49152)[..]
+            );
+            at = (at + 8 + len).next_multiple_of(4);
+        }
+        assert_eq!(word(&body, at), STATUS_OK);
+        assert_eq!(body.len(), at + 4, "nothing trails the status");
+    }
+
+    /// A filter naming `netlogon` is answered with `netlogon`, not with whatever is published first.
+    #[test]
+    fn a_lookup_by_interface_answers_that_interface() {
+        let mut stub = Vec::new();
+        stub.extend_from_slice(&INQUIRY_MATCH_BY_IF.to_le_bytes());
+        stub.extend_from_slice(&0_u32.to_le_bytes()); // object: NULL
+        stub.extend_from_slice(&1_u32.to_le_bytes()); // interface_id: a referent
+        stub.extend_from_slice(&0_u32.to_le_bytes()); // vers_option
+        stub.extend_from_slice(&[0_u8; 20]); // handle
+        stub.extend_from_slice(&500_u32.to_le_bytes());
+        stub.extend_from_slice(&NETLOGON.uuid);
+        stub.extend_from_slice(&NETLOGON.version.to_le_bytes());
+        stub.extend_from_slice(&0_u16.to_le_bytes());
+
+        let body = serve(OPNUM_LOOKUP, &stub, published()).expect("answered");
+        assert_eq!(word(&body, 20), 1, "one endpoint");
+        let len = word(&body, 60) as usize;
         assert_eq!(
-            word(&body, tower_at + 4) as usize,
-            tower_len,
-            "the subcontext repeats the length"
+            &body[64..64 + len - 1],
+            b"netlogon",
+            "the one that was asked for"
         );
-        let tower = &body[tower_at + 8..tower_at + 8 + tower_len];
-        assert_eq!(tower, &drsuapi_tower(49152)[..]);
-        // The status follows the padded tower.
-        let status_at = (tower_at + 8 + tower_len).next_multiple_of(4);
-        assert_eq!(word(&body, status_at), STATUS_OK);
-        assert_eq!(body.len(), status_at + 4, "nothing trails the status");
+        let tower_at = (64 + len).next_multiple_of(4);
+        let tower_len = word(&body, tower_at) as usize;
+        assert_eq!(
+            &body[tower_at + 8..tower_at + 8 + tower_len],
+            &interface_tower(NETLOGON, 49152)[..]
+        );
     }
 
     /// A client that comes back with the handle it was given has seen everything.
@@ -603,8 +694,8 @@ mod tests {
         let asked = tower_in(&stub).expect("the tower is found by its own length");
         assert_eq!(asked.len(), 75);
         assert!(
-            publishes_drsuapi_over_tcp(&asked),
-            "it asks for drsuapi 4.0 over tcp"
+            published_interface(&asked, 49152).is_some(),
+            "it asks for drsuapi over tcp"
         );
 
         let body = serve(OPNUM_MAP, &stub, published()).expect("answered");

@@ -831,7 +831,7 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
         let endpoint = endpoint.clone();
         let kerberos = kerberos.clone();
         tokio::spawn(async move {
-            debug!(%peer, "rpc: connection opened");
+            debug!(%peer, port, "rpc: connection opened");
             if let Err(err) = connection(stream, port, &endpoint, kerberos.as_ref()).await {
                 debug!(%peer, %err, "rpc: connection ended");
             }
@@ -1022,6 +1022,25 @@ fn answer(
                 Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => {
                     super::drsuapi::serve(request.opnum, stub)
                 }
+                // Named by the mapper but not answered here yet: the call is logged with its opnum
+                // so the sequence a client expects can be read from a trace, and refused by number
+                // rather than with a protocol error - those two read very differently to a client.
+                Some(syntax)
+                    if syntax.uuid == pdu::NETLOGON.uuid
+                        || syntax.uuid == pdu::LSARPC.uuid
+                        || syntax.uuid == pdu::SAMR.uuid =>
+                {
+                    tracing::info!(
+                        interface = %hex(&syntax.uuid),
+                        opnum = request.opnum,
+                        stub = stub.len(),
+                        "rpc: a call on an interface named by the mapper, not served here yet"
+                    );
+                    Err(super::association::Fault {
+                        status: pdu::NCA_OP_RNG_ERROR,
+                        did_not_execute: true,
+                    })
+                }
                 Some(syntax) if syntax.uuid == pdu::EPM.uuid => match endpoint.publish {
                     Some(published) => super::epm::serve(request.opnum, stub, published),
                     // A listener that does not publish anything would answer the mapper with a
@@ -1114,7 +1133,14 @@ fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<Context
         // same address - the mapper at 135 and the interface it names.
         let serves_interface = matches!(
             element.abstract_syntax.uuid,
-            uuid if uuid == pdu::DRSUAPI.uuid || uuid == pdu::EPM.uuid
+            uuid if uuid == pdu::DRSUAPI.uuid
+                || uuid == pdu::EPM.uuid
+                // Named by the mapper and therefore bindable here: a client that asked where
+                // `netlogon` or `lsarpc` lives was answered with this port, and a bind it cannot
+                // make turns that answer into a dead end.
+                || uuid == pdu::NETLOGON.uuid
+                || uuid == pdu::LSARPC.uuid
+                || uuid == pdu::SAMR.uuid
         );
         let speaks_ndr32 = element
             .transfer_syntaxes
