@@ -212,8 +212,12 @@ const MAX_FRAG: u16 = 5840;
 const RESULT_ACCEPTANCE: u16 = 0;
 /// `provider_rejection`: this server knows the interface but not the transfer syntax asked for.
 const RESULT_PROVIDER_REJECTION: u16 = 2;
-/// `reason_not_specified`, for an interface this server does not serve at all.
-const REASON_NOT_SPECIFIED: u16 = 1;
+/// `proposed_transfer_syntaxes_not_supported`: the interface is here, the encoding is not.
+const REASON_TRANSFER_SYNTAX_NOT_SUPPORTED: u16 = 2;
+/// `local_limit_exceeded`: the shape a client accepts for a context this server does not serve.
+const RESULT_LOCAL_LIMIT_EXCEEDED: u16 = 3;
+/// And its reason, measured from the same answer.
+const REASON_LOCAL_LIMIT_EXCEEDED: u16 = 3;
 /// `abstract_syntax_not_supported`, for a known interface with an unusable transfer syntax.
 const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u16 = 3;
 
@@ -879,6 +883,9 @@ async fn connection(
                 kerberos,
                 &mut exchange,
             ) {
+                if std::env::var_os("RRL_EPM_DIAG").is_some() {
+                    warn!(hex = %hex(&reply), "rpc: a PDU leaves this endpoint");
+                }
                 stream.write_all(&reply).await?;
             }
         }
@@ -1092,6 +1099,13 @@ fn answer(
 }
 
 /// One result per context element, and the accepted ones recorded for later calls.
+///
+/// The two refusals are not the same refusal, and a client reads the numbers: measured against a
+/// live Samba controller answering a Windows join, the transfer syntax it cannot speak (NDR64) is
+/// `provider_rejection` with reason `2` - *proposed transfer syntaxes not supported* - while a
+/// context it does not serve at all is `3`, *local limit exceeded*. Answering `2` to the second kind
+/// makes the client treat the whole bind as refused, which is what it reports as
+/// `RPC_S_SERVER_UNAVAILABLE` for an interface that is listening.
 fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<ContextResult> {
     let mut results = Vec::with_capacity(bind.contexts.len());
     for element in &bind.contexts {
@@ -1116,15 +1130,19 @@ fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<Context
                 contexts.push((element.id, element.abstract_syntax));
             }
         } else {
-            // Two refusals that read the same to a client and differently to whoever reads the log:
-            // an interface this server does not serve, and a transfer syntax it cannot speak.
-            let reason = if serves_interface {
-                REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED
+            let (result, reason) = if serves_interface {
+                // The interface is here; the transfer syntax the client proposed is not.
+                (
+                    RESULT_PROVIDER_REJECTION,
+                    REASON_TRANSFER_SYNTAX_NOT_SUPPORTED,
+                )
             } else {
-                REASON_NOT_SPECIFIED
+                // Nothing by that name, and a client that sees `2` here reads the bind as broken
+                // rather than this context as absent.
+                (RESULT_LOCAL_LIMIT_EXCEEDED, REASON_LOCAL_LIMIT_EXCEEDED)
             };
             results.push(ContextResult {
-                result: RESULT_PROVIDER_REJECTION,
+                result,
                 reason,
                 transfer_syntax: SyntaxId {
                     uuid: [0; 16],
@@ -1381,9 +1399,15 @@ mod tests {
         assert!(contexts.is_empty(), "nothing was taken");
         let ack = &replies[0];
         let results_at = ack.len() - 24;
+        // `3` and `3`: local limit exceeded. `2` here is what a client reads as a broken bind
+        // rather than as a context this server does not serve - measured against a live controller.
         assert_eq!(
             u16::from_le_bytes([ack[results_at], ack[results_at + 1]]),
-            2
+            3
+        );
+        assert_eq!(
+            u16::from_le_bytes([ack[results_at + 2], ack[results_at + 3]]),
+            3
         );
     }
 
