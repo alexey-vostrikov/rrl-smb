@@ -577,6 +577,28 @@ impl NtlmMac {
     pub fn verify(&mut self, message: &[u8], signature: &[u8]) -> bool {
         ct_eq_16(&self.mac(message), signature)
     }
+
+    /// Takes `data` through the sealing cipher, in place.
+    ///
+    /// One RC4 stream per direction, shared with the checksum: the send direction encrypts the
+    /// message first and then masks the checksum with the state that leaves behind, and the receive
+    /// direction must advance its own stream by the message before a signature will verify
+    /// (MS-NLMP 3.4.3, and Samba's `ntlmssp_unseal_packet`, which decrypts and only then checks).
+    /// That is why this cannot be a separate handle and why a message and its signature cannot be
+    /// verified in the other order.
+    ///
+    /// Returns `false` when the association negotiated no key exchange, and so has no stream to
+    /// seal with - a client that seals without `NTLMSSP_NEGOTIATE_KEY_EXCH` is not one this
+    /// implementation can answer.
+    pub fn seal(&mut self, data: &mut [u8]) -> bool {
+        match self.handle.as_mut() {
+            Some(handle) => {
+                handle.apply_keystream(data);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 // --- Public state machine ---------------------------------------------------
