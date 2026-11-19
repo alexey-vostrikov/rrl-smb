@@ -847,6 +847,17 @@ fn authenticate3(
             "netlogon-keys"
         );
     }
+    if std::env::var_os("NETLOGON_KEY_DUMP").is_some() {
+        // Both halves of the capability check: MS-NRPC 3.1.4.4.2 has the client compare the flags
+        // this server returns against the ones it offered, and a bit echoed that was not offered -
+        // or one withheld that was - is `STATUS_ACCESS_DENIED` with nothing in the client's own
+        // report to say which bit.
+        tracing::warn!(
+            client_flags = format_args!("{client_flags:#010x}"),
+            server_flags = format_args!("{:#010x}", server_flags(client_flags)),
+            "netlogon: capabilities offered and answered"
+        );
+    }
     let answer = match verdict(&machine.nt_hash, aes, des, &challenge, &client_credential) {
         Verdict::Accepted(answer) => answer,
         Verdict::Unsupported => {
@@ -936,6 +947,13 @@ fn server_flags(client: u32) -> u32 {
     /// `NETLOGON_NEG_AUTHENTICATED_RPC` (0x40000000): the channel is checked, not anonymous.
     const AUTHENTICATED_RPC: u32 = 0x4000_0000;
 
+    // A diagnostic, and only that: echoing the whole offer says this server implements every
+    // facility the client named, which it does not. It exists to answer one question with an
+    // experiment - whether a client that refuses a subset is refusing the subset or refusing some
+    // particular bit - and it must not become the answer.
+    if std::env::var_os("RRL_NETLOGON_ECHO").is_some() {
+        return client;
+    }
     client & (STRONG_KEYS | SUPPORTS_AES | AUTHENTICATED_RPC | PASSWORD_SET2)
 }
 
