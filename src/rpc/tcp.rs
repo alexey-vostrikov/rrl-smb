@@ -44,7 +44,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
-use crate::proto::auth::ntlm::{NtlmServer, NtlmTargetInfo};
+use crate::proto::auth::ntlm::{Direction, NtlmMac, NtlmServer, NtlmTargetInfo};
 use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
 
 pub use super::epm::Published;
@@ -71,6 +71,12 @@ pub struct Endpoint {
     /// Absent means this endpoint accepts NTLM only - a different statement from "the keytab is
     /// broken", which is a startup error.
     pub keytab: Option<std::path::PathBuf>,
+    /// The accounts an `RPC_C_AUTHN_WINNT` logon may name.
+    ///
+    /// A Windows join authenticates its second call on this endpoint with NTLM, not with a ticket -
+    /// the domain it is joining has issued it none - so a listener without this refuses the call
+    /// that `NetpGetComputerObjectDn` depends on. Same source SMB uses: the directory's accounts.
+    pub logon_users: Option<Arc<dyn crate::LogonUsers>>,
     /// What an endpoint mapper on this listener should name for `drsuapi`.
     ///
     /// Set on the listener bound to TCP 135: the mapper answers with the port named here, and that
@@ -111,7 +117,73 @@ struct Exchange {
     /// answer to it is 0 too.
     recv_seq: u64,
     send_seq: u64,
+    /// The mechanism and level this association agreed on, for the answers that carry a verifier.
+    ///
+    /// Recorded rather than assumed: a client that authenticated with NTLM reads an answer stamped
+    /// `GSS negotiate` as a protocol error, and the level decides whether the body is signed.
+    agreed: Option<Agreed>,
+    /// NTLM per-message signing, once an AUTHENTICATE was verified: (what this server sends, what it
+    /// expects to receive).
+    sign: Option<(NtlmMac, NtlmMac)>,
+    /// The session key and negotiated flags, kept because a signature has to be probed against both
+    /// possible readings of "the message" and a probe needs a fresh state: the RC4 stream behind an
+    /// NTLM signature is stateful, so a live one cannot be asked twice.
+    key: Option<(u32, [u8; 16])>,
+    /// Which reading of the signed message this client uses, once a signature has proved it.
+    sig_style: Option<SigStyle>,
 }
+
+/// What an NTLM signature covers (MS-RPCE 2.2.2.9.1).
+///
+/// Two readings are in use and the difference is not cosmetic: one signs the whole PDU with the
+/// signature octets zeroed, the other signs the header and body alone. Which one a client uses is
+/// decided by the first call that verifies, not assumed - a server that guessed would reject a
+/// correctly signed call with nothing in the log to say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigStyle {
+    /// The whole PDU, signature octets zeroed.
+    Zeroed,
+    /// Everything the PDU holds ahead of the signature: header, arguments and `sec_trailer`.
+    ///
+    /// This is the one a Windows Server 2022 client uses, measured: the checksum of its first
+    /// signed call matches an HMAC over exactly these octets and over no other reading of them.
+    BeforeSignature,
+}
+
+impl SigStyle {
+    /// The octets this style signs, taken from a whole PDU.
+    fn message(self, pdu: &[u8], sig_len: usize) -> Vec<u8> {
+        match self {
+            SigStyle::Zeroed => {
+                let mut copy = pdu.to_vec();
+                let from = copy.len().saturating_sub(sig_len);
+                copy[from..].fill(0);
+                copy
+            }
+            SigStyle::BeforeSignature => pdu[..pdu.len().saturating_sub(sig_len)].to_vec(),
+        }
+    }
+}
+
+/// What an association's verifier says about itself.
+#[derive(Debug, Clone, Copy)]
+struct Agreed {
+    /// `RPC_C_AUTHN_*`: 9 for SPNEGO, 10 for raw NTLMSSP.
+    auth_type: u8,
+    /// `RPC_C_AUTHN_LEVEL_*`: 5 is integrity, 6 is privacy.
+    auth_level: u8,
+    /// The context the client named, echoed in every answer.
+    auth_context_id: u32,
+}
+
+/// `RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`: every PDU is signed, none is encrypted.
+const LEVEL_INTEGRITY: u8 = 5;
+/// `RPC_C_AUTHN_LEVEL_PKT_PRIVACY`: every PDU is sealed.
+const LEVEL_PRIVACY: u8 = 6;
+/// The NTLMSSP message types, in the second word of a token (MS-NLMP 2.2).
+const NTLMSSP_NEGOTIATE: u32 = 1;
+/// `AUTHENTICATE_MESSAGE`.
+const NTLMSSP_AUTHENTICATE: u32 = 3;
 
 impl Default for Exchange {
     fn default() -> Self {
@@ -122,6 +194,10 @@ impl Default for Exchange {
             seal: None,
             recv_seq: 0,
             send_seq: 0,
+            agreed: None,
+            sign: None,
+            key: None,
+            sig_style: None,
         }
     }
 }
@@ -163,13 +239,23 @@ fn assoc_group() -> u32 {
 /// and it names a service this server holds a key for - so it can be accepted here without a password
 /// and without a second round. NTLM is the fallback for a client whose ticket cannot be used, because
 /// the sealing it needs is already implemented and proven against a live client.
-fn spnego_answer(
+fn auth_answer(
     parsed: &Pdu<'_>,
     endpoint: &Endpoint,
     kerberos: Option<&Arc<krb5::Keytab>>,
     exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let auth = parsed.auth.as_ref()?;
+    // Recorded on the first verifier of the association: every answer has to name the mechanism and
+    // level the client chose, and a client reads a different one as a protocol error.
+    exchange.agreed.get_or_insert(Agreed {
+        auth_type: auth.auth_type,
+        auth_level: auth.auth_level,
+        auth_context_id: auth.auth_context_id,
+    });
+    if auth.auth_type == pdu::AuthVerifier::TYPE_NTLM {
+        return ntlm_answer(auth.token, endpoint, exchange);
+    }
     if auth.auth_type != pdu::AuthVerifier::TYPE_GSS_NEGOTIATE {
         debug!(
             auth_type = auth.auth_type,
@@ -443,6 +529,11 @@ fn seal_answer(stub: &[u8], level: u8, exchange: &mut Exchange) -> (Vec<u8>, Opt
     }
 }
 
+/// Hex for a log line, in the form a trace of the wire reads.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|octet| format!("{octet:02x}")).collect()
+}
+
 /// The mechanism's own token inside a GSS-API envelope.
 ///
 /// `0x6e` opens an AP-REQ and `0x6f` an AP-REP; a client that receives the envelope where it expects
@@ -456,15 +547,88 @@ fn mechanism_token(token: &[u8]) -> &[u8] {
     token
 }
 
-/// A CHALLENGE for an NTLMSSP NEGOTIATE, inside a `NegTokenResp`.
-fn challenge_for(
+/// The NTLMSSP exchange on an association that chose `RPC_C_AUTHN_WINNT` (10).
+///
+/// A Windows join authenticates its second call on this endpoint with raw NTLMSSP - measured:
+/// `auth_type=10`, level 5, a forty-octet NEGOTIATE with flags `0xe2088297`, no SPNEGO around it.
+/// The handshake is the same three messages SMB uses; what differs is where the token travels (the
+/// verifier) and that the association is signed rather than sealed afterwards.
+fn ntlm_answer(token: &[u8], endpoint: &Endpoint, exchange: &mut Exchange) -> Option<Vec<u8>> {
+    if !token.starts_with(b"NTLMSSP\x00") || token.len() < 12 {
+        // At level 5 the verifier of every later call is a sixteen-octet signature, not a
+        // NTLMSSP message: nothing to answer here.
+        return None;
+    }
+    let kind = u32::from_le_bytes(token[8..12].try_into().expect("four octets"));
+    match kind {
+        NTLMSSP_NEGOTIATE => challenge_blob(token, endpoint, exchange),
+        NTLMSSP_AUTHENTICATE => {
+            // Taken out of the exchange: `authenticate` needs the server while the signing state
+            // it produces belongs to the same exchange.
+            let Some(server) = exchange.ntlm.take() else {
+                warn!("rpc: an AUTHENTICATE arrived with no NEGOTIATE before it");
+                return None;
+            };
+            let Some(users) = endpoint.logon_users.as_ref() else {
+                warn!("rpc: NTLM offered, but this listener has no accounts to check it against");
+                return None;
+            };
+            let lookup = |user: &str, _domain: &str| users.user(user);
+            match server.authenticate(token, lookup) {
+                Ok(outcome) => {
+                    exchange.key = Some((outcome.flags, outcome.session_key));
+                    let (send, recv) = (
+                        NtlmMac::new(
+                            outcome.flags,
+                            &outcome.session_key,
+                            Direction::ServerToClient,
+                        ),
+                        NtlmMac::new(
+                            outcome.flags,
+                            &outcome.session_key,
+                            Direction::ClientToServer,
+                        ),
+                    );
+                    match (send, recv) {
+                        (Some(send), Some(recv)) => exchange.sign = Some((send, recv)),
+                        // Integrity was not negotiated: the association can still be used, but
+                        // nothing signs it, and saying so is better than pretending.
+                        _ => warn!("rpc: NTLM accepted without integrity; calls will be unsigned"),
+                    }
+                    info!(
+                        identity = ?outcome.identity,
+                        flags = format_args!("0x{:08x}", outcome.flags),
+                        "rpc: NTLM accepted over this endpoint"
+                    );
+                    exchange.principal = Some(match &outcome.identity {
+                        crate::proto::auth::ntlm::Identity::User { user, domain } => {
+                            format!("{domain}\\{user}")
+                        }
+                        crate::proto::auth::ntlm::Identity::Anonymous => "anonymous".to_string(),
+                    });
+                    None
+                }
+                Err(err) => {
+                    warn!(%err, "rpc: NTLM AUTHENTICATE refused");
+                    None
+                }
+            }
+        }
+        other => {
+            debug!(kind = other, "rpc: NTLMSSP message of an unknown type");
+            None
+        }
+    }
+}
+
+/// The raw NTLMSSP CHALLENGE for a NEGOTIATE, and the exchange state it starts.
+fn challenge_blob(
     negotiate: &[u8],
     endpoint: &Endpoint,
     exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let mut challenge = [0_u8; 8];
     if let Err(err) = crate::utils::fill_random(&mut challenge) {
-        // An NTLM challenge that is not random is one that repeats: the exchange must not go on.
         warn!(%err, "rpc: the OS random source failed; no challenge");
         return None;
     }
@@ -489,12 +653,124 @@ fn challenge_for(
         challenge = blob.len(),
         "rpc: answering with an NTLMSSP challenge"
     );
+    Some(blob)
+}
+
+/// A CHALLENGE for an NTLMSSP NEGOTIATE, inside a `NegTokenResp`.
+fn challenge_for(
+    negotiate: &[u8],
+    endpoint: &Endpoint,
+    exchange: &mut Exchange,
+) -> Option<Vec<u8>> {
+    let blob = challenge_blob(negotiate, endpoint, exchange)?;
     Some(spnego::encode_resp_token(
         NegState::AcceptIncomplete,
         Some(OID_NTLMSSP),
         Some(&blob),
         None,
     ))
+}
+
+/// Whether a call's NTLM signature is the client's.
+///
+/// An association that negotiated no integrity has nothing to check, and that is not a failure: the
+/// answer is `true` because there was no signature, which is different from one that did not verify.
+fn verify_signature(raw: &[u8], auth: &pdu::AuthVerifier<'_>, exchange: &mut Exchange) -> bool {
+    if exchange.sign.is_none() {
+        return true;
+    }
+    let sig = auth.token;
+    if sig.len() != 16 {
+        warn!(len = sig.len(), "rpc: a signature of an unexpected length");
+        return false;
+    }
+    // The style is settled by the first signature that verifies, on a fresh state: the RC4 stream
+    // behind NTLM signing advances with every message, so the live one cannot be asked twice.
+    if exchange.sig_style.is_none() {
+        let settled = exchange
+            .key
+            .as_ref()
+            .and_then(|(flags, key)| signature_style(raw, sig, *flags, key));
+        match settled {
+            Some(style) => {
+                info!(style = ?style, "rpc: this client's NTLM signatures cover that much");
+                exchange.sig_style = Some(style);
+            }
+            None => {
+                warn!(
+                    hex = %hex(raw),
+                    sig = %hex(sig),
+                    key = ?exchange.key.as_ref().map(|(flags, key)| (flags, hex(key))),
+                    "rpc: no reading of the signed message matches this signature"
+                );
+                return false;
+            }
+        }
+    }
+    let style = exchange.sig_style.expect("settled above");
+    let message = style.message(raw, sig.len());
+    let Some((_, recv)) = exchange.sign.as_mut() else {
+        return true;
+    };
+    let ok = recv.verify(&message, sig);
+    if !ok {
+        warn!(style = ?style, "rpc: the NTLM signature did not verify");
+    }
+    ok
+}
+
+/// Which reading of the signed message produced `sig`, if either.
+fn signature_style(raw: &[u8], sig: &[u8], flags: u32, key: &[u8; 16]) -> Option<SigStyle> {
+    for style in [SigStyle::BeforeSignature, SigStyle::Zeroed] {
+        if let Some(mut probe) = NtlmMac::new(flags, key, Direction::ClientToServer)
+            && probe.verify(&style.message(raw, sig.len()), sig)
+        {
+            return Some(style);
+        }
+    }
+    None
+}
+
+/// Signs a built answer, in place of the zero placeholder its verifier carries.
+///
+/// The placeholder is what makes this work: the signature covers the whole PDU, so the octets it
+/// will occupy have to exist and be zero while it is computed.
+fn sign_reply(mut reply: Vec<u8>, exchange: &mut Exchange) -> Vec<u8> {
+    let style = match exchange.sig_style {
+        Some(style) => style,
+        // Nothing signed yet: an answer to the AUTHENTICATE or a first call that carried no
+        // signature has no signature either.
+        None => return reply,
+    };
+    let Some((send, _)) = exchange.sign.as_mut() else {
+        return reply;
+    };
+    let message = match style {
+        SigStyle::Zeroed => reply.clone(),
+        SigStyle::BeforeSignature => reply[..reply.len().saturating_sub(16)].to_vec(),
+    };
+    let signature = send.mac(&message);
+    let from = reply.len() - 16;
+    reply[from..].copy_from_slice(&signature);
+    if std::env::var_os("RRL_EPM_DIAG").is_some() {
+        warn!(hex = %hex(&reply), "rpc: the signed answer, as it goes on the wire");
+    }
+    debug!(style = ?style, "rpc: the answer was signed");
+    reply
+}
+
+/// The verifier an answer carries, when the association authenticated.
+fn reply_verifier<'a>(token: Option<&'a [u8]>, exchange: &Exchange) -> Option<AuthReply<'a>> {
+    let agreed = exchange.agreed?;
+    Some(AuthReply {
+        auth_type: agreed.auth_type,
+        auth_level: agreed.auth_level,
+        // A bind answer adds no padding: the token follows the result list directly, and a
+        // non-zero count here would tell the client to skip octets that are not there.
+        auth_pad_length: 0,
+        auth_context_id: agreed.auth_context_id,
+        token: token?,
+    })
 }
 
 /// Binds `addr` and serves every connection until the process ends.
@@ -596,6 +872,7 @@ async fn connection(
             };
             for reply in answer(
                 &parsed,
+                &raw,
                 &mut contexts,
                 port,
                 endpoint,
@@ -614,6 +891,7 @@ async fn connection(
 /// which contexts are taken and what a call is answered with, and neither needs a peer.
 fn answer(
     parsed: &Pdu<'_>,
+    raw: &[u8],
     contexts: &mut Vec<(u16, SyntaxId)>,
     port: u16,
     endpoint: &Endpoint,
@@ -621,7 +899,7 @@ fn answer(
     exchange: &mut Exchange,
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
-    let token = spnego_answer(parsed, endpoint, kerberos, exchange);
+    let token = auth_answer(parsed, endpoint, kerberos, exchange);
     // One line per PDU: which packet type arrived and, for a call, which interface and opnum. A
     // client that connects and then stops speaking is otherwise indistinguishable from one that
     // never connected, and that difference was the whole of a day's work on this endpoint.
@@ -650,21 +928,7 @@ fn answer(
                 assoc_group(),
                 &port.to_string(),
                 &results(bind, contexts),
-                token
-                    .as_deref()
-                    .map(|token| AuthReply {
-                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
-                        auth_level: parsed.auth.as_ref().map_or(6, |auth| auth.auth_level),
-                        // This PDU adds no padding: the token follows the result list directly, and a
-                        // non-zero count here would tell the client to skip octets that are not there.
-                        auth_pad_length: 0,
-                        auth_context_id: parsed
-                            .auth
-                            .as_ref()
-                            .map_or(0, |auth| auth.auth_context_id),
-                        token,
-                    })
-                    .as_ref(),
+                reply_verifier(token.as_deref(), exchange).as_ref(),
             )]
         }
 
@@ -692,19 +956,7 @@ fn answer(
                 0,
                 "",
                 &results(bind, contexts),
-                token
-                    .as_deref()
-                    .map(|token| AuthReply {
-                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
-                        auth_level: parsed.auth.as_ref().map_or(6, |auth| auth.auth_level),
-                        auth_pad_length: 0,
-                        auth_context_id: parsed
-                            .auth
-                            .as_ref()
-                            .map_or(0, |auth| auth.auth_context_id),
-                        token,
-                    })
-                    .as_ref(),
+                reply_verifier(token.as_deref(), exchange).as_ref(),
             )]
         }
 
@@ -736,7 +988,28 @@ fn answer(
                 // Below level 6 the stub is the arguments, and padding it needs is the PDU's own.
                 _ => None,
             };
-            let stub = unsealed.as_deref().unwrap_or(request.stub);
+            // At level 5 the arguments are in the clear and the verifier is a signature, so the
+            // stub arrives untouched - including the `auth_pad_length` octets MS-RPCE puts at its
+            // end to align the `sec_trailer`. A handler that reads fields counts them as arguments
+            // unless they are taken off first, which is a misread rather than a short read.
+            let stub = match unsealed.as_deref() {
+                Some(opened) => opened,
+                None if level == LEVEL_INTEGRITY && pad > 0 => request
+                    .stub
+                    .get(..request.stub.len().saturating_sub(pad))
+                    .unwrap_or(request.stub),
+                None => request.stub,
+            };
+
+            // At level 5 the arguments travel in the clear and a signature stands beside them. It
+            // covers the PDU as the client wrote it, so it is checked on `raw`, before anything here
+            // has had a chance to rewrite it.
+            if level == LEVEL_INTEGRITY
+                && let Some(auth) = parsed.auth.as_ref()
+                && !verify_signature(raw, auth, exchange)
+            {
+                return Vec::new();
+            }
 
             let result = match interface {
                 Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => {
@@ -773,28 +1046,29 @@ fn answer(
             match result {
                 Ok(stub) => {
                     let (body, header) = seal_answer(&stub, level, exchange);
-                    // Built here, not inside the helper: a verifier borrows its token, and the token
-                    // is the helper's return value, so it has to outlive the call.
-                    let verifier = header.as_deref().map(|token| AuthReply {
-                        auth_type: pdu::AuthVerifier::TYPE_GSS_NEGOTIATE,
-                        auth_level: 6,
-                        // The padding travels **inside** the seal (MS-RPCE 2.2.2.11.1), so the PDU
-                        // itself adds none and this count is what the client must not skip.
-                        auth_pad_length: 0,
-                        auth_context_id: parsed
-                            .auth
-                            .as_ref()
-                            .map_or(0, |auth| auth.auth_context_id),
-                        token,
-                    });
-                    vec![pdu::response(
+                    // At level 5 the answer is signed rather than sealed: the verifier is a
+                    // sixteen-octet signature, and the placeholder it occupies has to be part of the
+                    // PDU while the signature over that PDU is computed.
+                    let signing = level == LEVEL_INTEGRITY && exchange.sign.is_some();
+                    let placeholder = signing.then_some([0_u8; 16]);
+                    // One token for two shapes: the seal's header, or the signature's placeholder.
+                    let token: Option<&[u8]> = header
+                        .as_deref()
+                        .or(placeholder.as_ref().map(|zeros| &zeros[..]));
+                    let verifier = reply_verifier(token, exchange);
+                    let reply = pdu::response(
                         parsed.header.call_id,
                         pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
                         u32::try_from(stub.len()).unwrap_or(u32::MAX),
                         request.context_id,
                         &body,
                         verifier.as_ref(),
-                    )]
+                    );
+                    vec![if signing {
+                        sign_reply(reply, exchange)
+                    } else {
+                        reply
+                    }]
                 }
                 Err(fault) => vec![pdu::fault(
                     parsed.header.call_id,
@@ -931,6 +1205,7 @@ mod tests {
             nb_computer: "SAMBA".to_string(),
             dns_computer: "samba.ad.example.com".to_string(),
             keytab: None,
+            logon_users: None,
             publish: None,
         }
     }
@@ -992,6 +1267,7 @@ mod tests {
         let mut exchange = Exchange::default();
         let answer = &answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1035,6 +1311,7 @@ mod tests {
         let mut exchange = Exchange::default();
         let answer = &answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1061,6 +1338,7 @@ mod tests {
         let mut contexts = Vec::new();
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1093,6 +1371,7 @@ mod tests {
         let mut contexts = Vec::new();
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1115,6 +1394,7 @@ mod tests {
         let mut contexts = Vec::new();
         answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1128,6 +1408,7 @@ mod tests {
         let parsed = pdu::parse(&call).expect("a request");
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1155,6 +1436,7 @@ mod tests {
         let mut contexts = Vec::new();
         let ack = &answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1184,6 +1466,7 @@ mod tests {
         let mut contexts = Vec::new();
         let ack = &answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1203,6 +1486,7 @@ mod tests {
         let mut contexts = Vec::new();
         let ack = &answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1224,8 +1508,10 @@ mod tests {
         let mut contexts = Vec::new();
         let call = request_pdu(0, &[0_u8; 8]);
         let parsed = pdu::parse(&call).expect("a request");
+        let raw = &call[..];
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1290,6 +1576,7 @@ mod tests {
         let mut contexts = Vec::new();
         answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1315,8 +1602,10 @@ mod tests {
         let token = client.emit_wrap(0, &stub).expect("the client seals");
         let call = sealed_request_pdu(2, 0, &token, 0);
         let parsed = pdu::parse(&call).expect("a request");
+        let raw = &call[..];
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1388,8 +1677,10 @@ mod tests {
         let token = client.emit_wrap(0, &plaintext).expect("the client seals");
         let call = sealed_request_pdu(3, 0, &token, 3);
         let parsed = pdu::parse(&call).expect("a request");
+        let raw = &call[..];
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -1422,8 +1713,10 @@ mod tests {
         let token = stranger.emit_wrap(0, &[0_u8; 8]).expect("sealed");
         let call = sealed_request_pdu(4, 0, &token, 0);
         let parsed = pdu::parse(&call).expect("a request");
+        let raw = &call[..];
         let replies = answer(
             &parsed,
+            &raw,
             &mut contexts,
             49152,
             &endpoint(),

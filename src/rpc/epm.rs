@@ -240,10 +240,24 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     let serves = asked
         .as_deref()
         .is_some_and(|tower| publishes_drsuapi_over_tcp(tower));
+    // `max_towers` is a size parameter, and the answer's conformant array has to be sized by the
+    // value the client named - not by what this server happens to return. Answering one tower in an
+    // array declared with room for one, when the client asked for more, is what a client reports as
+    // `RPC_X_BAD_STUB_DATA` (0x6f7): its unmarshaller checks the bound before reading an element.
+    //
+    // Measured: a Windows Server 2022 request carries it at octet 20, and zeroing that word makes a
+    // real Samba answer "no more entries" instead of a tower.
+    let max_towers = u32::from_le_bytes(
+        stub.get(20..24)
+            .and_then(|word| word.try_into().ok())
+            .unwrap_or([1, 0, 0, 0]),
+    )
+    .clamp(1, 500);
     tracing::info!(
         stub = stub.len(),
         tower = asked.as_ref().map(Vec::len),
         serves,
+        max_towers,
         "epm: ept_map"
     );
 
@@ -251,7 +265,7 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     writer.bytes(&[0_u8; 20]); // a null entry handle: this answer is complete
     if !serves {
         writer.u32(0); // num_towers
-        writer.u32(1); // the maximum this server is willing to send
+        writer.u32(max_towers); // the conformant bound the client named
         writer.u32(0); // offset
         writer.u32(0); // actual
         writer.u32(STATUS_NO_MORE_ENTRIES);
@@ -259,7 +273,7 @@ fn map(stub: &[u8], published: Published) -> Result<Vec<u8>, Fault> {
     }
     let tower = drsuapi_tower(published.drsuapi_port);
     writer.u32(1); // num_towers
-    writer.u32(1); // the maximum
+    writer.u32(max_towers); // the maximum
     writer.u32(0); // offset
     writer.u32(1); // actual
     writer.pointer(true);
@@ -584,6 +598,9 @@ mod tests {
 
         let body = serve(OPNUM_MAP, &stub, published()).expect("answered");
         assert_eq!(word(&body, 20), 1, "one tower is offered");
+        // The conformant bound the client named is what the answer declares, not a number of this
+        // server's choosing: 2 in this capture.
+        assert_eq!(word(&body, 24), 2, "the client's own max_towers");
         assert_eq!(word(&body, body.len() - 4), STATUS_OK);
         // The port this server publishes is inside the tower it answers with.
         assert!(
