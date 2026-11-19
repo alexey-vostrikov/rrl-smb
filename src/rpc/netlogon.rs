@@ -334,6 +334,14 @@ mod dc_flags {
     pub const DS_DS_FLAG: u32 = 0x0000_0010;
     pub const DS_KDC_FLAG: u32 = 0x0000_0020;
     pub const DS_WRITABLE_FLAG: u32 = 0x0000_0100;
+    /// The functional levels this controller's answer is good for (`MS-ADTS` 6.3.1.2).
+    ///
+    /// A member asks the locator and then checks that the controller is at least as new as the
+    /// domain it is joining; a 2016 member reads the absence of the 2016 bit as "not a
+    /// `WinThreshold` controller" and moves on to one that does not exist.
+    pub const DS_DS_8_FLAG: u32 = 0x0000_4000;
+    pub const DS_DS_9_FLAG: u32 = 0x0000_8000;
+    pub const DS_DS_10_FLAG: u32 = 0x0001_0000;
     pub const DS_DNS_CONTROLLER_FLAG: u32 = 0x2000_0000;
     pub const DS_DNS_DOMAIN_FLAG: u32 = 0x4000_0000;
     pub const DS_DNS_FOREST_FLAG: u32 = 0x8000_0000;
@@ -412,6 +420,9 @@ fn get_dc_name(server: &ServerState, stub: &[u8], ex2: bool) -> Result<Vec<u8>, 
     let mut dc = dc_flags::DS_LDAP_FLAG
         | dc_flags::DS_DS_FLAG
         | dc_flags::DS_WRITABLE_FLAG
+        | dc_flags::DS_DS_8_FLAG
+        | dc_flags::DS_DS_9_FLAG
+        | dc_flags::DS_DS_10_FLAG
         | dc_flags::DS_DNS_CONTROLLER_FLAG
         | dc_flags::DS_DNS_DOMAIN_FLAG
         | dc_flags::DS_DNS_FOREST_FLAG;
