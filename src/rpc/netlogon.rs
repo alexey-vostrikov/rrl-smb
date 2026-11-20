@@ -679,12 +679,6 @@ fn logon_get_domain_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, F
         ),
         domain_sid: config.domain_sid.clone().unwrap_or_default(),
         netbios_domain,
-        dns_host: format!(
-            "{}.{}",
-            config.netbios_name.to_ascii_lowercase(),
-            dns_domain.to_ascii_lowercase()
-        ),
-        site: DEFAULT_SITE.to_string(),
         dns_domain,
     };
     if level != 1 {
@@ -699,7 +693,18 @@ fn logon_get_domain_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, F
         domain = %facts.dns_domain,
         "netlogon: the domain's description answered"
     );
-    Ok(domain_information_reply(&server_credential, &facts))
+    let reply = domain_information_reply(&server_credential, &facts);
+    // The stub before it is sealed, under the same switch that dumps the request: a shape error is
+    // invisible in a failure code and obvious in the octets, and they are what a reference parser
+    // is fed to find out which field.
+    if std::env::var_os("NETLOGON_DUMP").is_some() {
+        tracing::warn!(
+            len = reply.len(),
+            hex = %reply.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "netlogon: the domain's description, as it leaves"
+        );
+    }
+    Ok(reply)
 }
 
 /// What the answer says about the domain, gathered once from the configuration.
@@ -709,10 +714,6 @@ pub(crate) struct DomainFacts {
     /// `dns_domainname` and `dns_forestname`: this server hosts one naming context, so the forest
     /// and the domain are the same name, exactly as the CLDAP answer says.
     pub dns_domain: String,
-    /// `dns_hostname`: this controller's own name.
-    pub dns_host: String,
-    /// `sitename`: the site the locator already names, so the two answers agree.
-    pub site: String,
     /// The domain's GUID, derived from the DNS name the same way every other answer derives it.
     pub domain_guid: uuid::Uuid,
     /// The domain's SID, as the bytes a `dom_sid2` carries.
@@ -739,22 +740,23 @@ fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) ->
     writer.raw(server_credential);
     // The return authenticator's timestamp: four octets, zero.
     writer.u32(0);
-    // The switch is `[in]` in the IDL and travels anyway - a switched union cannot be read without
-    // its arm. Measured at offset twelve on `netr_LogonGetCapabilities`, and the same here.
+    // The switch travels even though it is `[in]`: measured on `netr_LogonGetCapabilities`, where a
+    // reply without it was refused with the flags read as a switch value.
     writer.u32(1);
+    // The union's arm is `netr_DomainInformation *domain_info` - a reference, so it has a referent
+    // id of its own. Without it the client reads this structure's first two octets as a pointer and
+    // the rest four octets early, and refuses the reply with `RPC_NT_INVALID_BOUND`: every length
+    // it then reads is a fragment of the one before. Measured on a Windows Server 2025 member.
+    writer.pointer(true);
 
-    // `netr_OneDomainInfo`, inline: the three names and the two references, then the dummies.
+    // `netr_OneDomainInfo`, inline. The three names and the two references, then the dummies.
     write_string_large(&mut writer, Some(&facts.netbios_domain));
     write_string_large(&mut writer, Some(&facts.dns_domain));
     write_string_large(&mut writer, Some(&facts.dns_domain));
     write_guid(&mut writer, &facts.domain_guid);
-    // `dom_sid2`: a count, a reference to the sub-authorities, then the authority inline. Written
-    // from the SID the configuration holds - the same octets the directory carries, taken apart
-    // into the three pieces this structure asks for.
-    writer.u32(SidParts::of(&facts.domain_sid).count);
+    // `domain_sid` is `dom_sid2 *`: a reference here, the structure itself in the deferred half.
     writer.pointer(true);
-    writer.raw(&SidParts::of(&facts.domain_sid).authority);
-    // `trust_extension`: a container whose pointer is NULL - this server trusts no other domain.
+    // `trust_extension`: a container with a NULL reference - this server trusts no other domain.
     writer.u16(0);
     writer.u16(0);
     writer.pointer(false);
@@ -764,16 +766,22 @@ fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) ->
     for _ in 0..4 {
         writer.u32(0);
     }
-    // `trusted_domain_count` and the array that would follow it.
+    // `trusted_domain_count` and the array it sizes.
+    //
+    // One, not zero, and the entry is this domain itself - which is what Samba's own controller
+    // sends (`trusted_domain_count = trusts + 1`, its own domain last) and what Windows appears to
+    // require. Measured: with a count of zero and a NULL array, a Windows Server 2025 member
+    // refused the reply with `0xC0000017` (`STATUS_NO_MEMORY`), which is what a client that indexes
+    // `count - 1` on an empty list does when the subtraction wraps.
+    writer.u32(1);
+    writer.pointer(true);
+    // `lsa_policy`: size zero and a NULL reference (MS-NRPC 3.5.4.4.10, the level-1 rule).
     writer.u32(0);
     writer.pointer(false);
-    // `lsa_policy`: a size of zero and a NULL pointer - there is no policy blob to hand out.
-    writer.u32(0);
-    writer.pointer(false);
-    // The controller's own DNS name and the site, then three dummies.
-    write_string_large(&mut writer, Some(&facts.dns_host));
-    write_string_large(&mut writer, Some(&facts.site));
-    for _ in 0..2 {
+    // `dns_hostname` is only answered when the client asked the server to manage its SPN
+    // (`NETR_WS_FLAG_HANDLES_SPN_UPDATE`, 0x2). This server never writes one into the directory, so
+    // it says nothing either way, and the three dummies stay empty with it.
+    for _ in 0..4 {
         write_string_large(&mut writer, None);
     }
     // `workstation_flags`, `supported_enc_types` and the two trailing dummies.
@@ -782,28 +790,72 @@ fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) ->
     writer.u32(0);
     writer.u32(0);
 
-    // The deferred half, in the order the references were written: the SID's sub-authorities, then
-    // each string the inline part pointed at.
-    let sid = SidParts::of(&facts.domain_sid);
-    writer.u32(sid.count); // conformant array of the sub-authorities
-    writer.raw(&sid.sub_authorities);
-    let deferred = deferred_strings(facts);
-    for text in deferred {
-        writer.string(&text);
+    // The deferred half, in the order the references were taken: the three names of
+    // `primary_domain`, its SID, the trusted-domain array, then the names and SID of its one entry.
+    write_string_large_chars(&mut writer, &facts.netbios_domain);
+    write_string_large_chars(&mut writer, &facts.dns_domain);
+    write_string_large_chars(&mut writer, &facts.dns_domain);
+    write_dom_sid2(&mut writer, &facts.domain_sid);
+
+    // The array: its length, then its one element inline. The element is this domain described as
+    // a trusted domain, which per MS-NRPC 3.5.4.4.10 is the same names with `DnsForestName` NULL.
+    writer.u32(1); // max_count of the conformant array
+    write_string_large(&mut writer, Some(&facts.netbios_domain));
+    write_string_large(&mut writer, Some(&facts.dns_domain));
+    write_string_large(&mut writer, None);
+    write_guid(&mut writer, &facts.domain_guid);
+    writer.pointer(true);
+    writer.u16(0);
+    writer.u16(0);
+    writer.pointer(false);
+    for _ in 0..3 {
+        write_string_large(&mut writer, None);
     }
+    for _ in 0..4 {
+        writer.u32(0);
+    }
+    // Its own deferred data: the two names it carries, then its SID.
+    write_string_large_chars(&mut writer, &facts.netbios_domain);
+    write_string_large_chars(&mut writer, &facts.dns_domain);
+    write_dom_sid2(&mut writer, &facts.domain_sid);
+
     writer.u32(NTSTATUS_SUCCESS);
     writer.finish()
 }
 
-/// The strings the inline part refers to, in the order their references were written.
-fn deferred_strings(facts: &DomainFacts) -> Vec<String> {
-    vec![
-        facts.netbios_domain.clone(),
-        facts.dns_domain.clone(),
-        facts.dns_domain.clone(),
-        facts.dns_host.clone(),
-        facts.site.clone(),
-    ]
+/// The characters an `lsa_StringLarge` refers to.
+///
+/// Not a `[string]`, and the difference is not cosmetic: `lsa_StringLarge` is
+/// `[size_is(size/2), length_is(length/2)] uint16 *string`, where `length` is `2 * strlen` and
+/// `size` is `2 * (strlen + 1)`. So the array's **maximum** is one unit longer than what travels:
+/// `max_count` counts the NUL, `actual_count` does not, and the NUL itself is not in the data.
+///
+/// Written as `[string]` would write it - the NUL inside the array, both counts equal to
+/// `strlen + 1` - a client reads `actual_count` against the `length` the structure declares and
+/// refuses the whole reply with `RPC_NT_INVALID_BOUND` (`0xC0020023`): "the array bounds are
+/// invalid". Measured on a Windows Server 2025 member.
+fn write_string_large_chars(writer: &mut NdrWriter, text: &str) {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
+    writer.u32(count + 1); // max_count: the array as declared, NUL included
+    writer.u32(0); // offset
+    writer.u32(count); // actual_count: what actually travels
+    for unit in units {
+        writer.raw(&unit.to_le_bytes());
+    }
+}
+
+/// A `dom_sid2` as Samba's IDL describes it: a `dom_sid` whose sub-authorities are a conformant
+/// array, and "as with all in-structure conformant arrays, the array length is placed **before**
+/// the start of the structure".
+///
+/// So the octets are the count, then revision, sub-authority count, the six-octet identifier
+/// authority and the sub-authorities - not the directory's own layout, which has the count second.
+fn write_dom_sid2(writer: &mut NdrWriter, sid: &[u8]) {
+    let parts = SidParts::of(sid);
+    writer.u32(parts.count); // the conformant array's length, before the structure
+    writer.raw(&parts.authority); // revision, sub-authority count, identifier authority
+    writer.raw(&parts.sub_authorities);
 }
 
 /// An `lsa_StringLarge`: a length, a size, and a reference to the characters.
@@ -873,9 +925,12 @@ impl SidParts {
     }
 }
 
-/// `kerb_EncTypes`: what this server can put in a ticket - AES-128 and AES-256, the two the KDC
-/// issues, with RC4 kept for a client that asks for nothing better.
-const SUPPORTED_ENC_TYPES: u32 = 0x0000_0038;
+/// `kerb_EncTypes`, when the account carries no `msDS-SupportedEncryptionTypes`.
+///
+/// MS-NRPC 3.5.4.4.10 names this value for exactly that case: the field is the machine account's
+/// attribute, and "if the attribute does not exist, then set it to 0xFFFFFFFF". Inventing a
+/// narrower mask here would be claiming a restriction this server does not read from anywhere.
+const SUPPORTED_ENC_TYPES: u32 = 0xFFFF_FFFF;
 
 /// The reply stub, in the order a live client reads it.
 ///
