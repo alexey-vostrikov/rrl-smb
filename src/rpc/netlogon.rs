@@ -130,17 +130,7 @@ pub(crate) async fn serve(
         OPNUM_DSR_GETDCNAME => get_dc_name(server, stub, false),
         OPNUM_DSR_GETDCNAME_EX2 => get_dc_name(server, stub, true),
         OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(server, stub),
-        OPNUM_LOGON_GET_DOMAIN_INFO => {
-            // Said out loud because the client's own report names the step and not the cause: it
-            // says the domain could not be reached, which is what a failed call looks like from the
-            // outside.
-            tracing::warn!(
-                opnum,
-                "netlogon: netr_LogonGetDomainInfo is not implemented; a member's join reads the \
-                 domain's description of itself here"
-            );
-            Ok(not_supported(opnum))
-        }
+        OPNUM_LOGON_GET_DOMAIN_INFO => logon_get_domain_info(server, stub),
         _ => Err(Fault {
             status: NCA_OP_RNG_ERROR,
             did_not_execute: true,
@@ -600,6 +590,256 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         NTSTATUS_SUCCESS,
     ))
 }
+
+/// `netr_LogonGetDomainInfo`: the controller's description of the domain, which a member reads
+/// about itself.
+///
+/// The request's head is the same shape as `netr_LogonGetCapabilities`: a server name, a computer
+/// name, the client's credential, the return authenticator and then a level. What follows the level
+/// is the caller's own workstation information, which this server has no use for - the answer
+/// describes the domain, not the caller.
+///
+/// Measured from a live Windows Server 2025 member: the level is **1**, and what it reads back is
+/// `netr_DomainInformation` - the full structure, not the policy alone. What is **not** yet
+/// confirmed is this reply's marshalling: the client answers `NlUpdateDomainInfo failed
+/// 0xC0020023` to it, so at least one field is laid out differently from what it expects. The next
+/// step is the same one that settled the bind: capture the reference server's answer to this exact
+/// call and compare it byte for byte.
+fn logon_get_domain_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(_server_name) = reader.string() else {
+        return Err(malformed_hex("server_name", stub));
+    };
+    let computer = match reader.pointer() {
+        Some(true) => match reader.string() {
+            Some(units) => Some(String::from_utf16_lossy(&units).trim().to_string()),
+            None => return Err(malformed_hex("computer_name", stub)),
+        },
+        _ => None,
+    };
+    let Some(credential) = reader.bytes(8) else {
+        return Err(malformed_hex("credential", stub));
+    };
+    let credential: [u8; 8] = credential
+        .try_into()
+        .map_err(|_| malformed_at("credential"))?;
+    let Some(client_timestamp) = reader.bytes(8) else {
+        return Err(malformed_hex("credential.timestamp", stub));
+    };
+    let sequence = u32::from_le_bytes(
+        client_timestamp[..4]
+            .try_into()
+            .expect("four octets of the timestamp"),
+    );
+    let Some(_return_authenticator) = reader.bytes(8) else {
+        return Err(malformed_hex("return_authenticator", stub));
+    };
+    let Some(level) = reader.u32() else {
+        return Err(malformed_hex("level", stub));
+    };
+
+    let stepped = computer.as_deref().and_then(|computer| {
+        server.advance_channel(computer, |channel| advance_credential(channel, sequence))
+    });
+    let Some((expected_client, server_credential)) = stepped else {
+        tracing::warn!(
+            computer = computer.as_deref().unwrap_or("<none>"),
+            "netlogon: the domain's description was asked for before a channel was proved"
+        );
+        return Ok(domain_info_refusal(NTSTATUS_ACCESS_DENIED));
+    };
+    if !rrl_crypto::ct_eq(&expected_client, &credential) {
+        tracing::warn!(
+            sequence,
+            "netlogon: the domain's description was asked for with a credential the chain does not produce"
+        );
+        return Ok(domain_info_refusal(NTSTATUS_ACCESS_DENIED));
+    }
+
+    let config = &server.config;
+    let dns_domain = config.dns_domain.clone().unwrap_or_default();
+    if dns_domain.is_empty() {
+        // Without the domain's own name there is nothing honest to answer: a member that is told
+        // the wrong DNS name of its own domain reports a domain it cannot reach.
+        tracing::warn!("netlogon: no domain facts to describe this domain with");
+        return Ok(domain_info_refusal(NTSTATUS_NOT_SUPPORTED));
+    }
+    let netbios_domain = config
+        .domain_netbios
+        .clone()
+        .unwrap_or_else(|| config.netbios_name.clone());
+    let facts = DomainFacts {
+        // The GUID is derived from the DNS name, exactly as `netr_DsRGetDCNameEx2` and the CLDAP
+        // answer derive it: a client compares the GUID one call gives it against another's, and two
+        // answers that disagree describe two domains.
+        domain_guid: uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            dns_domain.to_ascii_lowercase().as_bytes(),
+        ),
+        domain_sid: config.domain_sid.clone().unwrap_or_default(),
+        netbios_domain,
+        dns_host: format!(
+            "{}.{}",
+            config.netbios_name.to_ascii_lowercase(),
+            dns_domain.to_ascii_lowercase()
+        ),
+        site: DEFAULT_SITE.to_string(),
+        dns_domain,
+    };
+    if level != 1 {
+        tracing::warn!(
+            level,
+            "netlogon: the domain's description was asked for at a level this server does not answer"
+        );
+        return Ok(domain_info_refusal(NTSTATUS_NOT_SUPPORTED));
+    }
+    tracing::info!(
+        level,
+        domain = %facts.dns_domain,
+        "netlogon: the domain's description answered"
+    );
+    Ok(domain_information_reply(&server_credential, &facts))
+}
+
+/// What the answer says about the domain, gathered once from the configuration.
+pub(crate) struct DomainFacts {
+    /// `domainname`: the NetBIOS name, `AD`.
+    pub netbios_domain: String,
+    /// `dns_domainname` and `dns_forestname`: this server hosts one naming context, so the forest
+    /// and the domain are the same name, exactly as the CLDAP answer says.
+    pub dns_domain: String,
+    /// `dns_hostname`: this controller's own name.
+    pub dns_host: String,
+    /// `sitename`: the site the locator already names, so the two answers agree.
+    pub site: String,
+    /// The domain's GUID, derived from the DNS name the same way every other answer derives it.
+    pub domain_guid: uuid::Uuid,
+    /// The domain's SID, as the bytes a `dom_sid2` carries.
+    pub domain_sid: Vec<u8>,
+}
+
+/// A refusal in the shape of the call: the authenticator, then the status, and no structure.
+fn domain_info_refusal(status: u32) -> Vec<u8> {
+    let mut writer = NdrWriter::new();
+    writer.raw(&[0u8; 8]);
+    writer.u32(0);
+    writer.u32(status);
+    writer.finish()
+}
+
+/// The `netr_DomainInformation` a level-1 call expects.
+///
+/// The shape is mechanical and the values are this server's own: the three names, the GUID and SID
+/// the rest of the protocol already answers with, the controller's host name and the site. Every
+/// `dummy` field is written as an empty or zero value - the IDL names them dummies because nothing
+/// reads them, and inventing content there would be inventing an answer.
+fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) -> Vec<u8> {
+    let mut writer = NdrWriter::new();
+    writer.raw(server_credential);
+    // The return authenticator's timestamp: four octets, zero.
+    writer.u32(0);
+    // The switch is `[in]` in the IDL and travels anyway - a switched union cannot be read without
+    // its arm. Measured at offset twelve on `netr_LogonGetCapabilities`, and the same here.
+    writer.u32(1);
+
+    // `netr_OneDomainInfo`, inline: the three names and the two references, then the dummies.
+    write_string_large(&mut writer, Some(&facts.netbios_domain));
+    write_string_large(&mut writer, Some(&facts.dns_domain));
+    write_string_large(&mut writer, Some(&facts.dns_domain));
+    write_guid(&mut writer, &facts.domain_guid);
+    writer.pointer(true); // domain_sid
+    // `trust_extension`: a container whose pointer is NULL - this server trusts no other domain.
+    writer.u16(0);
+    writer.u16(0);
+    writer.pointer(false);
+    for _ in 0..3 {
+        write_string_large(&mut writer, None);
+    }
+    for _ in 0..4 {
+        writer.u32(0);
+    }
+    // `trusted_domain_count` and the array that would follow it.
+    writer.u32(0);
+    writer.pointer(false);
+    // `lsa_policy`: a size of zero and a NULL pointer - there is no policy blob to hand out.
+    writer.u32(0);
+    writer.pointer(false);
+    // The controller's own DNS name and the site, then three dummies.
+    write_string_large(&mut writer, Some(&facts.dns_host));
+    write_string_large(&mut writer, Some(&facts.site));
+    for _ in 0..2 {
+        write_string_large(&mut writer, None);
+    }
+    // `workstation_flags`, `supported_enc_types` and the two trailing dummies.
+    writer.u32(0);
+    writer.u32(SUPPORTED_ENC_TYPES);
+    writer.u32(0);
+    writer.u32(0);
+
+    // The deferred half, in the order the references were written: the SID, then each string the
+    // inline part pointed at.
+    writer.u32(u32::try_from(facts.domain_sid.len()).unwrap_or(u32::MAX)); // SubAuthorityCount
+    writer.raw(&[0u8; 4]);
+    write_sid_body(&mut writer, &facts.domain_sid);
+    let deferred = deferred_strings(facts);
+    for text in deferred {
+        writer.string(&text);
+    }
+    writer.u32(NTSTATUS_SUCCESS);
+    writer.finish()
+}
+
+/// The strings the inline part refers to, in the order their references were written.
+fn deferred_strings(facts: &DomainFacts) -> Vec<String> {
+    vec![
+        facts.netbios_domain.clone(),
+        facts.dns_domain.clone(),
+        facts.dns_domain.clone(),
+        facts.dns_host.clone(),
+        facts.site.clone(),
+    ]
+}
+
+/// An `lsa_StringLarge`: a length, a size, and a reference to the characters.
+///
+/// Both counts are in **bytes**, and `size` counts the terminating NUL while `length` does not -
+/// the same convention `UNICODE_STRING` uses, which is what the IDL comment points at.
+fn write_string_large(writer: &mut NdrWriter, text: Option<&str>) {
+    match text {
+        Some(text) => {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            writer.u16(u16::try_from(units.len() * 2).unwrap_or(u16::MAX));
+            writer.u16(u16::try_from(units.len() * 2 + 2).unwrap_or(u16::MAX));
+            writer.pointer(true);
+        }
+        None => {
+            writer.u16(0);
+            writer.u16(0);
+            writer.pointer(false);
+        }
+    }
+}
+
+/// The sixteen octets of a GUID in the order MS-DTYP puts them on the wire.
+fn write_guid(writer: &mut NdrWriter, guid: &uuid::Uuid) {
+    let (data1, data2, data3, data4) = guid.as_fields();
+    writer.u32(data1);
+    writer.u16(data2);
+    writer.u16(data3);
+    writer.raw(data4);
+}
+
+/// The body of a `dom_sid2` after its revision and sub-authority count.
+///
+/// `domain_sid` arrives as the same octets a SID has in the directory - revision, count, authority,
+/// sub-authorities - so the count is taken from there and the rest is written as it stands.
+fn write_sid_body(writer: &mut NdrWriter, sid: &[u8]) {
+    writer.raw(sid);
+}
+
+/// `kerb_EncTypes`: what this server can put in a ticket - AES-128 and AES-256, the two the KDC
+/// issues, with RC4 kept for a client that asks for nothing better.
+const SUPPORTED_ENC_TYPES: u32 = 0x0000_0038;
 
 /// The reply stub, in the order a live client reads it.
 ///
