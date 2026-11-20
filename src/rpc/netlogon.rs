@@ -572,9 +572,11 @@ fn logon_get_capabilities(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, 
         ));
     };
     let _ = server_credential;
-    if query_level != 1 {
-        // The union has arms for 1 and 2 and this server has nothing to say at 2. Samba's own server
-        // answers the same way, and a fault is what the client already handles for an old server.
+    if query_level != 1 && query_level != 2 {
+        // `netr_Capabilities` is a union with an arm per level, and both arms are the same single
+        // word on the wire - `server_capabilities` for 1, `requested_flags` for 2 - so the answer
+        // is shaped the same and only the meaning differs. Windows Server 2025 asks **1 and then
+        // 2** in the same session, and a refusal at the second ends the channel.
         tracing::warn!(
             query_level,
             "netlogon: capabilities asked for at a level this server does not answer"
@@ -1698,9 +1700,14 @@ mod tests {
         );
     }
 
-    /// Level 2 is not answered, and is not answered as though it were level 1.
+    /// Level 2 is answered, with the negotiated flags.
+    ///
+    /// A Windows Server 2025 member asks for 1 and then 2; `netr_Capabilities` names the 2 arm
+    /// `requested_flags`, and it is the same single word on the wire, so the answer is the flags
+    /// both sides negotiated. Measured: refusing it ended the channel with `0x51f`
+    /// (`ERROR_NO_LOGON_SERVERS`) on a member that had just passed level 1.
     #[test]
-    fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
+    fn level_two_is_answered_with_the_negotiated_flags() {
         let state = proved();
         let reply = logon_get_capabilities(
             &state,
@@ -1708,10 +1715,33 @@ mod tests {
         )
         .expect("answered");
 
-        assert_eq!(reply.len(), 24);
         assert_eq!(
             u32::from_le_bytes(reply[12..16].try_into().expect("switch")),
             2,
+            "the level is echoed"
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[20..24].try_into().expect("status")),
+            NTSTATUS_SUCCESS,
+            "level 2 is an arm this server answers"
+        );
+    }
+
+    fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
+        let state = proved();
+        // Three, not two: `netr_Capabilities` has arms for 1 and 2, and this server answers both -
+        // a Windows Server 2025 member asks for 1 and then 2 in the same session, and refusing the
+        // second ends the channel. A level outside the union is still refused.
+        let reply = logon_get_capabilities(
+            &state,
+            &capabilities_stub(&octets(LIVE_CLIENT), LIVE_SEQUENCE, 3),
+        )
+        .expect("answered");
+
+        assert_eq!(reply.len(), 24);
+        assert_eq!(
+            u32::from_le_bytes(reply[12..16].try_into().expect("switch")),
+            3,
             "the level the call was made at, echoed - a client told 1 reads the arm it did not ask for"
         );
         assert_eq!(
