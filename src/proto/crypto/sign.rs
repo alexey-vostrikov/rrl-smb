@@ -211,9 +211,8 @@ pub fn verify(msg: &[u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()> 
     }
 }
 
-/// Constant-time comparison of two 16-byte arrays.
+/// Constant-time comparison of two 16-byte signatures, from the crypto layer (RRL-7.2).
 #[inline]
-/// Constant-time comparison, from the crypto layer (RRL-7.2).
 fn constant_time_eq(a: &[u8; SIG_LEN], b: &[u8; SIG_LEN]) -> bool {
     rrl_crypto::ct_eq(a, b)
 }

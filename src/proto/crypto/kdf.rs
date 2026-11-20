@@ -12,10 +12,8 @@
 //!   and `context`, so the wire-level input has two consecutive NULs at that
 //!   boundary.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
+// The derivation itself lives in `rrl-crypto`; what is left here is the SMB spelling of it and the
+// names of the keys SMB derives.
 
 /// SP 800-108 CTR-mode KDF using HMAC-SHA-256 with L = 128.
 ///
@@ -34,26 +32,24 @@ pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
 /// SP 800-108 CTR-mode KDF using HMAC-SHA-256, filling `out` with
 /// L = `out.len() * 8` bits. One HMAC block covers the 16- and 32-byte keys
 /// SMB derives.
+///
+/// The derivation itself is [`rrl_crypto::kdf::kdf_hmac_sha2`] (RRL-7.4): SP 800-108 counter mode is
+/// **one** function with two spellings, and the whole difference between them is who writes the NUL
+/// after the label. A Kerberos caller passes `b"prf"` and the layer writes the separator; an SMB
+/// caller passes `b"SMB2AESCMAC\x00"`, NUL included, and the layer's separator makes the second one.
+/// That is the wire format MS-SMB2 §3.1.4.2 asks for - `i || Label || 0x00 || Context || L` with the
+/// label's own terminator already in place - and it is what the published vector below checks.
 pub(crate) fn smb2_kdf_into(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
     assert!(out.len() <= 32, "SMB keys are at most 256 bits");
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA-256 accepts keys of any length");
-
-    // i = 1 (big-endian u32)
-    mac.update(&[0x00, 0x00, 0x00, 0x01]);
-    // Label (including trailing NUL provided by caller)
-    mac.update(label);
-    // SP 800-108 separator byte between Label and Context (in addition to any
-    // trailing NUL the caller already included in `label`).
-    mac.update(&[0x00]);
-    // Context (including trailing NUL provided by caller, or for 3.1.1 the
-    // 64-byte preauth hash)
-    mac.update(context);
-    // L in bits (big-endian u32)
-    mac.update(&(out.len() as u32 * 8).to_be_bytes());
-
-    let full = mac.finalize().into_bytes();
-    out.copy_from_slice(&full[..out.len()]);
+    let derived = rrl_crypto::kdf::kdf_hmac_sha2(
+        rrl_crypto::kdf::Sha2Kind::Sha256,
+        key,
+        label,
+        Some(context),
+        u32::try_from(out.len() * 8).expect("an SMB key is at most 256 bits"),
+    )
+    .expect("the label, context and length this crate passes are a valid SP 800-108 input");
+    out.copy_from_slice(&derived[..out.len()]);
 }
 
 // --- Convenience helpers ---------------------------------------------------
