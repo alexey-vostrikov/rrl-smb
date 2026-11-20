@@ -804,15 +804,6 @@ fn server_get_trust_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, F
         "netlogon: the trust information answered"
     );
 
-    if std::env::var_os("NETLOGON_DUMP").is_some() {
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        tracing::warn!(
-            key = %hex(&key[..16]),
-            cur = %hex(&current.unwrap_or(MD4_OF_EMPTY)),
-            prev = %hex(&previous),
-            "netlogon: trust-info inputs"
-        );
-    }
     let mut writer = NdrWriter::new();
     writer.raw(&server_credential);
     writer.u32(0); // the return authenticator's timestamp
@@ -1629,13 +1620,17 @@ fn des_key(seven: &[u8]) -> [u8; 8] {
     key[5] = ((seven[4] & 0x1F) << 2) | (seven[5] >> 6);
     key[6] = ((seven[5] & 0x3F) << 1) | (seven[6] >> 7);
     key[7] = seven[6] & 0x7F;
-    // Odd parity, as DES wants it: the low bit is set when the other seven hold an even number of
-    // ones. Set and not toggled - a byte that already ends in a one keeps it, and flipping it there
-    // yields a key one bit away from the one the client used.
+    // Then every byte moves up by one, which is the step that was missing here: the seven packed
+    // bits belong in the **top** seven of each octet, and the low bit is left for DES's parity.
+    // Without it each octet held the value one place lower than every DES implementation reads it,
+    // so the same plaintext came out as a different ciphertext - measured against openssl: the key
+    // this produced gave `783d355c…` where Samba's `str_to_key` gives `0ab55c11…` for the same
+    // session key.
+    //
+    // Parity itself is not set: DES ignores the low bit, and measured, an odd-parity octet and the
+    // same octet with that bit clear encrypt to identical ciphertext.
     for byte in &mut key {
-        if byte.count_ones() % 2 == 0 {
-            *byte |= 1;
-        }
+        *byte <<= 1;
     }
     key
 }
@@ -1680,6 +1675,67 @@ fn malformed() -> Fault {
     Fault {
         status: crate::rpc::pdu::NCA_PROTO_ERROR,
         did_not_execute: true,
+    }
+}
+
+#[cfg(test)]
+mod des_tests {
+    use super::*;
+
+    /// The octets a seven-octet run becomes, against a reference DES.
+    ///
+    /// The values come from openssl: `str_to_key` of `677c4befe1c61f21` is `66be127cfe0e183e`, and
+    /// that key encrypts `333cc0c614212612` to `0ab55c11c62fb395` under `des-ecb`. Both steps are
+    /// pinned here because the packing and the shift were wrong in different ways: the packing was
+    /// right and the shift was missing, and one octet of difference is a key nobody else computes.
+    #[test]
+    fn a_seven_octet_run_becomes_the_key_a_reference_des_computes() {
+        assert_eq!(
+            des_key(&[0x67, 0x7c, 0x4b, 0xef, 0xe1, 0xc6, 0x1f]),
+            [0x66, 0xbe, 0x12, 0x7c, 0xfe, 0x0e, 0x18, 0x3e]
+        );
+        assert_eq!(
+            des_key(&[0x21, 0xb0, 0x6d, 0xea, 0x80, 0xec, 0x83]),
+            [0x20, 0xd8, 0x1a, 0xbc, 0xa8, 0x06, 0xb2, 0x06]
+        );
+    }
+
+    /// A `samr_Password` under a channel key, against the same reference.
+    ///
+    /// Two DES passes, the first under the key's first seven octets and the second under its next
+    /// seven - which is what `des_crypt112_16` does in Samba and what `netr_ServerGetTrustInfo`
+    /// must answer with, or a member reads a password it does not have and `nltest /sc_verify`
+    /// reports `ERROR_INVALID_PASSWORD` on a channel that is otherwise proven.
+    #[test]
+    fn a_password_ciphertext_matches_the_reference() {
+        let mut session_key = [0u8; 32];
+        session_key[..16].copy_from_slice(&[
+            0x67, 0x7c, 0x4b, 0xef, 0xe1, 0xc6, 0x1f, 0x21, 0xb0, 0x6d, 0xea, 0x80, 0xec, 0x83,
+            0x8b, 0x00,
+        ]);
+        let password = [
+            0x33, 0x3c, 0xc0, 0xc6, 0x14, 0x21, 0x26, 0x12, 0x6e, 0xf7, 0x6e, 0x33, 0x4d, 0xed,
+            0x1c, 0xe2,
+        ];
+        assert_eq!(
+            des_crypt_16(&password, &session_key),
+            [
+                0x0a, 0xb5, 0x5c, 0x11, 0xc6, 0x2f, 0xb3, 0x95, 0xea, 0x91, 0x49, 0x94, 0x15, 0x2b,
+                0xcb, 0xd3
+            ]
+        );
+    }
+
+    /// The empty password's NT hash, which is what a channel with no previous password answers.
+    #[test]
+    fn the_empty_password_hash_is_the_one_every_source_publishes() {
+        assert_eq!(
+            MD4_OF_EMPTY,
+            [
+                0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0,
+                0x89, 0xc0
+            ]
+        );
     }
 }
 
@@ -1797,11 +1853,18 @@ mod tests {
         assert_eq!(&reply[..16], &[0u8; 16], "nothing was agreed");
     }
 
-    /// A known answer for the whole chain, produced outside this crate: the hash from Python's
-    /// `hashlib` and the DES passes from `openssl enc -des-ecb -provider legacy`.
+    /// A known answer for the whole chain, produced outside this crate.
     ///
-    /// The end-to-end proof is the join stand - a live Samba answers `ACCESS_DENIED` for a
-    /// credential it did not expect - but a vector pins *which* bytes are wrong when it does.
+    /// **These vectors used to be wrong, and wrong in the way that hides itself**: they had been
+    /// produced by this implementation, so they agreed with it whatever it did. They encoded a key
+    /// packing that left out a shift, every DES in the world disagreed with them, and the test
+    /// passed anyway - which is worse than having no test, because it says the arithmetic is
+    /// verified. The values below come from openssl (`enc -des-ecb -provider legacy`) over the same
+    /// octets, and that is the only reason to trust them.
+    ///
+    /// The end-to-end proof is the live client - `nltest /sc_verify` answers `NERR_Success` only
+    /// when these bytes are the ones it computes - but a vector pins *which* octet is wrong when
+    /// they are not.
     #[test]
     fn the_credential_chain_matches_an_independent_computation() {
         let nt_hash: [u8; 16] = std::array::from_fn(|i| i as u8);
@@ -1820,22 +1883,22 @@ mod tests {
 
         assert_eq!(
             des_key(&key[..7]),
-            [0x25, 0x43, 0x04, 0x5d, 0x07, 0x7a, 0x73, 0x53],
-            "seven octets packed into a DES key"
+            [0x4a, 0x84, 0x08, 0xb8, 0x0c, 0xf4, 0xe6, 0xa6],
+            "seven octets packed into a DES key, against openssl"
         );
         assert_eq!(
             des_key(&key[7..14]),
-            [0x01, 0x19, 0x69, 0x3b, 0x71, 0x53, 0x1f, 0x03]
+            [0x02, 0x30, 0xd2, 0x76, 0xe2, 0xa6, 0x3c, 0x06]
         );
 
         assert_eq!(
             credential(&client, &key),
-            [0x6a, 0x9e, 0x03, 0x2e, 0x1f, 0x48, 0x4e, 0xbb],
+            [0x7b, 0xdc, 0x06, 0x30, 0x26, 0xa6, 0x3b, 0xd4],
             "the value a client sends, derived from its own half"
         );
         assert_eq!(
             credential(&server, &key),
-            [0x1f, 0xd5, 0x9e, 0xa9, 0x84, 0xa5, 0x5e, 0xf7],
+            [0x9a, 0xeb, 0x8e, 0x5a, 0x0b, 0xf1, 0xed, 0xd2],
             "the value this server answers with, from its half"
         );
     }
