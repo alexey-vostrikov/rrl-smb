@@ -276,6 +276,24 @@ fn netlogon_answer(token: &[u8], exchange: &mut Exchange) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The server state an interface handler needs, from the endpoint that carries it.
+///
+/// `Err` is the fault a listener that answers no interface with a policy behind it returns: the
+/// mapper names where an interface lives and does not answer for it, and a call arriving there is
+/// one this listener has no state to serve.
+fn state_of(
+    endpoint: &Endpoint,
+) -> Result<Arc<crate::server::ServerState>, super::association::Fault> {
+    endpoint
+        .channel_state
+        .as_ref()
+        .map(|state| Arc::clone(&state.0))
+        .ok_or(super::association::Fault {
+            status: pdu::NCA_OP_RNG_ERROR,
+            did_not_execute: true,
+        })
+}
+
 /// What a call on this association has proved, in the shape the interface handlers take.
 ///
 /// A DCE/RPC association over TCP has no SMB session behind it, so nothing here seals anything: the
@@ -1293,20 +1311,22 @@ async fn answer(
                         }),
                     }
                 }
-                Some(syntax)
-                    if syntax.uuid == pdu::LSARPC.uuid || syntax.uuid == pdu::SAMR.uuid =>
-                {
-                    tracing::info!(
-                        interface = %hex(&syntax.uuid),
-                        opnum = request.opnum,
-                        stub = stub.len(),
-                        "rpc: a call on an interface named by the mapper, not served here yet"
-                    );
-                    Err(super::association::Fault {
-                        status: pdu::NCA_OP_RNG_ERROR,
-                        did_not_execute: true,
-                    })
-                }
+                // The two interfaces the mapper publishes beside `drsuapi`, answered here for the
+                // same reason `netlogon` is: a client that finds them announced and then refused
+                // takes the refusal for the server not having them. `samr` needs the state because
+                // its writes hand out handles; `lsarpc` reads the domain's own description of itself.
+                Some(syntax) if syntax.uuid == pdu::LSARPC.uuid => match state_of(endpoint) {
+                    Ok(state) => {
+                        super::lsarpc::serve(&state, &caller(&exchange), request.opnum, stub).await
+                    }
+                    Err(fault) => Err(fault),
+                },
+                Some(syntax) if syntax.uuid == pdu::SAMR.uuid => match state_of(endpoint) {
+                    Ok(state) => {
+                        super::samr::serve(&state, &caller(&exchange), request.opnum, stub).await
+                    }
+                    Err(fault) => Err(fault),
+                },
                 Some(syntax) if syntax.uuid == pdu::EPM.uuid => match endpoint.publish {
                     Some(published) => super::epm::serve(request.opnum, stub, published),
                     // A listener that does not publish anything would answer the mapper with a
