@@ -38,7 +38,9 @@ async fn volume_size_and_identity_come_from_the_backend() {
     assert_eq!(status, ntstatus::STATUS_SUCCESS);
     assert_eq!(u32_at(&vol, 8), volume.serial_number);
     let label: Vec<u16> = vol[18..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     assert_eq!(String::from_utf16(&label).unwrap(), "share");

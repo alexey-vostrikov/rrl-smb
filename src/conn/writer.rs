@@ -118,7 +118,7 @@ impl ResponseQueue {
     pub fn try_send_notice(&self, bytes: Vec<u8>) -> Result<(), NoticeError> {
         let len = bytes.len();
         self.notices
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued + len <= QUEUED_NOTICE_BYTES).then_some(queued + len)
             })
             .map_err(|_| NoticeError::Full)?;

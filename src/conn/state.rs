@@ -181,7 +181,13 @@ impl Connection {
     /// Removes the session `session_id` and ends its opens; with `keep`,
     /// the durable opens that qualify stay in that table. Returns false
     /// when the connection has no such session.
-    pub async fn close_session(&self, session_id: u64, keep: Option<&Arc<DurableTable>>) -> bool {
+    /// `pub(crate)` and not `pub`: the durable table it takes is a crate-internal type, and a public
+    /// method cannot name one. Every caller is inside this crate.
+    pub(crate) async fn close_session(
+        &self,
+        session_id: u64,
+        keep: Option<&Arc<DurableTable>>,
+    ) -> bool {
         let keep = keep.map(|table| (table, table.sweeps()));
         let removed = self.sessions.write().await.remove(&session_id);
         let Some(sess_arc) = removed else {
@@ -307,7 +313,7 @@ impl Connection {
     /// Closes every session and tree of the connection and ends their
     /// opens; with `keep`, the durable opens that qualify stay in that
     /// table. Runs when the connection ends.
-    pub async fn close_all(&self, keep: Option<&Arc<DurableTable>>) {
+    pub(crate) async fn close_all(&self, keep: Option<&Arc<DurableTable>>) {
         let keep = keep.map(|table| (table, table.sweeps()));
         let sessions: Vec<_> = self.sessions.write().await.drain().collect();
         let mut opens = Vec::new();

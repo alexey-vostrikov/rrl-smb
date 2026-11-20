@@ -39,7 +39,9 @@ pub fn utf16le_to_units(bytes: &[u8]) -> Option<Vec<u16>> {
     }
     Some(
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect(),
     )

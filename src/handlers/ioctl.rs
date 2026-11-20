@@ -219,7 +219,9 @@ impl ValidateNegotiateRequest {
             guid: fixed[4..20].try_into().ok()?,
             security_mode: u16::from_le_bytes([fixed[20], fixed[21]]),
             dialects: list
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|d| u16::from_le_bytes([d[0], d[1]]))
                 .collect(),
         })

@@ -109,9 +109,11 @@ pub(crate) fn push_entry(buf: &mut Vec<u8>, last: &mut Option<usize>, action: u3
     if let Some(at) = *last {
         let same_name = buf[at + 8..at + 12] == (name_len as u32).to_le_bytes()
             && buf[at + ENTRY_HEADER_LEN..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .zip(name)
-                .all(|(unit, &c)| unit == c.to_le_bytes());
+                .all(|(unit, &c)| *unit == c.to_le_bytes());
         if same_name && buf[at + 4..at + 8] == action.to_le_bytes() {
             return;
         }
@@ -185,7 +187,9 @@ mod tests {
             let (next, action, len) = (field(0), field(4), field(8) as usize);
             assert_eq!(len % 2, 0);
             let name: Vec<u16> = buf[at + 12..at + 12 + len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             out.push((next, action, String::from_utf16(&name).unwrap()));

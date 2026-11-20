@@ -53,6 +53,10 @@ const TYPE_NEGOTIATE: u32 = 0;
 /// The server's answer to a negotiate request.
 const TYPE_NEGOTIATE_RESPONSE: u32 = 1;
 /// The client's answer to the server's challenge.
+///
+/// Named for the test that refuses it: this server answers a negotiate and reads no response
+/// message, so the constant is documentation the suite leans on rather than code the library runs.
+#[cfg(test)]
 const TYPE_RESPONSE: u32 = 2;
 
 /// Reads the message a client sent on its bind.
@@ -147,8 +151,11 @@ mod tests {
     #[test]
     fn a_response_is_not_a_negotiate() {
         let mut token = CAPTURED.to_vec();
-        token[0] = 2;
-        assert_eq!(parse_negotiate(&token), Err(Error::UnexpectedType(2)));
+        token[0] = TYPE_RESPONSE as u8;
+        assert_eq!(
+            parse_negotiate(&token),
+            Err(Error::UnexpectedType(TYPE_RESPONSE))
+        );
     }
 
     #[test]

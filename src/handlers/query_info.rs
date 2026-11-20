@@ -621,7 +621,9 @@ mod tests {
             let entry = &buf[at..];
             let len = u32::from_le_bytes(entry[60..64].try_into().unwrap()) as usize;
             let units: Vec<u16> = entry[104..104 + len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let name = String::from_utf16(&units).unwrap();

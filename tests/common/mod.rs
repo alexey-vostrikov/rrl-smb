@@ -346,7 +346,9 @@ pub fn id_both_entries(mut buf: &[u8]) -> Vec<(String, u64, usize)> {
         let file_id = u64::from_le_bytes(buf[96..104].try_into().unwrap());
         let end = (104 + name_len).min(buf.len());
         let units: Vec<u16> = buf[104..end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         out.push((

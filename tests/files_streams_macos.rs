@@ -59,7 +59,9 @@ fn stream_entries(buf: &[u8]) -> Vec<(String, u64)> {
         let next = u32_at(buf, at) as usize;
         let len = u32_at(buf, at + 4) as usize;
         let units: Vec<u16> = buf[at + 24..at + 24 + len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let size = u64::from_le_bytes(buf[at + 8..at + 16].try_into().unwrap());

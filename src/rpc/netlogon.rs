@@ -390,9 +390,10 @@ fn get_dc_name(server: &ServerState, stub: &[u8], ex2: bool) -> Result<Vec<u8>, 
 
     // The flat name is answered only when it is asked for: a client that reads `ad.example.com`
     // where it expected `AD` treats the controller as belonging to another domain.
-    let domain_name = if flags & DS_RETURN_FLAT_NAME != 0 && flags & DS_RETURN_DNS_NAME == 0 {
-        netbios_domain.clone()
-    } else if dns_domain.is_empty() {
+    // Two different reasons to answer the flat name - it was asked for, or there is no DNS name to
+    // answer instead - and one branch, because both produce the same value.
+    let flat_name_wanted = flags & DS_RETURN_FLAT_NAME != 0 && flags & DS_RETURN_DNS_NAME == 0;
+    let domain_name = if flat_name_wanted || dns_domain.is_empty() {
         netbios_domain.clone()
     } else {
         dns_domain.clone()
@@ -970,6 +971,11 @@ const NTSTATUS_SUCCESS_STATUS: u32 = 0x0000_0000;
 /// the call it made and not by the status it finds: `ServerAuthenticate3` answers with a server
 /// credential, the negotiated flags and a RID before the status, and a reply that omitted them
 /// would be read as a shorter structure with a status made of their first octets.
+/// The shape a refusal has for the calls that used to be refused.
+///
+/// Only the tests need it now: every call this interface serves is answered with its own reply, and
+/// a refusal shape kept for the library would be a shape nothing produces.
+#[cfg(test)]
 fn not_supported(opnum: u16) -> Vec<u8> {
     let mut writer = NdrWriter::new();
     match opnum {
@@ -2002,6 +2008,8 @@ mod tests {
         );
     }
 
+    /// A level outside the union is refused, and the level is echoed back.
+    #[test]
     fn a_level_this_server_does_not_answer_is_refused_and_the_level_is_echoed() {
         let state = proved();
         // Three, not two: `netr_Capabilities` has arms for 1 and 2, and this server answers both -

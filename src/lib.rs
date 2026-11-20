@@ -501,7 +501,9 @@ pub mod fuzzing {
     pub fn create_name(data: &[u8]) {
         use crate::stream::{StreamPart, StreamType, parse_create_name, parse_stream_target};
         let units: Vec<u16> = data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         if let Ok(target) = parse_stream_target(&units) {

@@ -495,7 +495,9 @@ async fn query(
         };
         let len = u32_at(at + 60) as usize;
         let units: Vec<u16> = buf[at + name_at..at + name_at + len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         out.push(Listed {

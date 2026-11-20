@@ -117,5 +117,9 @@ async fn signing_context_is_answered_only_when_sent() {
     assert_eq!(status(&frame), 0);
     let contexts = response_contexts(&frame);
     assert_eq!(contexts.len(), 2);
-    assert_eq!(contexts[1], id_list_context(CTX_SIGNING, &[AES_CMAC]));
+    // The client's order decides (MS-SMB2 3.2.5.3.1): the first algorithm it lists that this
+    // server implements. It listed AES-GMAC first and both are implemented, so AES-GMAC is the
+    // answer. This assertion used to say AES-CMAC, from when CMAC was the only one implemented -
+    // a stale expectation, not a behaviour that changed.
+    assert_eq!(contexts[1], id_list_context(CTX_SIGNING, &[AES_GMAC]));
 }

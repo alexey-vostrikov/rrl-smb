@@ -97,7 +97,7 @@ pub(crate) struct NotifyBudget {
 impl NotifyBudget {
     fn take_watch(&self) -> bool {
         self.watches
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_WATCHES_PER_CONNECTION).then_some(n + 1)
             })
             .is_ok()
@@ -105,7 +105,7 @@ impl NotifyBudget {
 
     fn charge(&self, bytes: usize) -> bool {
         self.bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 (held + bytes <= MAX_NOTIFY_BYTES).then_some(held + bytes)
             })
             .is_ok()
@@ -1432,7 +1432,9 @@ mod tests {
             let field = |o: usize| u32::from_le_bytes(buf[at + o..at + o + 4].try_into().unwrap());
             let len = field(8) as usize;
             let name: Vec<u16> = buf[at + 12..at + 12 + len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             out.push((field(4), String::from_utf16(&name).unwrap()));

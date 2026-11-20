@@ -215,7 +215,9 @@ fn entries(frame: &[u8]) -> Vec<(u32, String)> {
         let field = |o: usize| u32::from_le_bytes(buf[at + o..at + o + 4].try_into().unwrap());
         let len = field(8) as usize;
         let name: Vec<u16> = buf[at + 12..at + 12 + len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         out.push((field(4), String::from_utf16(&name).unwrap()));

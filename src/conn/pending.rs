@@ -119,7 +119,7 @@ impl PendingOps {
             return None;
         }
         self.bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 (held + retained <= MAX_PENDING_BYTES).then_some(held + retained)
             })
             .ok()?;

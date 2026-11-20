@@ -1123,12 +1123,14 @@ fn open_password_unsalted(cipher: &[u8], key: crate::server::SessionKey) -> Opti
 /// text as well, because a wrong key can produce a `Length` that happens to fit.
 fn password_at_the_end(plain: &[u8]) -> Option<Vec<u8>> {
     let length = u32::from_le_bytes(plain.get(512..516)?.try_into().ok()?) as usize;
-    if length == 0 || length > 512 || length % 2 != 0 {
+    if length == 0 || length > 512 || !length.is_multiple_of(2) {
         return None;
     }
     let candidate = plain.get(512 - length..512)?;
     if !candidate
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .all(|pair| pair[1] == 0 || (0x04..=0x08).contains(&pair[1]))
     {
         return None;
@@ -1457,7 +1459,9 @@ mod tests {
 
         let text = String::from_utf16_lossy(
             &password
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>(),
         );
