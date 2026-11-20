@@ -255,6 +255,20 @@ pub trait MachineAccounts: Send + Sync + std::fmt::Debug {
     /// disagreement with the directory that nothing would ever correct.
     async fn machine_control(&self, name: &str) -> Option<u32>;
 
+    /// Writes the account's flags, as `samr_SetUserInfo` class 16 carries them.
+    ///
+    /// A member disables its own account on the way out of the domain, and that write is the whole
+    /// of `Remove-Computer`'s effect on the directory: the client opens the account, reads its
+    /// flags, and sets them again with `ACB_DISABLED`. Without this call the account stays enabled
+    /// and the machine is told the unjoin failed - measured, `0x4c` ->
+    /// "The procedure number is out of range" - which is a refusal of the *call*, not of the value.
+    ///
+    /// The value is `userAccountControl` here, already translated: `AcctFlags` and the directory's
+    /// bits share positions with different meanings, and the translation belongs where the two meet,
+    /// in `samr`. `false` means the store refused the write, and a client that is told a disable
+    /// succeeded while it did not leaves an account nobody will ever clean up.
+    async fn set_machine_control(&self, name: &str, control: u32) -> bool;
+
     /// Removes the machine account `name`, and answers whether it was there.
     ///
     /// `samr_DeleteUser` is what a join calls when it gives up, and the account it removes is the

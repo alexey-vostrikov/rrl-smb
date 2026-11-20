@@ -117,6 +117,14 @@ pub(crate) const OPNUM_DELETE_USER: u16 = 35;
 pub(crate) const OPNUM_OPEN_USER: u16 = 34;
 /// `SamrQueryInformationUser` (MS-SAMR 3.1.5.6.37): the same as the `2` call with a class.
 pub(crate) const OPNUM_QUERY_INFO_USER: u16 = 36;
+
+/// `samr_SetUserInfo` (Function 0x25): the older writer, and the one a member uses to leave.
+///
+/// `Remove-Computer` sends class 16 through **this** call and not through
+/// `SetInformationUser2` (58): measured on a Windows Server 2022 member, the sequence is
+/// `Connect5` -> `OpenDomain` -> `LookupNames` -> `OpenUser` -> `QueryInformationUser` (16) ->
+/// this -> `Close`, with `SetInformationUser2` never called at all.
+pub(crate) const OPNUM_SET_USER_INFO: u16 = 37;
 /// `SamrGetUserDomainPasswordInformation` (MS-SAMR 3.1.5.9.5): the domain's password policy.
 pub(crate) const OPNUM_USER_DOMAIN_PASSWORD: u16 = 44;
 /// `samr_OpenDomain` (opnum 7).
@@ -155,6 +163,7 @@ pub(crate) async fn serve(
         OPNUM_CREATE_USER2 => create_user2(server, stub).await,
         OPNUM_SET_INFO_USER2 => set_information_user2(server, _caller, stub).await,
         OPNUM_QUERY_INFO_USER => query_information_user(server, stub).await,
+        OPNUM_SET_USER_INFO => set_user_info(server, stub).await,
         OPNUM_OPEN_USER => open_user(server, stub).await,
         OPNUM_DELETE_USER => delete_user(server, stub).await,
         OPNUM_USER_DOMAIN_PASSWORD => user_domain_password_information(stub),
@@ -545,6 +554,9 @@ fn lookup_domain(config: &crate::server::ServerConfig, stub: &[u8]) -> Result<Ve
 /// MS-ERREF: the handle was not one this server issued.
 const NTSTATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 
+/// MS-ERREF: a parameter this call cannot use - here, a flags word that is not in the stub.
+const NTSTATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+
 /// MS-ERREF: no such domain.
 const STATUS_NO_SUCH_DOMAIN: u32 = 0xC000_00DF;
 
@@ -631,13 +643,22 @@ async fn query_information_user(server: &ServerState, stub: &[u8]) -> Result<Vec
             };
             match control {
                 Some(control) => {
-                    tracing::debug!(account = %account, control, "samr: QueryInformationUser");
+                    // The directory's flags are **not** the ones this call speaks: the two sets put
+                    // different meanings on the same bits, and a member that is told `0x1000` here
+                    // reads it as "smartcard required" while its own account is a plain workstation.
+                    let flags = acct_flags(control);
+                    tracing::debug!(
+                        account = %account,
+                        control,
+                        flags,
+                        "samr: QueryInformationUser"
+                    );
                     writer.pointer(true);
                     // The union's discriminant travels on the wire: the `[out]` shape carries its
                     // own tag, and a reply without it is read as an arm of a different number -
                     // `0x6c5`, `RPC_S_INVALID_BOUND`, from the client's unmarshalling.
                     writer.u32(USER_CONTROL_INFORMATION);
-                    writer.u32(control);
+                    writer.u32(flags);
                     writer.u32(NTSTATUS_SUCCESS);
                 }
                 None => {
@@ -665,8 +686,223 @@ async fn query_information_user(server: &ServerState, stub: &[u8]) -> Result<Vec
     Ok(writer.finish())
 }
 
+/// `samr_SetUserInfo` (37): the account's flags, written the way `samr` numbers them.
+///
+/// Only class 16 is answered, and it is the one a member needs: leaving a domain is disabling its
+/// own account, and the client does it here. The measured stub for that call is twenty octets of
+/// handle, the level as a half word (`0x0010`), two octets of padding, and `AcctFlags` as a word:
+///
+/// ```text
+/// 01000000 01000000 00000000 00000000 00000000 10001000 81000000
+/// handle (20 octets)                        level  pad  acb_info
+/// ```
+///
+/// `0x81` is `ACB_WSTRUST | ACB_DISABLED` - a workstation trust account, disabled - and it becomes
+/// `0x1002` in `userAccountControl`, which is what the directory stores.
+async fn set_user_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    let Some(handle) = reader.bytes(20) else {
+        return Err(malformed_at("user_handle", stub));
+    };
+    let Some(account) = server.samr_user(handle) else {
+        tracing::warn!(
+            octets = stub.len(),
+            "samr: SetUserInfo for a handle this server never issued"
+        );
+        let mut writer = NdrWriter::new();
+        writer.u32(NTSTATUS_INVALID_HANDLE);
+        return Ok(writer.finish());
+    };
+
+    // The level is a half word; the arm after it is aligned to four, which is where the observed
+    // stub puts it. Reading the level as a word instead would turn 16 into 0x00100010 and every
+    // class would be unknown.
+    let narrow = reader.u16();
+    let wide = {
+        let mut again = NdrReader::new(stub);
+        let _ = again.bytes(20);
+        again.u32()
+    };
+    let level = narrow.map(u32::from).or(wide).unwrap_or(u32::MAX);
+
+    let mut writer = NdrWriter::new();
+    if level != USER_CONTROL_INFORMATION {
+        tracing::warn!(
+            level,
+            name = info_class_name(level),
+            account = %account,
+            octets = stub.len(),
+            "samr: SetUserInfo - a class this server cannot write"
+        );
+        writer.u32(NTSTATUS_NOT_SUPPORTED);
+        return Ok(writer.finish());
+    }
+
+    // The arm starts where the observed call puts it, and the last four octets are the flags: a
+    // stub that carries them inline is the same call with a different padding.
+    let at = if stub.len() >= 28 { 24 } else { 22 };
+    let Some(flags) = stub
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok().map(u32::from_le_bytes))
+    else {
+        tracing::warn!(
+            account = %account,
+            octets = stub.len(),
+            "samr: SetUserInfo class 16 without a flags word"
+        );
+        writer.u32(NTSTATUS_INVALID_PARAMETER);
+        return Ok(writer.finish());
+    };
+
+    let control = user_account_control(flags);
+    let written = match server.config.machine_accounts.as_ref() {
+        Some(accounts) => accounts.set_machine_control(&account, control).await,
+        None => false,
+    };
+    tracing::info!(
+        account = %account,
+        flags,
+        control,
+        written,
+        "samr: SetUserInfo wrote the account flags"
+    );
+    writer.u32(if written {
+        NTSTATUS_SUCCESS
+    } else {
+        NTSTATUS_NOT_SUPPORTED
+    });
+    Ok(writer.finish())
+}
+
 /// `USER_INFORMATION_CLASS` 16 (MS-SAMR 2.2.6.28): the account's own flags.
 const USER_CONTROL_INFORMATION: u32 = 16;
+
+/// `userAccountControl` bits, as the directory stores them (MS-ADTS 3.1.1.2.2.9).
+mod uac {
+    pub(crate) const ACCOUNTDISABLE: u32 = 0x0000_0002;
+    pub(crate) const LOCKOUT: u32 = 0x0000_0010;
+    pub(crate) const PASSWD_NOTREQD: u32 = 0x0000_0020;
+    pub(crate) const ENCRYPTED_TEXT_PASSWORD_ALLOWED: u32 = 0x0000_0080;
+    pub(crate) const NORMAL_ACCOUNT: u32 = 0x0000_0200;
+    pub(crate) const INTERDOMAIN_TRUST_ACCOUNT: u32 = 0x0000_0800;
+    pub(crate) const WORKSTATION_TRUST_ACCOUNT: u32 = 0x0000_1000;
+    pub(crate) const SERVER_TRUST_ACCOUNT: u32 = 0x0000_2000;
+    pub(crate) const DONT_EXPIRE_PASSWD: u32 = 0x0001_0000;
+    pub(crate) const SMARTCARD_REQUIRED: u32 = 0x0004_0000;
+    pub(crate) const TRUSTED_FOR_DELEGATION: u32 = 0x0008_0000;
+    pub(crate) const NOT_DELEGATED: u32 = 0x0010_0000;
+    pub(crate) const USE_DES_KEY_ONLY: u32 = 0x0020_0000;
+    pub(crate) const DONT_REQUIRE_PREAUTH: u32 = 0x0040_0000;
+    pub(crate) const PASSWORD_EXPIRED: u32 = 0x0080_0000;
+}
+
+/// `AcctFlags`, as `samr` numbers them (`librpc/idl/samr.idl`, `samr_AcctFlags`).
+mod acb {
+    pub(crate) const DISABLED: u32 = 0x0000_0001;
+    pub(crate) const PWNOTREQ: u32 = 0x0000_0004;
+    pub(crate) const NORMAL: u32 = 0x0000_0010;
+    pub(crate) const DOMTRUST: u32 = 0x0000_0040;
+    pub(crate) const WSTRUST: u32 = 0x0000_0080;
+    pub(crate) const SVRTRUST: u32 = 0x0000_0100;
+    pub(crate) const PWNOEXP: u32 = 0x0000_0200;
+    pub(crate) const AUTOLOCK: u32 = 0x0000_0400;
+    pub(crate) const ENC_TXT_PWD_ALLOWED: u32 = 0x0000_0800;
+    pub(crate) const SMARTCARD_REQUIRED: u32 = 0x0000_1000;
+    pub(crate) const TRUSTED_FOR_DELEGATION: u32 = 0x0000_2000;
+    pub(crate) const NOT_DELEGATED: u32 = 0x0000_4000;
+    pub(crate) const USE_DES_KEY_ONLY: u32 = 0x0000_8000;
+    pub(crate) const DONT_REQUIRE_PREAUTH: u32 = 0x0001_0000;
+    pub(crate) const PW_EXPIRED: u32 = 0x0002_0000;
+}
+
+/// The same account flags, said the way `samr` says them.
+///
+/// The two sets are **not** the same numbering, and they collide: `0x1000` means "workstation
+/// trust account" in `userAccountControl` and "smartcard required" in `AcctFlags`, `0x200` means
+/// "normal account" in one and "password does not expire" in the other. Handing a client the
+/// directory's word here does not merely lose a flag - it tells a joined member, through
+/// `QueryInformationUser` class 16, that its own machine account requires a smartcard:
+///
+/// ```text
+/// NetpSetMachineAccountPasswordAndTypeEx: Broken account type 0x1000 -- error out
+/// NetpManageMachineAccountWithSid: status of disabling account 'DOCKERW-K5E4442$': 0x524
+/// ```
+///
+/// and `Remove-Computer` never disables the account, so the machine stays in the domain.
+///
+/// Measured against a real Samba DC with `rpcclient queryuser`, which is where the numbers on
+/// each line come from:
+///
+/// ```text
+/// Administrator   0x200    -> 0x10     normal account
+/// krbtgt          0x202    -> 0x11     normal, disabled
+/// DOCKERW-K5E4442$ 0x1002  -> 0x81     workstation trust, disabled
+/// a user with DONT_EXPIRE_PASSWD 0x10200 -> 0x210
+/// ```
+fn acct_flags(control: u32) -> u32 {
+    let mut flags = 0;
+    let pairs = [
+        (uac::ACCOUNTDISABLE, acb::DISABLED),
+        (uac::PASSWD_NOTREQD, acb::PWNOTREQ),
+        (uac::NORMAL_ACCOUNT, acb::NORMAL),
+        (uac::INTERDOMAIN_TRUST_ACCOUNT, acb::DOMTRUST),
+        (uac::WORKSTATION_TRUST_ACCOUNT, acb::WSTRUST),
+        (uac::SERVER_TRUST_ACCOUNT, acb::SVRTRUST),
+        (uac::DONT_EXPIRE_PASSWD, acb::PWNOEXP),
+        (uac::LOCKOUT, acb::AUTOLOCK),
+        (
+            uac::ENCRYPTED_TEXT_PASSWORD_ALLOWED,
+            acb::ENC_TXT_PWD_ALLOWED,
+        ),
+        (uac::SMARTCARD_REQUIRED, acb::SMARTCARD_REQUIRED),
+        (uac::TRUSTED_FOR_DELEGATION, acb::TRUSTED_FOR_DELEGATION),
+        (uac::NOT_DELEGATED, acb::NOT_DELEGATED),
+        (uac::USE_DES_KEY_ONLY, acb::USE_DES_KEY_ONLY),
+        (uac::DONT_REQUIRE_PREAUTH, acb::DONT_REQUIRE_PREAUTH),
+        (uac::PASSWORD_EXPIRED, acb::PW_EXPIRED),
+    ];
+    for (from, to) in pairs {
+        if control & from != 0 {
+            flags |= to;
+        }
+    }
+    flags
+}
+
+/// The same flags the other way, for a client that writes them.
+///
+/// A member disables its own account while leaving - `SetInformationUser2` class 16 with
+/// `ACB_DISABLED` - and a server that stored the word unchanged would write `0x1`, which is not
+/// a flag the directory knows: it would set nothing at all and answer success.
+fn user_account_control(flags: u32) -> u32 {
+    let mut control = 0;
+    let pairs = [
+        (acb::DISABLED, uac::ACCOUNTDISABLE),
+        (acb::PWNOTREQ, uac::PASSWD_NOTREQD),
+        (acb::NORMAL, uac::NORMAL_ACCOUNT),
+        (acb::DOMTRUST, uac::INTERDOMAIN_TRUST_ACCOUNT),
+        (acb::WSTRUST, uac::WORKSTATION_TRUST_ACCOUNT),
+        (acb::SVRTRUST, uac::SERVER_TRUST_ACCOUNT),
+        (acb::PWNOEXP, uac::DONT_EXPIRE_PASSWD),
+        (acb::AUTOLOCK, uac::LOCKOUT),
+        (
+            acb::ENC_TXT_PWD_ALLOWED,
+            uac::ENCRYPTED_TEXT_PASSWORD_ALLOWED,
+        ),
+        (acb::SMARTCARD_REQUIRED, uac::SMARTCARD_REQUIRED),
+        (acb::TRUSTED_FOR_DELEGATION, uac::TRUSTED_FOR_DELEGATION),
+        (acb::NOT_DELEGATED, uac::NOT_DELEGATED),
+        (acb::USE_DES_KEY_ONLY, uac::USE_DES_KEY_ONLY),
+        (acb::DONT_REQUIRE_PREAUTH, uac::DONT_REQUIRE_PREAUTH),
+        (acb::PW_EXPIRED, uac::PASSWORD_EXPIRED),
+    ];
+    for (from, to) in pairs {
+        if flags & from != 0 {
+            control |= to;
+        }
+    }
+    control
+}
 
 /// MS-ERREF: the object asked about does not exist.
 const NTSTATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
@@ -1517,6 +1753,111 @@ mod tests {
         assert_eq!(info_class_name(9999), "unknown");
     }
 
+    /// The two flag systems, against values a real Samba DC answers.
+    ///
+    /// Each expected number below is what `rpcclient queryuser` printed for the account named
+    /// beside it: `Administrator` 0x200 -> 0x10, `krbtgt` 0x202 -> 0x11, a machine account
+    /// 0x1002 -> 0x81, and a user with `DONT_EXPIRE_PASSWD` 0x10200 -> 0x210. They are not the
+    /// same numbering with different names - the bits collide, and `0x1000` is the collision that
+    /// cost a `Remove-Computer`: workstation trust in one set, smartcard required in the other.
+    #[test]
+    fn the_directory_flags_are_reported_in_the_words_samr_uses() {
+        assert_eq!(acct_flags(0x0200), 0x10, "Administrator: normal account");
+        assert_eq!(acct_flags(0x0202), 0x11, "krbtgt: normal, disabled");
+        assert_eq!(
+            acct_flags(0x1002),
+            0x81,
+            "a machine: workstation trust, disabled"
+        );
+        assert_eq!(acct_flags(0x1_0200), 0x210, "a user who never expires");
+        // The trap itself: the bit a client reads as `ACB_WSTRUST` is not where the directory
+        // keeps it.
+        assert_eq!(acct_flags(0x1000), 0x80);
+        assert_ne!(acct_flags(0x1000), 0x1000);
+    }
+
+    /// The same translation backwards, which is the write a member makes when it leaves.
+    #[test]
+    fn the_flags_a_client_writes_become_the_directory_flags() {
+        assert_eq!(
+            user_account_control(0x81),
+            0x1002,
+            "ACB_WSTRUST|ACB_DISABLED"
+        );
+        assert_eq!(user_account_control(0x10), 0x0200, "ACB_NORMAL");
+        assert_eq!(
+            user_account_control(0x11),
+            0x0202,
+            "ACB_NORMAL|ACB_DISABLED"
+        );
+        // Nothing is invented for a bit neither side knows: a client that sends it gets a value
+        // the directory cannot use, and the write is refused rather than silently widened.
+        assert_eq!(user_account_control(0), 0);
+    }
+
+    /// The round trip a member's own account makes: read 0x1000, write back 0x81.
+    #[test]
+    fn a_flag_read_from_the_directory_survives_the_round_trip() {
+        for control in [0x1000u32, 0x1002, 0x0200, 0x0202, 0x1_0200] {
+            assert_eq!(
+                user_account_control(acct_flags(control)),
+                control,
+                "0x{control:x} does not survive a read and a write"
+            );
+        }
+    }
+
+    /// `SetUserInfo` class 16, with the stub a Windows Server 2022 member actually sends.
+    ///
+    /// The level is a half word and the arm is aligned to four, so the flags sit at octet 24; a
+    /// reader that took the level as a word would see `0x00100010` and refuse the class, which is
+    /// exactly the "procedure number is out of range" the client reported before this call existed.
+    #[tokio::test]
+    async fn set_user_info_writes_the_flags_of_the_class_a_member_sends() {
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(CreatesAccounts));
+        let server = state(config);
+        let handle = server.remember_samr_user("DOCKERW-K5E4442$");
+        let mut writer = NdrWriter::new();
+        writer.bytes(&handle);
+        writer.u16(16); // UserControlInformation
+        writer.u16(16); // the two octets of alignment a client sends as it does
+        writer.u32(0x81); // ACB_WSTRUST | ACB_DISABLED
+        let stub = writer.finish();
+        assert_eq!(stub.len(), 28, "the measured stub is this long");
+
+        let body = serve(&server, &caller(), OPNUM_SET_USER_INFO, &stub)
+            .await
+            .expect("answered");
+
+        assert_eq!(body.len(), 4, "only a status comes back");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            NTSTATUS_SUCCESS,
+            "a machine that is leaving has to be able to disable its own account"
+        );
+    }
+
+    /// A class this server does not write is refused, and named in the log.
+    #[tokio::test]
+    async fn set_user_info_refuses_another_class() {
+        let server = state(config());
+        let handle = server.remember_samr_user("samba$");
+        let mut writer = NdrWriter::new();
+        writer.bytes(&handle);
+        writer.u16(21); // UserAllInformation
+        writer.u16(0);
+        writer.u32(0);
+        let stub = writer.finish();
+        let body = serve(&server, &caller(), OPNUM_SET_USER_INFO, &stub)
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().unwrap()),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
+
     #[test]
     fn connect5_echoes_the_level_it_answers_with() {
         let mut writer = NdrWriter::new();
@@ -1624,6 +1965,10 @@ mod tests {
 
         async fn machine_control(&self, name: &str) -> Option<u32> {
             name.ends_with('$').then_some(0x1000)
+        }
+
+        async fn set_machine_control(&self, name: &str, _control: u32) -> bool {
+            name.ends_with('$')
         }
 
         async fn delete_machine(&self, name: &str) -> bool {
