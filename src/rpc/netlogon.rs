@@ -747,7 +747,12 @@ fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) ->
     write_string_large(&mut writer, Some(&facts.dns_domain));
     write_string_large(&mut writer, Some(&facts.dns_domain));
     write_guid(&mut writer, &facts.domain_guid);
-    writer.pointer(true); // domain_sid
+    // `dom_sid2`: a count, a reference to the sub-authorities, then the authority inline. Written
+    // from the SID the configuration holds - the same octets the directory carries, taken apart
+    // into the three pieces this structure asks for.
+    writer.u32(SidParts::of(&facts.domain_sid).count);
+    writer.pointer(true);
+    writer.raw(&SidParts::of(&facts.domain_sid).authority);
     // `trust_extension`: a container whose pointer is NULL - this server trusts no other domain.
     writer.u16(0);
     writer.u16(0);
@@ -776,11 +781,11 @@ fn domain_information_reply(server_credential: &[u8; 8], facts: &DomainFacts) ->
     writer.u32(0);
     writer.u32(0);
 
-    // The deferred half, in the order the references were written: the SID, then each string the
-    // inline part pointed at.
-    writer.u32(u32::try_from(facts.domain_sid.len()).unwrap_or(u32::MAX)); // SubAuthorityCount
-    writer.raw(&[0u8; 4]);
-    write_sid_body(&mut writer, &facts.domain_sid);
+    // The deferred half, in the order the references were written: the SID's sub-authorities, then
+    // each string the inline part pointed at.
+    let sid = SidParts::of(&facts.domain_sid);
+    writer.u32(sid.count); // conformant array of the sub-authorities
+    writer.raw(&sid.sub_authorities);
     let deferred = deferred_strings(facts);
     for text in deferred {
         writer.string(&text);
@@ -829,12 +834,42 @@ fn write_guid(writer: &mut NdrWriter, guid: &uuid::Uuid) {
     writer.raw(data4);
 }
 
-/// The body of a `dom_sid2` after its revision and sub-authority count.
+/// A SID taken apart into what `dom_sid2` asks for.
 ///
-/// `domain_sid` arrives as the same octets a SID has in the directory - revision, count, authority,
-/// sub-authorities - so the count is taken from there and the rest is written as it stands.
-fn write_sid_body(writer: &mut NdrWriter, sid: &[u8]) {
-    writer.raw(sid);
+/// The directory's SID is revision, sub-authority count, six octets of authority and then the
+/// sub-authorities; `dom_sid2` puts the count first, then a reference to the sub-authorities, then
+/// the authority as a struct of its own. Writing the directory's octets as they stand is what a
+/// reader reports as an array running past its bounds.
+struct SidParts {
+    count: u32,
+    authority: [u8; 8],
+    sub_authorities: Vec<u8>,
+}
+
+impl SidParts {
+    fn of(sid: &[u8]) -> Self {
+        if sid.len() < 8 {
+            return Self {
+                count: 0,
+                authority: [0; 8],
+                sub_authorities: Vec::new(),
+            };
+        }
+        let count = usize::from(sid[1]);
+        let mut authority = [0u8; 8];
+        authority[0] = sid[0]; // revision
+        authority[1] = sid[1]; // sub-authority count
+        authority[2..8].copy_from_slice(&sid[2..8]); // identifier authority
+        let sub_authorities = sid
+            .get(8..8 + count * 4)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        Self {
+            count: u32::try_from(count).unwrap_or(0),
+            authority,
+            sub_authorities,
+        }
+    }
 }
 
 /// `kerb_EncTypes`: what this server can put in a ticket - AES-128 and AES-256, the two the KDC
