@@ -98,6 +98,7 @@ pub struct Endpoint {
 /// No `Debug`: it holds an NTLM acceptor, whose state is the password material this server compares
 /// against, and a derive here would put that into a log line the first time somebody traced a
 /// binding.
+#[derive(Default)]
 struct Exchange {
     /// The NTLM acceptor, once a NEGOTIATE arrived.
     ntlm: Option<NtlmServer>,
@@ -225,27 +226,6 @@ const LEVEL_PRIVACY: u8 = 6;
 const NTLMSSP_NEGOTIATE: u32 = 1;
 /// `AUTHENTICATE_MESSAGE`.
 const NTLMSSP_AUTHENTICATE: u32 = 3;
-
-impl Default for Exchange {
-    fn default() -> Self {
-        Exchange {
-            ntlm: None,
-            kerberos: None,
-            principal: None,
-            seal: None,
-            recv_seq: 0,
-            send_seq: 0,
-            agreed: None,
-            sign: None,
-            key: None,
-            sig_style: None,
-            netlogon: None,
-            netlogon_negotiated: false,
-            netlogon_computer: None,
-            netlogon_seal: None,
-        }
-    }
-}
 
 /// The server state a `netlogon` endpoint answers on `ServerState`, without its `Debug`.
 ///
@@ -407,7 +387,7 @@ fn state_of(
 /// A DCE/RPC association over TCP has no SMB session behind it, so nothing here seals anything: the
 /// key is absent and `can_encrypt` is false. What it does have is the principal an NTLM or Kerberos
 /// binding proved, and that is what a handler reads when it needs to know who is asking.
-pub(crate) fn caller(exchange: &Exchange) -> crate::server::Caller {
+fn caller(exchange: &Exchange) -> crate::server::Caller {
     let identity = match exchange.principal.as_deref() {
         Some(user) => crate::proto::auth::ntlm::Identity::User {
             user: user.to_string(),
@@ -438,8 +418,6 @@ const REASON_TRANSFER_SYNTAX_NOT_SUPPORTED: u16 = 2;
 const RESULT_LOCAL_LIMIT_EXCEEDED: u16 = 3;
 /// And its reason, measured from the same answer.
 const REASON_LOCAL_LIMIT_EXCEEDED: u16 = 3;
-/// `abstract_syntax_not_supported`, for a known interface with an unusable transfer syntax.
-const REASON_ABSTRACT_SYNTAX_NOT_SUPPORTED: u16 = 3;
 
 /// The association group id this server returns.
 ///
@@ -1432,7 +1410,9 @@ async fn answer(
                     checked,
                     auth,
                     exchange,
-                    ntlm_sealed.then_some(request.stub.len()).unwrap_or(0),
+                    // The length the RC4 stream was advanced by, or zero when no NTLM seal is in
+                    // play: a plain `if` reads better than the chain clippy flagged.
+                    if ntlm_sealed { request.stub.len() } else { 0 },
                 )
             {
                 return Vec::new();
@@ -1476,7 +1456,7 @@ async fn answer(
                             let mut channel = exchange.netlogon.take().unwrap_or_default();
                             let answer = super::netlogon::serve(
                                 &state.0,
-                                &super::tcp::caller(&exchange),
+                                &caller(exchange),
                                 &mut channel,
                                 request.opnum,
                                 stub,
@@ -1497,13 +1477,13 @@ async fn answer(
                 // its writes hand out handles; `lsarpc` reads the domain's own description of itself.
                 Some(syntax) if syntax.uuid == pdu::LSARPC.uuid => match state_of(endpoint) {
                     Ok(state) => {
-                        super::lsarpc::serve(&state, &caller(&exchange), request.opnum, stub).await
+                        super::lsarpc::serve(&state, &caller(exchange), request.opnum, stub).await
                     }
                     Err(fault) => Err(fault),
                 },
                 Some(syntax) if syntax.uuid == pdu::SAMR.uuid => match state_of(endpoint) {
                     Ok(state) => {
-                        super::samr::serve(&state, &caller(&exchange), request.opnum, stub).await
+                        super::samr::serve(&state, &caller(exchange), request.opnum, stub).await
                     }
                     Err(fault) => Err(fault),
                 },
@@ -1572,7 +1552,7 @@ async fn answer(
                     // PDU while the signature over that PDU is computed.
                     let signing = exchange.sign.is_some()
                         && (level == LEVEL_INTEGRITY || (level == LEVEL_PRIVACY && ntlm_sealed));
-                    let placeholder = signing.then(|| [0_u8; 16]);
+                    let placeholder = signing.then_some([0_u8; 16]);
                     // One token for two shapes: the seal's header, or the signature's placeholder.
                     let token: Option<&[u8]> = header
                         .as_deref()
@@ -2103,7 +2083,7 @@ mod tests {
         let raw = &call[..];
         let replies = answer(
             &parsed,
-            &raw,
+            raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -2199,7 +2179,7 @@ mod tests {
         let raw = &call[..];
         let replies = answer(
             &parsed,
-            &raw,
+            raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -2275,7 +2255,7 @@ mod tests {
         let raw = &call[..];
         let replies = answer(
             &parsed,
-            &raw,
+            raw,
             &mut contexts,
             49152,
             &endpoint(),
@@ -2312,7 +2292,7 @@ mod tests {
         let raw = &call[..];
         let replies = answer(
             &parsed,
-            &raw,
+            raw,
             &mut contexts,
             49152,
             &endpoint(),

@@ -446,7 +446,9 @@ impl<'a> NdrIn<'a> {
         let actual = self.u32() as usize;
         assert_eq!(max as usize, actual);
         let units: Vec<u16> = self.buf[self.at..self.at + 2 * actual]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         self.at += 2 * actual;

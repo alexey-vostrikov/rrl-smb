@@ -67,7 +67,9 @@ pub fn notify_entries(body: &[u8], len: u32) -> Vec<(u32, String)> {
         let field = |o: usize| u32::from_le_bytes(buf[at + o..at + o + 4].try_into().unwrap());
         let (next, action, name_len) = (field(0) as usize, field(4), field(8) as usize);
         let units: Vec<u16> = buf[at + 12..at + 12 + name_len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let name = String::from_utf16(&units).expect("UTF-16 name");

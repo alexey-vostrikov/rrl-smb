@@ -416,7 +416,9 @@ fn parse_listing(buf: &[u8]) -> Vec<StreamInfo> {
             break;
         };
         let units: Vec<u16> = name
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let named = String::from_utf16(&units).ok().and_then(|name| {

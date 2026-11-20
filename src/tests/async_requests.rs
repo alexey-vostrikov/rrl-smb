@@ -700,7 +700,7 @@ impl crate::ShareBackend for LateFile {
         let miss = opts.intent == crate::OpenIntent::Open
             && self
                 .misses
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |n| n.checked_sub(1),

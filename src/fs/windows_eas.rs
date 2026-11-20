@@ -362,7 +362,9 @@ pub(super) fn listing_sizes(
                 && let Some(name) = listed.get(at + DIR_NAME..at + DIR_NAME + name_len)
             {
                 let units: Vec<u16> = name
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 if let Ok(name) = String::from_utf16(&units) {

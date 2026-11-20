@@ -340,8 +340,10 @@ fn parse_bind(pdu: &[u8]) -> Option<Bind> {
             id: u16::from_le_bytes([elem[0], elem[1]]),
             abstract_syntax: SyntaxId::read(&elem[4..])?,
             transfer_syntaxes: transfer
-                .chunks_exact(20)
-                .map(SyntaxId::read)
+                .as_chunks::<20>()
+                .0
+                .iter()
+                .map(|chunk| SyntaxId::read(chunk))
                 .collect::<Option<_>>()?,
         });
         at += 24 + 20 * syntaxes;

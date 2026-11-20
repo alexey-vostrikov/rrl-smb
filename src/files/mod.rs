@@ -119,7 +119,7 @@ impl OpenSlot {
     /// Takes a slot from `count`, or `None` when `limit` slots are taken.
     pub(crate) fn acquire(count: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < limit).then_some(n + 1)
             })
             .ok()

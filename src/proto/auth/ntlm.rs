@@ -143,7 +143,9 @@ pub fn utf16le(s: &str) -> Vec<u8> {
 /// Decode UTF-16LE bytes into a `String` (lossy on bad surrogates).
 fn utf16le_to_string(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     String::from_utf16_lossy(&units)
@@ -1647,7 +1649,7 @@ mod tests {
         let mut padded = [0u8; 21];
         padded[..16].copy_from_slice(key);
         let mut out = [0u8; 24];
-        for (i, k) in padded.chunks_exact(7).enumerate() {
+        for (i, k) in padded.as_chunks::<7>().0.iter().enumerate() {
             let mut bits = [0u8; 8];
             bits[1..].copy_from_slice(k);
             let bits = u64::from_be_bytes(bits);
