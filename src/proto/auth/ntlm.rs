@@ -164,14 +164,14 @@ pub fn nt_hash(password: &str) -> [u8; 16] {
 /// `NTOWFv2(password, user, domain) = HMAC_MD5(NT_hash(password), UTF-16LE(UPPER(user) || domain))`.
 ///
 /// The user name is uppercased; the domain is **not** (per MS-NLMP §3.4 NTOWFv2).
+///
+/// RRL-7.6: the MAC itself comes from the crypto layer, where the NT hash it is keyed with already
+/// lives - the two are one construction and were written twice.
 pub fn ntowf_v2(nt_hash_bytes: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
-    let mut mac = HmacMd5::new_from_slice(nt_hash_bytes).expect("HMAC accepts any key length");
-    mac.update(&utf16le(&user.to_uppercase()));
-    mac.update(&utf16le(domain));
-    let res = mac.finalize().into_bytes();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&res);
-    out
+    rrl_crypto::hmac_md5(
+        nt_hash_bytes,
+        &[&utf16le(&user.to_uppercase()), &utf16le(domain)],
+    )
 }
 
 /// Constant-time comparison, from the crypto layer (RRL-7.2).

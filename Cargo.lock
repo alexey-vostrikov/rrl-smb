@@ -978,7 +978,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#8e9acec24ac20b755aca00c2f99ca9048ef762a0"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#89d668e7cb4eebf655925b42cf9af38095bdf181"
 dependencies = [
  "aes 0.9.4",
  "getrandom 0.4.3",
@@ -994,7 +994,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#932838c9bbbaa7d6bb6399754c2485f075a94bdb"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#f2447f0b368b4599343b5daa9f5248781d64d701"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",
