@@ -61,6 +61,8 @@ pub(crate) const OPNUM_SERVER_REQ_CHALLENGE: u16 = 4;
 pub(crate) const OPNUM_SERVER_AUTHENTICATE3: u16 = 26;
 /// `netr_LogonGetDomainInfo` (opnum 29): the domain's description of itself.
 pub(crate) const OPNUM_LOGON_GET_DOMAIN_INFO: u16 = 29;
+/// `netr_ServerGetTrustInfo`: the machine passwords a member is given back, and its trust list.
+pub(crate) const OPNUM_SERVER_GET_TRUST_INFO: u16 = 46;
 /// `netr_LogonGetCapabilities`. A join cannot finish without it: Samba's `libnet_join` proves its
 /// secure channel here, and treats a missing call as a downgrade whenever AES was negotiated.
 pub(crate) const OPNUM_LOGON_GET_CAPABILITIES: u16 = 21;
@@ -75,7 +77,12 @@ pub(crate) const OPNUM_DSR_GETDCNAME_EX2: u16 = 0x22;
 
 /// `netr_ServerPasswordSet2` (opnum 46): the machine password a join picks, encrypted under the
 /// channel's session key.
-pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 46;
+/// `netr_ServerPasswordSet2`, Function 0x1e - **thirty**, not forty-six.
+///
+/// It was filed as 46, which is `netr_ServerGetTrustInfo` (Function 0x2e), and the mistake stayed
+/// invisible because a Windows member sets a machine password through `samr_SetInformationUser2`
+/// and not through this call: the handler was never reached, so nothing ever disagreed with it.
+pub(crate) const OPNUM_SERVER_PASSWORD_SET2: u16 = 30;
 
 /// `netr_CryptPassword`: 512 octets of ciphertext, then the length, all of it encrypted.
 const PASSWORD_BLOB: usize = 516;
@@ -131,6 +138,7 @@ pub(crate) async fn serve(
         OPNUM_DSR_GETDCNAME_EX2 => get_dc_name(server, stub, true),
         OPNUM_LOGON_GET_CAPABILITIES => logon_get_capabilities(server, stub),
         OPNUM_LOGON_GET_DOMAIN_INFO => logon_get_domain_info(server, stub),
+        OPNUM_SERVER_GET_TRUST_INFO => server_get_trust_info(server, stub),
         _ => Err(Fault {
             status: NCA_OP_RNG_ERROR,
             did_not_execute: true,
@@ -705,6 +713,161 @@ fn logon_get_domain_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, F
         );
     }
     Ok(reply)
+}
+
+/// `netr_ServerGetTrustInfo`: the machine's current and previous password, and its trust list.
+///
+/// A member reads this right after the domain's description, and `nltest /sc_verify` stops at
+/// `RPC_S_PROTOCOL_ERROR` when it is refused - the channel itself is already proved by then.
+///
+/// The two `samr_Password` values are the machine's own NT hash and the hash of the empty password,
+/// each encrypted under the channel's session key. They are encrypted with **DES** whatever the
+/// channel negotiated: Samba's `netlogon_creds_crypt_samr_Password` says so in a comment - "even
+/// with `NETLOGON_NEG_SUPPORTS_AES` or `NETLOGON_NEG_ARCFOUR` this uses DES" - and a client that
+/// expects DES cannot read AES there.
+///
+/// `trust_info` is NULL for a workstation channel, which is the case this server answers: the trust
+/// list is what a domain controller gives another domain controller, and a member has none.
+fn server_get_trust_info(server: &ServerState, stub: &[u8]) -> Result<Vec<u8>, Fault> {
+    let mut reader = NdrReader::new(stub);
+    // `server_name` is `[in,unique,string]`: a reference of its own, then the conformant varying
+    // string. `NdrReader::string` reads the string alone, so the reference is taken here - without
+    // it the reader takes the referent id for the string's maximum and refuses the whole stub.
+    let Some(present) = reader.pointer() else {
+        return Err(malformed_hex("server_name", stub));
+    };
+    if present && reader.string().is_none() {
+        return Err(malformed_hex("server_name", stub));
+    }
+    // `account_name` is `[in,ref,string]` - inline, so the string follows with no reference of its
+    // own. Measured: after the server name the stub holds `0d000000 00000000 0d000000` and then
+    // `DOCKERW-W25$\0`, which is this field.
+    let Some(account_units) = reader.string() else {
+        return Err(malformed_hex("account_name", stub));
+    };
+    let account = String::from_utf16_lossy(&account_units).trim().to_string();
+    // `secure_channel_type` is two octets, and the next field is already aligned: measured, the
+    // stub has `0200` then the computer name's maximum directly, with no padding between them.
+    let Some(_channel_type) = reader.u16() else {
+        return Err(malformed_hex("secure_channel_type", stub));
+    };
+    let computer = match reader.string() {
+        Some(units) => String::from_utf16_lossy(&units).trim().to_string(),
+        None => return Err(malformed_hex("computer_name", stub)),
+    };
+    let Some(credential) = reader.bytes(8) else {
+        return Err(malformed_hex("credential", stub));
+    };
+    let credential: [u8; 8] = credential
+        .try_into()
+        .map_err(|_| malformed_at("credential"))?;
+    // The authenticator's timestamp is four octets here, and it is the sequence number.
+    let Some(client_timestamp) = reader.bytes(4) else {
+        return Err(malformed_hex("credential.timestamp", stub));
+    };
+    let sequence = u32::from_le_bytes(client_timestamp.try_into().expect("four octets"));
+
+    let stepped =
+        server.advance_channel(&computer, |channel| advance_credential(channel, sequence));
+    let Some((expected_client, server_credential)) = stepped else {
+        tracing::warn!(
+            computer = %computer,
+            "netlogon: the trust information was asked for before a channel was proved"
+        );
+        return Ok(trust_info_refusal(NTSTATUS_ACCESS_DENIED));
+    };
+    if !rrl_crypto::ct_eq(&expected_client, &credential) {
+        tracing::warn!(
+            sequence,
+            "netlogon: the trust information was asked for with a credential the chain does not produce"
+        );
+        return Ok(trust_info_refusal(NTSTATUS_ACCESS_DENIED));
+    }
+
+    // The current password is the machine account's own; the previous one is the hash of the empty
+    // password, which is what Samba answers for a channel that is not a domain-to-domain trust.
+    let current = server
+        .config
+        .machine_secrets
+        .as_ref()
+        .and_then(|secrets| secrets.machine(&account))
+        .map(|machine| machine.nt_hash);
+    let previous = MD4_OF_EMPTY;
+    let key = server
+        .channel_key(&computer)
+        .ok_or_else(|| malformed_at("channel key"))?;
+
+    tracing::info!(
+        account = %account,
+        computer = %computer,
+        known = current.is_some(),
+        "netlogon: the trust information answered"
+    );
+
+    if std::env::var_os("NETLOGON_DUMP").is_some() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        tracing::warn!(
+            key = %hex(&key[..16]),
+            cur = %hex(&current.unwrap_or(MD4_OF_EMPTY)),
+            prev = %hex(&previous),
+            "netlogon: trust-info inputs"
+        );
+    }
+    let mut writer = NdrWriter::new();
+    writer.raw(&server_credential);
+    writer.u32(0); // the return authenticator's timestamp
+    // `new_owf_password`: the current password, or the empty-password hash when this server does
+    // not hold the account - a client reads the two values, not their presence.
+    let current = current.unwrap_or(MD4_OF_EMPTY);
+    writer.raw(&des_crypt_16(&current, &key));
+    writer.raw(&des_crypt_16(&previous, &key));
+    writer.pointer(false); // `trust_info`: NULL for a workstation channel
+    writer.u32(NTSTATUS_SUCCESS);
+    Ok(writer.finish())
+}
+
+/// A refusal in the shape of the call: the authenticator, then the status, and no passwords.
+fn trust_info_refusal(status: u32) -> Vec<u8> {
+    let mut writer = NdrWriter::new();
+    writer.raw(&[0u8; 8]);
+    writer.u32(0);
+    writer.u32(0);
+    writer.u32(0);
+    writer.u32(0);
+    writer.u32(0);
+    writer.pointer(false);
+    writer.u32(status);
+    writer.finish()
+}
+
+/// `MD4("")`: the NT hash of an empty password, which is what a "previous" password is when the
+/// account has never had one.
+const MD4_OF_EMPTY: [u8; 16] = [
+    0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0, 0x89, 0xc0,
+];
+
+/// `des_crypt112`: sixteen octets through two DES keys taken from the session key's first fourteen.
+///
+/// The first eight octets go through `session_key[0..7]`, the second through `session_key[7..14]`,
+/// each seven-octet run packed into an eight-octet DES key by the same bit packing
+/// `ComputeNetlogonCredential` uses. This is the cipher a `samr_Password` travels under, and it is
+/// DES even on an AES channel - measured against Samba's own comment and its code path.
+fn des_crypt_16(input: &[u8; 16], session_key: &[u8; 32]) -> [u8; 16] {
+    use des::cipher::{BlockCipherEncrypt, KeyInit};
+
+    let mut out = [0u8; 16];
+    for (index, key) in [&session_key[..7], &session_key[7..14]]
+        .into_iter()
+        .enumerate()
+    {
+        let mut block = des::cipher::Block::<des::Des>::from(
+            <[u8; 8]>::try_from(&input[index * 8..index * 8 + 8]).expect("eight octets"),
+        );
+        let cipher = des::Des::new_from_slice(&des_key(key)).expect("an eight-octet DES key");
+        cipher.encrypt_block(&mut block);
+        out[index * 8..index * 8 + 8].copy_from_slice(&block);
+    }
+    out
 }
 
 /// What the answer says about the domain, gathered once from the configuration.
