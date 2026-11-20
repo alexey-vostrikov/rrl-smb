@@ -6,3 +6,4 @@
 # cargo-mutants writes its report beside the crate
 /mutants.out
 /mutants.out.old
+.metrics/
