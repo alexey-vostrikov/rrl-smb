@@ -266,9 +266,15 @@ fn netlogon_answer(token: &[u8], exchange: &mut Exchange) -> Option<Vec<u8>> {
         );
         return None;
     }
-    let mut out = Vec::with_capacity(8);
+    // `MS-NRPC` 2.2.1.3.1: the flags describe the names in the **request**, so a response sets them
+    // to zero, and its buffer is a single `NULL`. Echoing the client's word back - which this did -
+    // claims the answer carries names it does not carry, and a client that checks the answer stops
+    // there: a Windows Server 2025 member logged `0x80090308` (`SEC_E_INVALID_TOKEN`) and never sent
+    // the AUTH3 that would have proved the channel.
+    let mut out = Vec::with_capacity(12);
     out.extend_from_slice(&NL_NEGOTIATE_RESPONSE.to_le_bytes());
-    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
     debug!(
         flags = format_args!("{flags:#010x}"),
         "rpc: netlogon authentication negotiated"

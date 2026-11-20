@@ -50,6 +50,8 @@ pub(crate) enum Error {
 
 /// `MessageType` values (MS-NRPC 2.2.1.3.1).
 const TYPE_NEGOTIATE: u32 = 0;
+/// The server's answer to a negotiate request.
+const TYPE_NEGOTIATE_RESPONSE: u32 = 1;
 /// The client's answer to the server's challenge.
 const TYPE_RESPONSE: u32 = 2;
 
@@ -77,16 +79,33 @@ pub(crate) fn parse_negotiate(token: &[u8]) -> Result<Negotiate, Error> {
     })
 }
 
-/// The message a server answers a bind with: the same type, and its own flags.
+/// The message a server answers a bind with.
+///
+/// `MS-NRPC` 2.2.1.3.1 is specific about the answer, and it is not a mirror of the request: the
+/// `Flags` word describes which names the **request** carried, so the response sets it to zero, and
+/// the buffer of a response is a single `NULL` character. Echoing the client's flags back was wrong
+/// twice over - it claimed the answer carried names it did not, and it left the buffer empty rather
+/// than null-terminated.
+///
+/// Measured: a Windows Server 2025 client answered a bind with flags echoed back and an empty
+/// buffer by refusing the whole channel - its own log said `0x80090308` (`SEC_E_INVALID_TOKEN`)
+/// and `NlConfirmNegotiatedCapabilities: denying access`, with no AUTH3 ever sent. The same client
+/// accepts the answer below.
 ///
 /// No nonce here. MS-NRPC puts the server's challenge in the AUTH3 exchange that follows, and
 /// sending one in the bind answer would be a value the client never compares.
-pub(crate) fn negotiate(flags: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
-    out.extend_from_slice(&TYPE_NEGOTIATE.to_le_bytes());
-    out.extend_from_slice(&flags.to_le_bytes());
+pub(crate) fn negotiate(_flags: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RESPONSE_LEN);
+    out.extend_from_slice(&TYPE_NEGOTIATE_RESPONSE.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    // The null character the response carries, padded to a word: the token sits in an RPC
+    // authentication trailer whose length is counted in four-octet multiples.
+    out.extend_from_slice(&[0, 0, 0, 0]);
     out
 }
+
+/// The length of the answer [`negotiate`] writes.
+pub(crate) const RESPONSE_LEN: usize = 12;
 
 /// One zero-terminated one-byte name, and what follows it.
 ///
@@ -140,14 +159,19 @@ mod tests {
         assert_eq!((message.flags, message.domain.as_str()), (0, ""));
     }
 
-    /// The answer is the same type with this server's flags, and nothing else.
+    /// The answer is a response with no name flags, and the buffer is one null character.
+    ///
+    /// `MS-NRPC` 2.2.1.3.1: the flags describe the request's names and the response's buffer is a
+    /// `NULL`. A client that is told otherwise refuses the channel before it sends AUTH3.
     #[test]
-    fn the_answer_is_a_negotiate_with_our_flags() {
-        let answer = negotiate(7);
-        assert_eq!(answer, vec![0, 0, 0, 0, 7, 0, 0, 0]);
-        let back = parse_negotiate(&answer).expect("our own answer parses");
-        assert_eq!(back.flags, 7);
-        assert_eq!(back.domain, "");
+    fn the_answer_is_a_response_with_no_name_flags() {
+        let answer = negotiate(0x17);
+        assert_eq!(answer, vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(answer.len(), RESPONSE_LEN);
+        assert!(
+            answer[8..].iter().all(|&byte| byte == 0),
+            "the buffer is a null character"
+        );
     }
 }
 
