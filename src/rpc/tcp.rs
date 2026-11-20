@@ -146,6 +146,32 @@ struct Exchange {
     netlogon: Option<crate::rpc::netlogon::Session>,
     /// Whether this association negotiated `RPC_C_AUTHN_NETLOGON`.
     netlogon_negotiated: bool,
+    /// The computer the client named when it negotiated that channel.
+    ///
+    /// The key a sealed call is proved with belongs to an account, and the negotiate is the only
+    /// place a client says which one it is. Kept from the bind because a sealed call carries no
+    /// copy of the name - only a signature over it.
+    netlogon_computer: Option<String>,
+    /// The schannel that seals calls on this association, once its key is known.
+    ///
+    /// Separate from `seal`, which is the RFC 4121 machinery of an accepted Kerberos ticket: this
+    /// one is MS-NRPC's `NL_AUTH_SIGNATURE`, keyed on the machine password's channel and counting
+    /// its own sequence per direction.
+    netlogon_seal: Option<NetlogonSealed>,
+}
+
+/// A netlogon channel that seals calls, and the counter it counts by.
+///
+/// **One** counter, shared by both directions - that is the part that is easy to get wrong. Samba's
+/// `gensec_schannel` keeps a single `seq_num` and steps it on every PDU it opens *and* every PDU it
+/// writes, so the first answer to a client's first sealed call is already number one. Two counters,
+/// one per direction, produce answers the client computes a different sequence for and refuses with
+/// a status that names nothing: measured as `NlConfirmNegotiatedCapabilities: denying access after
+/// status: 0xc0000001` on an answer whose ciphertext was otherwise correct.
+#[derive(Debug, Clone, Copy)]
+struct NetlogonSealed {
+    key: [u8; 32],
+    seq: u64,
 }
 
 /// What an NTLM signature covers (MS-RPCE 2.2.2.9.1).
@@ -215,6 +241,8 @@ impl Default for Exchange {
             sig_style: None,
             netlogon: None,
             netlogon_negotiated: false,
+            netlogon_computer: None,
+            netlogon_seal: None,
         }
     }
 }
@@ -279,7 +307,81 @@ fn netlogon_answer(token: &[u8], exchange: &mut Exchange) -> Option<Vec<u8>> {
         flags = format_args!("{flags:#010x}"),
         "rpc: netlogon authentication negotiated"
     );
+    // The names, in the order the flag bits number them: A (0x1) NetBIOS domain, B (0x2) NetBIOS
+    // computer, C (0x4) DNS domain, D (0x8) DNS host, E (0x10) NetBIOS computer again as UTF-8.
+    // The computer is what the channel's key belongs to, and it is taken from B rather than E
+    // because B is the form every client sends: a client that sets only E still names one.
+    exchange.netlogon_computer = computer_of(token.get(8..).unwrap_or_default(), flags);
     Some(out)
+}
+
+/// Which computer a negotiate names, from its flag word and the buffer that follows.
+///
+/// The buffer is a run of one-byte, zero-terminated names in the order the flags set. Reading it
+/// needs the flags: there is no length and no separator, so a name that was not announced would be
+/// taken for one that was, and the account looked up would be the wrong one.
+fn computer_of(buffer: &[u8], flags: u32) -> Option<String> {
+    const NETBIOS_DOMAIN: u32 = 0x01;
+    const NETBIOS_COMPUTER: u32 = 0x02;
+    const DNS_DOMAIN: u32 = 0x04;
+    const DNS_HOST: u32 = 0x08;
+
+    let mut rest = buffer;
+    let mut computer = None;
+    for (bit, is_computer) in [
+        (NETBIOS_DOMAIN, false),
+        (NETBIOS_COMPUTER, true),
+        // The DNS names are compressed UTF-8: the first octet is a length, then the label, and the
+        // name ends at a zero octet. A one-byte run of zero-terminated strings would read the first
+        // length octet as a character and the rest of the name as another.
+        (DNS_DOMAIN, false),
+        (DNS_HOST, false),
+    ] {
+        if flags & bit == 0 {
+            continue;
+        }
+        let name = if bit == DNS_DOMAIN || bit == DNS_HOST {
+            read_dns_name(&mut rest)
+        } else {
+            read_oem_string(&mut rest)
+        }?;
+        if is_computer && !name.is_empty() {
+            computer = Some(name);
+        }
+    }
+    computer
+}
+
+/// One zero-terminated one-byte name, and what follows it.
+fn read_oem_string(bytes: &mut &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0)?;
+    let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    *bytes = &bytes[end + 1..];
+    Some(name)
+}
+
+/// One RFC 1035 compressed name: length-prefixed labels, terminated by a zero.
+///
+/// The compression pointers a message may use are not followed: a name in a negotiate has no
+/// earlier message to point into, and following one would read this buffer as an offset into
+/// itself.
+fn read_dns_name(bytes: &mut &[u8]) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    loop {
+        let (&length, rest) = bytes.split_first()?;
+        *bytes = rest;
+        if length == 0 {
+            return Some(labels.join("."));
+        }
+        // Top two bits set is a compression pointer, which this buffer cannot legally hold.
+        if length & 0xC0 != 0 {
+            return None;
+        }
+        let length = usize::from(length);
+        let label = bytes.get(..length)?;
+        *bytes = &bytes[length..];
+        labels.push(String::from_utf8_lossy(label).into_owned());
+    }
 }
 
 /// The server state an interface handler needs, from the endpoint that carries it.
@@ -819,6 +921,46 @@ impl Exchange {
     }
 }
 
+/// Opens a call sealed by the netlogon channel.
+///
+/// The signature and the cipher are MS-NRPC's, and `schannel::unseal` owns both: it reads the
+/// `NL_AUTH_SIGNATURE` blob, checks the sequence against the counter this side keeps, and runs
+/// AES-CFB8 over the arguments in place. What is left here is the bookkeeping - advancing the
+/// counter and taking the authentication padding off, which travels inside the sealed body and is
+/// therefore not an argument.
+///
+/// The client is the initiator of the channel: it opened it with `netr_ServerReqChallenge`, so its
+/// sequence numbers carry the initiator bit and this server's answers do not.
+fn open_netlogon_sealed(
+    parsed: &Pdu<'_>,
+    request: &pdu::Request<'_>,
+    pad: usize,
+    exchange: &mut Exchange,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let Some(auth) = parsed.auth.as_ref() else {
+        return Err("a call at level 6 arrived with no verifier");
+    };
+    let Some(channel) = exchange.netlogon_seal.as_mut() else {
+        return Err("no netlogon channel to open this call with");
+    };
+    let mut stub = request.stub.to_vec();
+    crate::rpc::schannel::unseal(&channel.key, channel.seq, true, auth.token, &mut stub)
+        .map_err(|_| "the netlogon signature did not verify")?;
+    channel.seq += 1;
+    // The authentication padding is taken off by the caller, which does it for every level-6
+    // path alike. Taking it off here as well shortens the stub twice, and the fields at the end of
+    // a call - `query_level`, an `[out,ref]` placeholder - fall outside what the handler is given:
+    // measured as a 124-octet `netr_LogonGetCapabilities` cut to 120 and refused for a missing
+    // field it carried.
+    debug!(
+        opened = stub.len(),
+        pad,
+        seq = channel.seq - 1,
+        "rpc: a netlogon-sealed call was opened"
+    );
+    Ok(Some(stub))
+}
+
 /// Whether a call's NTLM signature is the client's.
 ///
 /// An association that negotiated no integrity has nothing to check, and that is not a failure: the
@@ -1206,7 +1348,35 @@ async fn answer(
             let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
             let pad = usize::from(parsed.auth.as_ref().map_or(0, |auth| auth.auth_pad_length));
             let ntlm_sealed = level == LEVEL_PRIVACY && exchange.seals_with_ntlm();
-            let unsealed = if ntlm_sealed {
+            // A call sealed by the netlogon channel, which is what a member sends once
+            // `ServerAuthenticate3` has proved one: `NL_AUTH_SIGNATURE` in the verifier and the
+            // arguments AES-CFB8'd in place. Neither of the other two ciphers applies - this is
+            // MS-NRPC's own, keyed on the machine password's channel - so a call it sealed reached
+            // the handler as ciphertext and was parsed as nonsense. Measured: `netr_LogonGetCapabilities`
+            // (opnum 21) arrived as 144 octets of noise.
+            let netlogon_sealed = level == LEVEL_PRIVACY
+                && parsed
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.auth_type == pdu::AuthVerifier::TYPE_NETLOGON);
+            if netlogon_sealed
+                && let Some(computer) = exchange.netlogon_computer.clone()
+                && exchange.netlogon_seal.is_none()
+                && let Ok(state) = state_of(endpoint)
+                && let Some(key) = state.channel_key(&computer)
+            {
+                debug!(%computer, "rpc: a netlogon channel will seal this association");
+                exchange.netlogon_seal = Some(NetlogonSealed { key, seq: 0 });
+            }
+            let unsealed = if netlogon_sealed {
+                match open_netlogon_sealed(parsed, request, pad, exchange) {
+                    Ok(opened) => opened,
+                    Err(detail) => {
+                        warn!(detail, "rpc: a netlogon-sealed call could not be opened");
+                        return Vec::new();
+                    }
+                }
+            } else if ntlm_sealed {
                 // Decrypt first: the checksum of an NTLM signature is masked with the same RC4
                 // stream, advanced past the message, so the signature cannot verify before the
                 // message has been taken through the cipher.
@@ -1252,7 +1422,11 @@ async fn answer(
                 _ => None,
             };
             let checked = signed_view.as_deref().unwrap_or(raw);
-            if level >= LEVEL_INTEGRITY
+            // The netlogon signature is checked by `schannel::unseal`, which needs the sequence and
+            // the direction to do it - so it is not offered to the NTLM check, whose MAC would
+            // read the same token as a mismatch and refuse a call that verified.
+            if !netlogon_sealed
+                && level >= LEVEL_INTEGRITY
                 && let Some(auth) = parsed.auth.as_ref()
                 && !verify_signature(
                     checked,
@@ -1365,6 +1539,32 @@ async fn answer(
                 Ok(stub) => {
                     if level == LEVEL_PRIVACY && ntlm_sealed {
                         return seal_answer_ntlm(parsed, request.context_id, &stub, exchange);
+                    }
+                    // An answer through the netlogon channel goes back the same way the call came:
+                    // the arguments AES-CFB8'd under the channel key, with this side's own sequence
+                    // number in an `NL_AUTH_SIGNATURE`. Sending plaintext here is what a client reads
+                    // as a channel that stopped being sealed mid-stream.
+                    if netlogon_sealed && let Some(channel) = exchange.netlogon_seal.as_mut() {
+                        let mut body = stub.clone();
+                        let sig =
+                            crate::rpc::schannel::seal(&channel.key, channel.seq, false, &mut body);
+                        channel.seq += 1;
+                        let verifier = AuthReply {
+                            auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
+                            auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
+                            // The padding is inside the sealed body, so the trailer carries none.
+                            auth_pad_length: 0,
+                            auth_context_id: parsed.auth.as_ref().map_or(1, |a| a.auth_context_id),
+                            token: &sig,
+                        };
+                        return vec![pdu::response(
+                            parsed.header.call_id,
+                            pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
+                            u32::try_from(stub.len()).unwrap_or(u32::MAX),
+                            request.context_id,
+                            &body,
+                            Some(&verifier),
+                        )];
                     }
                     let (body, header) = seal_answer(&stub, level, exchange);
                     // At level 5 the answer is signed rather than sealed: the verifier is a
@@ -1479,6 +1679,42 @@ fn results(bind: &pdu::Bind, contexts: &mut Vec<(u16, SyntaxId)>) -> Vec<Context
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The negotiate a Windows Server 2025 member sends, verbatim from a live channel.
+    ///
+    /// `00000000 17000000` then `AD\0`, `DOCKERW-W25\0`, `ad.example.com` as RFC 1035 labels and
+    /// the DNS host - the four names the flag word `0x17` announces, in its order.
+    const NEGOTIATE_2025: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x41, 0x44, 0x00, 0x44, 0x4f, 0x43, 0x4b,
+        0x45, 0x52, 0x57, 0x2d, 0x57, 0x32, 0x35, 0x00, 0x02, 0x61, 0x64, 0x07, 0x65, 0x78, 0x61,
+        0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x0b, 0x44, 0x4f, 0x43, 0x4b, 0x45,
+        0x52, 0x57, 0x2d, 0x57, 0x32, 0x35, 0x00,
+    ];
+
+    /// The computer a negotiate names is the one whose key seals the channel.
+    ///
+    /// Reading it needs the flag word: the buffer has no lengths and no separator, and the DNS
+    /// names in it are label-encoded rather than zero-terminated strings. A reader that treated
+    /// the whole buffer as one-byte strings would take the `0x02` label length for a character and
+    /// name an account nobody has.
+    #[test]
+    fn the_negotiate_names_the_computer_whose_key_seals_the_channel() {
+        let flags = u32::from_le_bytes(NEGOTIATE_2025[4..8].try_into().expect("four octets"));
+        assert_eq!(flags, 0x17, "the flags a live member sends");
+        assert_eq!(
+            computer_of(&NEGOTIATE_2025[8..], flags).as_deref(),
+            Some("DOCKERW-W25")
+        );
+    }
+
+    /// A negotiate that announces no computer name names none - it is not guessed.
+    #[test]
+    fn a_negotiate_without_a_computer_bit_names_no_computer() {
+        // Only the NetBIOS domain bit: the buffer holds one name and it is not a computer.
+        assert_eq!(computer_of(b"AD\0", 0x01), None);
+        // A buffer that ends inside a name is refused rather than read past its end.
+        assert_eq!(computer_of(b"AD", 0x02), None);
+    }
 
     /// A header, so a test speaks the same framing a client does.
     fn header(ptype: u8, call_id: u32, frag: u16) -> Vec<u8> {
