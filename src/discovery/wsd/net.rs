@@ -909,4 +909,74 @@ mod tests {
         UdpSocket::bind(lo.send).await.expect("send port");
         TcpListener::bind(lo.http).await.expect("metadata port");
     }
+
+    /// A link over loopback, which is an interface like any other: the sockets have to be
+    /// configurable against it.
+    fn loopback() -> Link {
+        Link {
+            index: 0,
+            addr: Ipv4Addr::LOCALHOST.into(),
+            networks: vec![(Ipv4Addr::LOCALHOST.into(), 8)],
+        }
+    }
+
+    /// Both sockets land where a Windows client looks for them.
+    ///
+    /// The receive socket binds the group address on the discovery port, because that is the
+    /// address a multicast request carries; the send socket binds the link's own address on the
+    /// same port, because a client sends its unicast reply there and to any other port it never
+    /// arrives. Neither is observable from a parser test, and getting either wrong makes the server
+    /// invisible on the network while everything else about it works.
+    ///
+    /// The test also pins the non-blocking flag: both sockets are polled by the engine, and a
+    /// blocking one would stop the whole discovery task on the first read that has nothing to
+    /// return.
+    ///
+    /// It runs inside a Tokio runtime and has to: `UdpSocket::from_std` registers the descriptor
+    /// with the reactor of the runtime it is called from, and the same code outside one panics with
+    /// "there is no reactor running". That is a property of the function worth pinning — it is
+    /// called from the discovery task, and a caller that reached it from somewhere else would learn
+    /// it the hard way.
+    #[tokio::test]
+    async fn the_two_sockets_bind_where_a_client_looks_for_them() {
+        let link = loopback();
+
+        let recv = recv_socket(&link).expect("a receive socket");
+        let local = recv.local_addr().expect("its address");
+        assert_eq!(local.port(), PORT, "the discovery port");
+        assert_eq!(
+            local.ip(),
+            IpAddr::V4(GROUP_V4),
+            "bound to the group, not to the link"
+        );
+
+        let send = send_socket(&link).expect("a send socket");
+        let local = send.local_addr().expect("its address");
+        assert_eq!(
+            local.port(),
+            PORT,
+            "replies leave from the port Windows expects"
+        );
+        assert_eq!(
+            local.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "and from the link's own address"
+        );
+    }
+
+    /// The scope ID of an IPv6 bind is the interface for a link-local address and zero otherwise.
+    ///
+    /// A scope ID on a global address makes the bind fail; none on a link-local one makes it
+    /// ambiguous between interfaces that share the address family.
+    #[test]
+    fn the_scope_id_follows_the_address_family() {
+        let link_local: Ipv6Addr = "fe80::1".parse().expect("a link-local address");
+        let global: Ipv6Addr = "2001:db8::1".parse().expect("a global address");
+        assert_eq!(
+            scope_id(link_local, 7),
+            7,
+            "the interface, for a link-local address"
+        );
+        assert_eq!(scope_id(global, 7), 0, "none, for a global one");
+    }
 }
