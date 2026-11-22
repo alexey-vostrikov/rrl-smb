@@ -31,6 +31,7 @@ use crate::rpc::association::Fault;
 use crate::rpc::ndr::{NdrReader, NdrWriter};
 use crate::rpc::pdu::NCA_OP_RNG_ERROR;
 use crate::server::ServerState;
+use crate::utils::{NameTable, name_in};
 
 /// `samr_ConnectVersion`: what a Windows 2003 and later server states, which is what a modern
 /// client expects to read (MS-SAMR 2.2.3.3).
@@ -1381,35 +1382,42 @@ fn password_at_the_end(plain: &[u8]) -> Option<Vec<u8>> {
 /// wrong arm is a client that reports `0x6c5` (`RPC_S_INVALID_BOUND`) when it reads an array where
 /// a word should be. Measured: 16 is `UserControlInformation`, the account's own flags.
 fn info_class_name(class: u32) -> &'static str {
-    match class {
-        1 => "UserGeneralInformation",
-        2 => "UserPreferencesInformation",
-        3 => "UserLogonInformation",
-        4 => "UserLogonHoursInformation",
-        5 => "UserAccountInformation",
-        6 => "UserNameInformation",
-        7 => "UserAccountNameInformation",
-        8 => "UserFullNameInformation",
-        9 => "UserPrimaryGroupInformation",
-        10 => "UserHomeInformation",
-        11 => "UserScriptInformation",
-        12 => "UserProfileInformation",
-        13 => "UserAdminCommentInformation",
-        14 => "UserWorkStationsInformation",
-        16 => "UserControlInformation",
-        17 => "UserExpiresInformation",
-        18 => "UserInternal1Information",
-        20 => "UserParametersInformation",
-        21 => "UserAllInformation",
-        23 => "UserInternal4Information",
-        24 => "UserInternal5Information",
-        25 => "UserInternal4InformationNew",
-        26 => "UserInternal5InformationNew",
-        31 => "UserInternal7Information",
-        32 => "UserInternal8Information",
-        _ => "unknown",
-    }
+    name_in(USER_INFO_CLASSES, class)
 }
+
+/// `USER_INFORMATION_CLASS`: the numbers `SamrQueryInformationUser2` accepts, and the names MS-SAMR
+/// gives them.
+///
+/// Written out rather than derived from the decoder: the decoder knows the classes it fills, and a
+/// name for a class it does not fill is what a log line needs when a client asks for one this server
+/// cannot answer.
+const USER_INFO_CLASSES: NameTable = &[
+    (1, "UserGeneralInformation"),
+    (2, "UserPreferencesInformation"),
+    (3, "UserLogonInformation"),
+    (4, "UserLogonHoursInformation"),
+    (5, "UserAccountInformation"),
+    (6, "UserNameInformation"),
+    (7, "UserAccountNameInformation"),
+    (8, "UserFullNameInformation"),
+    (9, "UserPrimaryGroupInformation"),
+    (10, "UserHomeInformation"),
+    (11, "UserScriptInformation"),
+    (12, "UserProfileInformation"),
+    (13, "UserAdminCommentInformation"),
+    (14, "UserWorkStationsInformation"),
+    (16, "UserControlInformation"),
+    (17, "UserExpiresInformation"),
+    (18, "UserInternal1Information"),
+    (20, "UserParametersInformation"),
+    (21, "UserAllInformation"),
+    (23, "UserInternal4Information"),
+    (24, "UserInternal5Information"),
+    (25, "UserInternal4InformationNew"),
+    (26, "UserInternal5InformationNew"),
+    (31, "UserInternal7Information"),
+    (32, "UserInternal8Information"),
+];
 
 /// `dom_sid2`: a conformant array of sub-authorities behind the SID's own header.
 ///

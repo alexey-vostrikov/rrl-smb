@@ -1,0 +1,15 @@
+# Code in this crate that a measurement on Linux cannot see, and that a CRAP score therefore
+# describes falsely: with no coverage data every one of these is scored as if it were dead, which
+# puts test doubles and another operating system's implementations at the top of the report and
+# buries the functions a maintainer is meant to read.
+#
+# `src/tests/**` is `#[cfg(test)] mod tests` in `lib.rs`: doubles and in-crate test modules, not
+# shipped code. Their CRAP is an artifact of the module being test-only — `MemFsBackend::open` came
+# out at 756 — and no amount of testing can lower it, because the file is only ever compiled as part
+# of a test binary.
+#
+# The rest is gated on the platform it belongs to and is never compiled here: `macos_streams` and
+# `dns_sd` are `target_vendor = "apple"`, `windows_streams`, `windows_eas` and `dnsapi` are
+# `windows`. The Linux halves of the same features — `avahi`, `responder`, `wsd`, `eas`, `inotify`,
+# `streams` — stay in the sample, because those do run here.
+exclude = ["src/tests/**", "src/fs/macos_streams/**", "src/fs/windows_streams/**", "src/fs/windows_eas.rs", "src/discovery/dns_sd.rs", "src/discovery/dnsapi.rs"]

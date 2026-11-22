@@ -20,6 +20,7 @@
 use super::association::Fault;
 use super::ndr::{NdrReader, NdrWriter};
 use super::pdu::{NCA_OP_RNG_ERROR, NCA_PROTO_ERROR};
+use crate::utils::{NameTable, name_in};
 
 /// `IDL_DRSBind` (opnum 0): the first call on the interface.
 pub(crate) const OPNUM_BIND: u16 = 0;
@@ -349,29 +350,31 @@ fn unbind() -> Vec<u8> {
 
 /// The names a log line is worth reading with, for the calls this server does not implement.
 fn opnum_name(opnum: u16) -> &'static str {
-    match opnum {
-        2 => "DRSReplicaSync",
-        3 => "DRSGetNCChanges",
-        4 => "DRSUpdateRefs",
-        5 => "DRSReplicaAdd",
-        6 => "DRSReplicaDel",
-        7 => "DRSReplicaModify",
-        8 => "DRSVerifyNames",
-        9 => "DRSGetMemberships",
-        10 => "DRSInterDomainMove",
-        11 => "DRSGetNT4ChangeLog",
-        12 => "DRSCrackNames",
-        13 => "DRSWriteAccountSpn",
-        14 => "DRSExecuteKCC",
-        15 => "DRSGetReplInfo",
-        16 => "DRSAddSidHistory",
-        17 => "DRSGetMemberships2",
-        18 => "DRSReplicaVerifyObjects",
-        19 => "DRSGetObjectExistence",
-        20 => "DRSQuerySitesByCost",
-        _ => "unknown",
-    }
+    name_in(DRSUAPI_OPNUMS, u32::from(opnum))
 }
+
+/// The operations of the `drsuapi` interface, by opnum, as MS-DRSR numbers them.
+const DRSUAPI_OPNUMS: NameTable = &[
+    (2, "DRSReplicaSync"),
+    (3, "DRSGetNCChanges"),
+    (4, "DRSUpdateRefs"),
+    (5, "DRSReplicaAdd"),
+    (6, "DRSReplicaDel"),
+    (7, "DRSReplicaModify"),
+    (8, "DRSVerifyNames"),
+    (9, "DRSGetMemberships"),
+    (10, "DRSInterDomainMove"),
+    (11, "DRSGetNT4ChangeLog"),
+    (12, "DRSCrackNames"),
+    (13, "DRSWriteAccountSpn"),
+    (14, "DRSExecuteKCC"),
+    (15, "DRSGetReplInfo"),
+    (16, "DRSAddSidHistory"),
+    (17, "DRSGetMemberships2"),
+    (18, "DRSReplicaVerifyObjects"),
+    (19, "DRSGetObjectExistence"),
+    (20, "DRSQuerySitesByCost"),
+];
 
 /// Whether a stub ended before a field this server reads, naming what was missing.
 #[allow(dead_code)]
