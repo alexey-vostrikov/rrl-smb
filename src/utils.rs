@@ -52,6 +52,29 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), getrandom::Error> {
     getrandom::fill(out)
 }
 
+/// The name a table gives `key`, or `"unknown"` when it has none.
+///
+/// A `match` over a protocol's numbering is a table written as control flow: twenty-five arms are
+/// twenty-five branches to count, and the cyclomatic number they produce says nothing about how hard
+/// the function is — it says how many constants the protocol happens to have. A slice with the same
+/// numbers can be read, diffed and checked against the specification's own list.
+///
+/// The lookup is linear, which is right for tables of this size: a binary search over twenty entries
+/// costs more branch prediction than the scan saves.
+pub(crate) fn name_in(table: NameTable, key: u32) -> &'static str {
+    match table.iter().find(|(n, _)| *n == key) {
+        Some((_, name)) => name,
+        None => "unknown",
+    }
+}
+
+/// A table of numbers and the names a specification gives them.
+///
+/// The `'static` is written once, here, rather than at every table: a name in a table is a string
+/// literal, and spelling the lifetime at each of them is the noise `redundant_static_lifetimes`
+/// exists to point at.
+pub(crate) type NameTable = &'static [(u32, &'static str)];
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

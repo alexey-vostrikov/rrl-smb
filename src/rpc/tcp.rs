@@ -1244,9 +1244,35 @@ async fn answer(
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
     let token = auth_answer(parsed, endpoint, kerberos, exchange);
-    // One line per PDU: which packet type arrived and, for a call, which interface and opnum. A
-    // client that connects and then stops speaking is otherwise indistinguishable from one that
-    // never connected, and that difference was the whole of a day's work on this endpoint.
+    log_pdu(parsed, raw);
+    match &parsed.body {
+        Body::Bind(bind) => {
+            let accepted = results(bind, contexts);
+            bind_answer(parsed, accepted, port, token, exchange)
+        }
+        Body::AlterContext(bind) => {
+            let accepted = results(bind, contexts);
+            alter_context_answer(parsed, accepted, token, exchange)
+        }
+        Body::Request(request) => {
+            request_answer(parsed, request, raw, contexts, endpoint, exchange).await
+        }
+        // auth3 carries the last step of an NTLM handshake and expects no answer of its own; the
+        // client's next PDU is the call it was authenticating for. Answering it, or closing the
+        // connection on it, is what a client reports as a bad tag (`RPC_S_INVALID_TAG`, 0x6be).
+        Body::Unexpected(ptype) => {
+            debug!(ptype, "rpc: unexpected PDU type, no answer");
+            Vec::new()
+        }
+        Body::CoCancel | Body::Orphaned => Vec::new(),
+    }
+}
+
+/// One line per PDU: which packet type arrived and, for a call, which interface and opnum.
+///
+/// A client that connects and then stops speaking is otherwise indistinguishable from one that never
+/// connected, and that difference was the whole of a day's work on this endpoint.
+fn log_pdu(parsed: &Pdu<'_>, raw: &[u8]) {
     debug!(
         ptype = parsed.header.ptype,
         call_id = parsed.header.call_id,
@@ -1259,338 +1285,504 @@ async fn answer(
     if std::env::var_os("RRL_EPM_DIAG").is_some() && parsed.header.ptype == 0 {
         warn!(hex = %hex(raw), "rpc: a request arrives, as it came off the wire");
     }
-    match &parsed.body {
-        Body::Bind(bind) => {
-            // C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff
-            // `auth_length != 0`**. Attaching a `sec_trailer` with an empty token therefore leaves
-            // eight octets a client cannot account for - it locates the trailer by counting back
-            // `auth_length`, and that is zero. This server has no token to send yet, so it sends no
-            // verifier at all, which is a different (and legal) statement from "an empty one".
-            vec![pdu::bind_ack(
-                pdu::PTYPE_BIND_ACK,
-                parsed.header.call_id,
-                MAX_FRAG,
-                // C706 says this "may contain a new association group identifier if one was requested
-                // by the client", and a real controller answers with a fresh non-zero id even when the
-                // client asked for zero - measured: Samba returns 3181 for a request carrying 0. A
-                // server that echoes the zero is one a client can read as "no association".
-                assoc_group(),
-                &port.to_string(),
-                &results(bind, contexts),
-                reply_verifier(token.as_deref(), exchange).as_ref(),
-            )]
-        }
+}
 
-        Body::AlterContext(bind) => {
-            // Measured on the stand: a Windows join asks for `RPC_C_AUTHN_GSS_NEGOTIATE` at level 6
-            // on this endpoint. Named in the log because the answer to it is the next step, and the
-            // values are what the answer has to satisfy.
-            if let Some(auth) = &parsed.auth {
-                info!(
-                    auth_type = auth.auth_type,
-                    auth_level = auth.auth_level,
-                    auth_context_id = auth.auth_context_id,
-                    token = auth.token.len(),
-                    "rpc: alter_context with authentication"
-                );
-            }
-            // C706 chap. 12, `rpcconn_alter_context_response_hdr_t`: same fields as `bind_ack`, and
-            // `sec_addr` is present but ignored - so an empty `port_any_t` (length 0) is the correct
-            // value, not a missing field. The verifier follows the same rule as in `bind_ack`: it is
-            // present only when `auth_length != 0`, and this server has no SPNEGO token to send yet.
-            vec![pdu::bind_ack(
-                pdu::PTYPE_ALTER_CONTEXT_RESP,
-                parsed.header.call_id,
-                MAX_FRAG,
-                0,
-                "",
-                &results(bind, contexts),
-                reply_verifier(token.as_deref(), exchange).as_ref(),
-            )]
-        }
+/// The answer to a bind.
+///
+/// C706 chap. 12, `rpcconn_bind_ack_hdr_t`: the verifier is present **iff** `auth_length != 0`.
+/// Attaching a `sec_trailer` with an empty token therefore leaves eight octets a client cannot
+/// account for - it locates the trailer by counting back `auth_length`, and that is zero. This
+/// server has no token to send yet, so it sends no verifier at all, which is a different (and legal)
+/// statement from "an empty one".
+fn bind_answer(
+    parsed: &Pdu<'_>,
+    accepted: Vec<pdu::ContextResult>,
+    port: u16,
+    token: Option<Vec<u8>>,
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    vec![pdu::bind_ack(
+        pdu::PTYPE_BIND_ACK,
+        parsed.header.call_id,
+        MAX_FRAG,
+        // C706 says this "may contain a new association group identifier if one was requested by the
+        // client", and a real controller answers with a fresh non-zero id even when the client asked
+        // for zero - measured: Samba returns 3181 for a request carrying 0. A server that echoes the
+        // zero is one a client can read as "no association".
+        assoc_group(),
+        &port.to_string(),
+        &accepted,
+        reply_verifier(token.as_deref(), exchange).as_ref(),
+    )]
+}
 
-        Body::Request(request) => {
-            // The interface comes from the context the call named: a call on a context that was
-            // never accepted has none, and guessing an interface would answer the wrong service.
-            let interface = contexts
-                .iter()
-                .find(|(id, _)| *id == request.context_id)
-                .map(|(_, syntax)| *syntax);
-
-            // At level 6 the stub is not the arguments. Two ciphers are in use and they are not
-            // interchangeable: a GSS wrap puts the token header in the verifier and its ciphertext
-            // where the arguments would be, while NTLM - what a Windows join uses on this endpoint,
-            // measured - RC4s the stub in place and puts a sixteen-octet signature in the verifier.
-            // Handing either to a handler parses nonsense, which a client reports as a bad stub.
-            let level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level);
-            let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
-            let pad = usize::from(parsed.auth.as_ref().map_or(0, |auth| auth.auth_pad_length));
-            let ntlm_sealed = level == LEVEL_PRIVACY && exchange.seals_with_ntlm();
-            // A call sealed by the netlogon channel, which is what a member sends once
-            // `ServerAuthenticate3` has proved one: `NL_AUTH_SIGNATURE` in the verifier and the
-            // arguments AES-CFB8'd in place. Neither of the other two ciphers applies - this is
-            // MS-NRPC's own, keyed on the machine password's channel - so a call it sealed reached
-            // the handler as ciphertext and was parsed as nonsense. Measured: `netr_LogonGetCapabilities`
-            // (opnum 21) arrived as 144 octets of noise.
-            let netlogon_sealed = level == LEVEL_PRIVACY
-                && parsed
-                    .auth
-                    .as_ref()
-                    .is_some_and(|auth| auth.auth_type == pdu::AuthVerifier::TYPE_NETLOGON);
-            if netlogon_sealed
-                && let Some(computer) = exchange.netlogon_computer.clone()
-                && exchange.netlogon_seal.is_none()
-                && let Ok(state) = state_of(endpoint)
-                && let Some(key) = state.channel_key(&computer)
-            {
-                debug!(%computer, "rpc: a netlogon channel will seal this association");
-                exchange.netlogon_seal = Some(NetlogonSealed { key, seq: 0 });
-            }
-            let unsealed = if netlogon_sealed {
-                match open_netlogon_sealed(parsed, request, pad, exchange) {
-                    Ok(opened) => opened,
-                    Err(detail) => {
-                        warn!(detail, "rpc: a netlogon-sealed call could not be opened");
-                        return Vec::new();
-                    }
-                }
-            } else if ntlm_sealed {
-                // Decrypt first: the checksum of an NTLM signature is masked with the same RC4
-                // stream, advanced past the message, so the signature cannot verify before the
-                // message has been taken through the cipher.
-                match exchange.unseal(request.stub) {
-                    Some(opened) => Some(opened),
-                    None => {
-                        warn!("rpc: a sealed call could not be opened");
-                        return Vec::new();
-                    }
-                }
-            } else {
-                match (level, verifier_token) {
-                    (6, Some(header)) => {
-                        match open_sealed_call(header, request.stub, pad, exchange) {
-                            Ok(opened) => opened,
-                            Err(detail) => {
-                                warn!(detail, "rpc: a sealed call could not be opened");
-                                return Vec::new();
-                            }
-                        }
-                    }
-                    // Below level 6 the stub is the arguments, and padding it needs is the PDU's own.
-                    _ => None,
-                }
-            };
-            // At level 5 the arguments travel in the clear and a signature stands beside them. It
-            // covers the PDU as the client wrote it, so it is checked on `raw`, before anything here
-            // has had a chance to rewrite it - and after any decryption, because the stream behind
-            // the checksum has to be advanced by the message first.
-            // A sealed message is signed over its **plaintext**: measured, the checksum of a
-            // Windows client's sealed `DsBind` matches an HMAC over the header, the decrypted
-            // arguments and the `sec_trailer` - and over the ciphertext it does not. So the octets
-            // the signature covers are rebuilt here, with the same length and the same offsets.
-            let signed_view = match (&unsealed, ntlm_sealed) {
-                (Some(opened), true) => {
-                    let mut view = raw.to_vec();
-                    let from = 24;
-                    if from + opened.len() <= view.len() {
-                        view[from..from + opened.len()].copy_from_slice(opened);
-                    }
-                    Some(view)
-                }
-                _ => None,
-            };
-            let checked = signed_view.as_deref().unwrap_or(raw);
-            // The netlogon signature is checked by `schannel::unseal`, which needs the sequence and
-            // the direction to do it - so it is not offered to the NTLM check, whose MAC would
-            // read the same token as a mismatch and refuse a call that verified.
-            if !netlogon_sealed
-                && level >= LEVEL_INTEGRITY
-                && let Some(auth) = parsed.auth.as_ref()
-                && !verify_signature(
-                    checked,
-                    auth,
-                    exchange,
-                    // The length the RC4 stream was advanced by, or zero when no NTLM seal is in
-                    // play: a plain `if` reads better than the chain clippy flagged.
-                    if ntlm_sealed { request.stub.len() } else { 0 },
-                )
-            {
-                return Vec::new();
-            }
-            // The padding travels inside the seal, so it is taken off after the seal opens.
-            let stub: &[u8] = match unsealed.as_deref() {
-                Some(opened) if ntlm_sealed || level == LEVEL_PRIVACY => opened
-                    .get(..opened.len().saturating_sub(pad))
-                    .unwrap_or(opened),
-                Some(opened) => opened,
-                None if level == LEVEL_INTEGRITY && pad > 0 => request
-                    .stub
-                    .get(..request.stub.len().saturating_sub(pad))
-                    .unwrap_or(request.stub),
-                None => request.stub,
-            };
-
-            let result = match interface {
-                Some(syntax) if syntax.uuid == pdu::DRSUAPI.uuid => super::drsuapi::serve(
-                    request.opnum,
-                    stub,
-                    // What `DRSCrackNames` answers from: the two names this endpoint already knows.
-                    // Not gated on `publish` - that is set on the mapper's listener only, and the
-                    // interface a client cracks names on is this one.
-                    Some(&super::drsuapi::CrackNames {
-                        nb_domain: endpoint.nb_domain.clone(),
-                        dns_domain: endpoint.dns_domain.clone(),
-                    }),
-                ),
-                // Named by the mapper but not answered here yet: the call is logged with its opnum
-                // so the sequence a client expects can be read from a trace, and refused by number
-                // rather than with a protocol error - those two read very differently to a client.
-                // The secure channel a member proves after it has joined, and the interface a
-                // password change goes through. Answered on this transport because that is where a
-                // Windows member looks for it: it asks the mapper for `netlogon`, and a server that
-                // names the interface and then refuses the call leaves it reporting
-                // `ERROR_NO_LOGON_SERVERS` for a domain it is a member of.
-                Some(syntax) if syntax.uuid == pdu::NETLOGON.uuid => {
-                    match &endpoint.channel_state {
-                        Some(state) => {
-                            let mut channel = exchange.netlogon.take().unwrap_or_default();
-                            let answer = super::netlogon::serve(
-                                &state.0,
-                                &caller(exchange),
-                                &mut channel,
-                                request.opnum,
-                                stub,
-                            )
-                            .await;
-                            exchange.netlogon = Some(channel);
-                            answer
-                        }
-                        None => Err(super::association::Fault {
-                            status: pdu::NCA_OP_RNG_ERROR,
-                            did_not_execute: true,
-                        }),
-                    }
-                }
-                // The two interfaces the mapper publishes beside `drsuapi`, answered here for the
-                // same reason `netlogon` is: a client that finds them announced and then refused
-                // takes the refusal for the server not having them. `samr` needs the state because
-                // its writes hand out handles; `lsarpc` reads the domain's own description of itself.
-                Some(syntax) if syntax.uuid == pdu::LSARPC.uuid => match state_of(endpoint) {
-                    Ok(state) => {
-                        super::lsarpc::serve(&state, &caller(exchange), request.opnum, stub).await
-                    }
-                    Err(fault) => Err(fault),
-                },
-                Some(syntax) if syntax.uuid == pdu::SAMR.uuid => match state_of(endpoint) {
-                    Ok(state) => {
-                        super::samr::serve(&state, &caller(exchange), request.opnum, stub).await
-                    }
-                    Err(fault) => Err(fault),
-                },
-                Some(syntax) if syntax.uuid == pdu::EPM.uuid => match endpoint.publish {
-                    Some(published) => super::epm::serve(request.opnum, stub, published),
-                    // A listener that does not publish anything would answer the mapper with a
-                    // tower for an endpoint it does not serve, so it says so instead.
-                    None => {
-                        tracing::warn!(
-                            opnum = request.opnum,
-                            "rpc: the endpoint mapper is not published on this listener"
-                        );
-                        Err(super::association::Fault {
-                            status: pdu::NCA_UNK_IF,
-                            did_not_execute: true,
-                        })
-                    }
-                },
-                other => {
-                    warn!(
-                        interface = ?other,
-                        context_id = request.context_id,
-                        opnum = request.opnum,
-                        "rpc: no handler for this interface over tcp"
-                    );
-                    Err(super::association::Fault {
-                        status: pdu::NCA_UNK_IF,
-                        did_not_execute: true,
-                    })
-                }
-            };
-            match result {
-                Ok(stub) => {
-                    if level == LEVEL_PRIVACY && ntlm_sealed {
-                        return seal_answer_ntlm(parsed, request.context_id, &stub, exchange);
-                    }
-                    // An answer through the netlogon channel goes back the same way the call came:
-                    // the arguments AES-CFB8'd under the channel key, with this side's own sequence
-                    // number in an `NL_AUTH_SIGNATURE`. Sending plaintext here is what a client reads
-                    // as a channel that stopped being sealed mid-stream.
-                    if netlogon_sealed && let Some(channel) = exchange.netlogon_seal.as_mut() {
-                        let mut body = stub.clone();
-                        let sig =
-                            crate::rpc::schannel::seal(&channel.key, channel.seq, false, &mut body);
-                        channel.seq += 1;
-                        let verifier = AuthReply {
-                            auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
-                            auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
-                            // The padding is inside the sealed body, so the trailer carries none.
-                            auth_pad_length: 0,
-                            auth_context_id: parsed.auth.as_ref().map_or(1, |a| a.auth_context_id),
-                            token: &sig,
-                        };
-                        return vec![pdu::response(
-                            parsed.header.call_id,
-                            pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
-                            u32::try_from(stub.len()).unwrap_or(u32::MAX),
-                            request.context_id,
-                            &body,
-                            Some(&verifier),
-                        )];
-                    }
-                    let (body, header) = seal_answer(&stub, level, exchange);
-                    // At level 5 the answer is signed rather than sealed: the verifier is a
-                    // sixteen-octet signature, and the placeholder it occupies has to be part of the
-                    // PDU while the signature over that PDU is computed.
-                    let signing = exchange.sign.is_some()
-                        && (level == LEVEL_INTEGRITY || (level == LEVEL_PRIVACY && ntlm_sealed));
-                    let placeholder = signing.then_some([0_u8; 16]);
-                    // One token for two shapes: the seal's header, or the signature's placeholder.
-                    let token: Option<&[u8]> = header
-                        .as_deref()
-                        .or(placeholder.as_ref().map(|zeros| &zeros[..]));
-                    let verifier = reply_verifier(token, exchange);
-                    let reply = pdu::response(
-                        parsed.header.call_id,
-                        pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
-                        u32::try_from(stub.len()).unwrap_or(u32::MAX),
-                        request.context_id,
-                        &body,
-                        verifier.as_ref(),
-                    );
-                    vec![if signing {
-                        sign_reply(reply, exchange)
-                    } else {
-                        reply
-                    }]
-                }
-                Err(fault) => vec![pdu::fault(
-                    parsed.header.call_id,
-                    pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG | pdu::PFC_DID_NOT_EXECUTE,
-                    request.context_id,
-                    fault.status,
-                )],
-            }
-        }
-
-        // auth3 carries the last step of an NTLM handshake and expects no answer of its own; the
-        // client's next PDU is the call it was authenticating for. Answering it, or closing the
-        // connection on it, is what a client reports as a bad tag (`RPC_S_INVALID_TAG`, 0x6be).
-        Body::Unexpected(ptype) => {
-            debug!(ptype, "rpc: unexpected PDU type, no answer");
-            Vec::new()
-        }
-
-        Body::CoCancel | Body::Orphaned => Vec::new(),
+/// The answer to an alter-context.
+///
+/// C706 chap. 12, `rpcconn_alter_context_response_hdr_t`: same fields as `bind_ack`, and `sec_addr`
+/// is present but ignored - so an empty `port_any_t` (length 0) is the correct value, not a missing
+/// field. The verifier follows the same rule as in `bind_ack`.
+fn alter_context_answer(
+    parsed: &Pdu<'_>,
+    accepted: Vec<pdu::ContextResult>,
+    token: Option<Vec<u8>>,
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    // Measured on the stand: a Windows join asks for `RPC_C_AUTHN_GSS_NEGOTIATE` at level 6 on this
+    // endpoint. Named in the log because the answer to it is the next step, and the values are what
+    // the answer has to satisfy.
+    if let Some(auth) = &parsed.auth {
+        info!(
+            auth_type = auth.auth_type,
+            auth_level = auth.auth_level,
+            auth_context_id = auth.auth_context_id,
+            token = auth.token.len(),
+            "rpc: alter_context with authentication"
+        );
     }
+    vec![pdu::bind_ack(
+        pdu::PTYPE_ALTER_CONTEXT_RESP,
+        parsed.header.call_id,
+        MAX_FRAG,
+        0,
+        "",
+        &accepted,
+        reply_verifier(token.as_deref(), exchange).as_ref(),
+    )]
+}
+
+/// The answer to a call: open what the seal did to it, hand the arguments to its interface, seal the
+/// answer the same way back.
+async fn request_answer(
+    parsed: &Pdu<'_>,
+    request: &pdu::Request<'_>,
+    raw: &[u8],
+    contexts: &[(u16, SyntaxId)],
+    endpoint: &Endpoint,
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    // The interface comes from the context the call named: a call on a context that was never
+    // accepted has none, and guessing an interface would answer the wrong service.
+    let interface = interface_of(contexts, request.context_id);
+    let Some(opening) = Opening::read(parsed, request, raw, endpoint, exchange) else {
+        return Vec::new();
+    };
+    match dispatch(
+        interface,
+        request.opnum,
+        opening.stub(request.stub),
+        endpoint,
+        exchange,
+    )
+    .await
+    {
+        Ok(stub) => reply(parsed, request, &stub, &opening, exchange),
+        Err(fault) => vec![pdu::fault(
+            parsed.header.call_id,
+            pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG | pdu::PFC_DID_NOT_EXECUTE,
+            request.context_id,
+            fault.status,
+        )],
+    }
+}
+
+/// The syntax a context id was accepted for, if it was accepted at all.
+fn interface_of(contexts: &[(u16, SyntaxId)], context_id: u16) -> Option<SyntaxId> {
+    contexts
+        .iter()
+        .find(|(id, _)| *id == context_id)
+        .map(|(_, syntax)| *syntax)
+}
+
+/// What the seal on this association did to the call, and whether the call may be answered at all.
+///
+/// Three ciphers are in play and they are not interchangeable: a GSS wrap puts the token header in
+/// the verifier and its ciphertext where the arguments would be; NTLM - what a Windows join uses on
+/// this endpoint, measured - RC4s the stub in place and puts a sixteen-octet signature in the
+/// verifier; and the netlogon channel AES-CFB8s the arguments under the machine password's channel
+/// key. Handing any of them to a handler parses nonsense, which a client reports as a bad stub.
+struct Opening {
+    level: u8,
+    pad: usize,
+    ntlm_sealed: bool,
+    netlogon_sealed: bool,
+    /// The arguments as they arrived once the seal was opened, when one was.
+    unsealed: Option<Vec<u8>>,
+}
+
+impl Opening {
+    /// Opens the call, or reports `None` when it cannot be opened and must not be answered.
+    fn read(
+        parsed: &Pdu<'_>,
+        request: &pdu::Request<'_>,
+        raw: &[u8],
+        endpoint: &Endpoint,
+        exchange: &mut Exchange,
+    ) -> Option<Opening> {
+        let level = parsed.auth.as_ref().map_or(0, |auth| auth.auth_level);
+        let verifier_token = parsed.auth.as_ref().map(|auth| auth.token);
+        let pad = usize::from(parsed.auth.as_ref().map_or(0, |auth| auth.auth_pad_length));
+        let ntlm_sealed = level == LEVEL_PRIVACY && exchange.seals_with_ntlm();
+        let netlogon_sealed = is_netlogon_sealed(parsed, level);
+        if netlogon_sealed {
+            begin_netlogon_seal(endpoint, exchange);
+        }
+        let unsealed = if netlogon_sealed {
+            open_netlogon(parsed, request, pad, exchange)?
+        } else if ntlm_sealed {
+            // Decrypt first: the checksum of an NTLM signature is masked with the same RC4 stream,
+            // advanced past the message, so the signature cannot verify before the message has been
+            // taken through the cipher.
+            match exchange.unseal(request.stub) {
+                Some(opened) => Some(opened),
+                None => {
+                    warn!("rpc: a sealed call could not be opened");
+                    return None;
+                }
+            }
+        } else {
+            open_gss(level, verifier_token, request.stub, pad, exchange)?
+        };
+        let opening = Opening {
+            level,
+            pad,
+            ntlm_sealed,
+            netlogon_sealed,
+            unsealed,
+        };
+        if !opening.signature_holds(parsed, request, raw, exchange) {
+            return None;
+        }
+        Some(opening)
+    }
+
+    /// The arguments themselves: the seal's plaintext, less the padding inside it.
+    ///
+    /// The padding travels inside the seal, so it is taken off after the seal opens - which is why
+    /// the length here is the PDU's own only when nothing was unsealed.
+    fn stub<'a>(&'a self, stub: &'a [u8]) -> &'a [u8] {
+        let trimmed = |data: &'a [u8]| {
+            data.get(..data.len().saturating_sub(self.pad))
+                .unwrap_or(data)
+        };
+        match self.unsealed.as_deref() {
+            Some(opened) if self.ntlm_sealed || self.level == LEVEL_PRIVACY => trimmed(opened),
+            Some(opened) => opened,
+            None if self.level == LEVEL_INTEGRITY && self.pad > 0 => trimmed(stub),
+            None => stub,
+        }
+    }
+
+    /// Whether this association's signature, if it has one, covers the call as it arrived.
+    ///
+    /// At level 5 the arguments travel in the clear and a signature stands beside them; a sealed
+    /// message is signed over its **plaintext** - measured, the checksum of a Windows client's
+    /// sealed `DsBind` matches an HMAC over the header, the decrypted arguments and the
+    /// `sec_trailer`, and over the ciphertext it does not. So the octets the signature covers are
+    /// rebuilt here, with the same length and the same offsets. The netlogon signature is checked by
+    /// `schannel::unseal` instead, which needs the sequence and the direction - so it is not offered
+    /// to the NTLM check, whose MAC would read the same token as a mismatch and refuse a call that
+    /// verified.
+    fn signature_holds(
+        &self,
+        parsed: &Pdu<'_>,
+        request: &pdu::Request<'_>,
+        raw: &[u8],
+        exchange: &mut Exchange,
+    ) -> bool {
+        if self.netlogon_sealed || self.level < LEVEL_INTEGRITY {
+            return true;
+        }
+        let Some(auth) = parsed.auth.as_ref() else {
+            return true;
+        };
+        let signed_view = match (&self.unsealed, self.ntlm_sealed) {
+            (Some(opened), true) => {
+                let mut view = raw.to_vec();
+                let from = 24;
+                if from + opened.len() <= view.len() {
+                    view[from..from + opened.len()].copy_from_slice(opened);
+                }
+                Some(view)
+            }
+            _ => None,
+        };
+        let checked = signed_view.as_deref().unwrap_or(raw);
+        // The length the RC4 stream was advanced by, or zero when no NTLM seal is in play.
+        let advanced = if self.ntlm_sealed {
+            request.stub.len()
+        } else {
+            0
+        };
+        verify_signature(checked, auth, exchange, advanced)
+    }
+}
+
+/// Whether this call arrived under the netlogon channel's own seal.
+fn is_netlogon_sealed(parsed: &Pdu<'_>, level: u8) -> bool {
+    level == LEVEL_PRIVACY
+        && parsed
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.auth_type == pdu::AuthVerifier::TYPE_NETLOGON)
+}
+
+/// Starts sealing this association with the netlogon channel key, once the channel is proved.
+///
+/// What a member sends once `ServerAuthenticate3` has proved one: `NL_AUTH_SIGNATURE` in the verifier
+/// and the arguments AES-CFB8'd in place. This is MS-NRPC's own cipher, keyed on the machine
+/// password's channel - so a call it sealed reached the handler as ciphertext and was parsed as
+/// nonsense. Measured: `netr_LogonGetCapabilities` (opnum 21) arrived as 144 octets of noise.
+fn begin_netlogon_seal(endpoint: &Endpoint, exchange: &mut Exchange) {
+    if exchange.netlogon_seal.is_some() {
+        return;
+    }
+    let Some(computer) = exchange.netlogon_computer.clone() else {
+        return;
+    };
+    let Ok(state) = state_of(endpoint) else {
+        return;
+    };
+    let Some(key) = state.channel_key(&computer) else {
+        return;
+    };
+    debug!(%computer, "rpc: a netlogon channel will seal this association");
+    exchange.netlogon_seal = Some(NetlogonSealed { key, seq: 0 });
+}
+
+/// A call sealed by the netlogon channel, opened - or `None` when it cannot be.
+fn open_netlogon(
+    parsed: &Pdu<'_>,
+    request: &pdu::Request<'_>,
+    pad: usize,
+    exchange: &mut Exchange,
+) -> Option<Option<Vec<u8>>> {
+    match open_netlogon_sealed(parsed, request, pad, exchange) {
+        Ok(opened) => Some(opened),
+        Err(detail) => {
+            warn!(detail, "rpc: a netlogon-sealed call could not be opened");
+            None
+        }
+    }
+}
+
+/// A call sealed with a GSS wrap: the token header in the verifier, the ciphertext where the
+/// arguments would be. Below level 6 the stub is the arguments, and the padding it needs is the
+/// PDU's own.
+fn open_gss(
+    level: u8,
+    verifier_token: Option<&[u8]>,
+    stub: &[u8],
+    pad: usize,
+    exchange: &mut Exchange,
+) -> Option<Option<Vec<u8>>> {
+    match (level, verifier_token) {
+        (6, Some(header)) => match open_sealed_call(header, stub, pad, exchange) {
+            Ok(opened) => Some(opened),
+            Err(detail) => {
+                warn!(detail, "rpc: a sealed call could not be opened");
+                None
+            }
+        },
+        _ => Some(None),
+    }
+}
+
+/// Hands the arguments to the interface the call named.
+///
+/// An interface named by the mapper but not answered here yet is refused by number rather than with
+/// a protocol error - those two read very differently to a client - and the opnum is logged so the
+/// sequence a client expects can be read from a trace.
+async fn dispatch(
+    interface: Option<SyntaxId>,
+    opnum: u16,
+    stub: &[u8],
+    endpoint: &Endpoint,
+    exchange: &mut Exchange,
+) -> Result<Vec<u8>, super::association::Fault> {
+    let Some(syntax) = interface else {
+        return unknown_interface(None, opnum);
+    };
+    if syntax.uuid == pdu::DRSUAPI.uuid {
+        return super::drsuapi::serve(
+            opnum,
+            stub,
+            // What `DRSCrackNames` answers from: the two names this endpoint already knows. Not
+            // gated on `publish` - that is set on the mapper's listener only, and the interface a
+            // client cracks names on is this one.
+            Some(&super::drsuapi::CrackNames {
+                nb_domain: endpoint.nb_domain.clone(),
+                dns_domain: endpoint.dns_domain.clone(),
+            }),
+        );
+    }
+    // The secure channel a member proves after it has joined, and the interface a password change
+    // goes through. Answered on this transport because that is where a Windows member looks for it:
+    // it asks the mapper for `netlogon`, and a server that names the interface and then refuses the
+    // call leaves it reporting `ERROR_NO_LOGON_SERVERS` for a domain it is a member of.
+    if syntax.uuid == pdu::NETLOGON.uuid {
+        return netlogon_call(opnum, stub, endpoint, exchange).await;
+    }
+    // The two interfaces the mapper publishes beside `drsuapi`, answered here for the same reason
+    // `netlogon` is: a client that finds them announced and then refused takes the refusal for the
+    // server not having them. `samr` needs the state because its writes hand out handles; `lsarpc`
+    // reads the domain's own description of itself.
+    if syntax.uuid == pdu::LSARPC.uuid {
+        let state = state_of(endpoint)?;
+        let who = caller(exchange);
+        return super::lsarpc::serve(&state, &who, opnum, stub).await;
+    }
+    if syntax.uuid == pdu::SAMR.uuid {
+        let state = state_of(endpoint)?;
+        let who = caller(exchange);
+        return super::samr::serve(&state, &who, opnum, stub).await;
+    }
+    if syntax.uuid == pdu::EPM.uuid {
+        return epm_call(opnum, stub, endpoint);
+    }
+    unknown_interface(Some(syntax), opnum)
+}
+
+/// A `netlogon` call, on the channel the association has already proved.
+async fn netlogon_call(
+    opnum: u16,
+    stub: &[u8],
+    endpoint: &Endpoint,
+    exchange: &mut Exchange,
+) -> Result<Vec<u8>, super::association::Fault> {
+    let Some(state) = &endpoint.channel_state else {
+        return Err(super::association::Fault {
+            status: pdu::NCA_OP_RNG_ERROR,
+            did_not_execute: true,
+        });
+    };
+    let mut channel = exchange.netlogon.take().unwrap_or_default();
+    let answer =
+        super::netlogon::serve(&state.0, &caller(exchange), &mut channel, opnum, stub).await;
+    exchange.netlogon = Some(channel);
+    answer
+}
+
+/// A call on the endpoint mapper.
+///
+/// A listener that does not publish anything would answer the mapper with a tower for an endpoint it
+/// does not serve, so it says so instead.
+fn epm_call(
+    opnum: u16,
+    stub: &[u8],
+    endpoint: &Endpoint,
+) -> Result<Vec<u8>, super::association::Fault> {
+    let Some(published) = endpoint.publish else {
+        tracing::warn!(
+            opnum,
+            "rpc: the endpoint mapper is not published on this listener"
+        );
+        return Err(super::association::Fault {
+            status: pdu::NCA_UNK_IF,
+            did_not_execute: true,
+        });
+    };
+    super::epm::serve(opnum, stub, published)
+}
+
+/// A call on an interface nothing here answers, refused by number.
+fn unknown_interface(
+    syntax: Option<SyntaxId>,
+    opnum: u16,
+) -> Result<Vec<u8>, super::association::Fault> {
+    warn!(
+        interface = ?syntax,
+        opnum, "rpc: no handler for this interface over tcp"
+    );
+    Err(super::association::Fault {
+        status: pdu::NCA_UNK_IF,
+        did_not_execute: true,
+    })
+}
+
+/// The answer to a call, sealed the way the call came.
+fn reply(
+    parsed: &Pdu<'_>,
+    request: &pdu::Request<'_>,
+    stub: &[u8],
+    opening: &Opening,
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    if opening.level == LEVEL_PRIVACY && opening.ntlm_sealed {
+        return seal_answer_ntlm(parsed, request.context_id, stub, exchange);
+    }
+    if opening.netlogon_sealed {
+        return sealed_netlogon_reply(parsed, request.context_id, stub, exchange);
+    }
+    plain_reply(parsed, request.context_id, stub, opening.level, exchange)
+}
+
+/// An answer through the netlogon channel: the arguments AES-CFB8'd under the channel key, with
+/// this side's own sequence number in an `NL_AUTH_SIGNATURE`.
+///
+/// Sending plaintext here is what a client reads as a channel that stopped being sealed mid-stream.
+fn sealed_netlogon_reply(
+    parsed: &Pdu<'_>,
+    context_id: u16,
+    stub: &[u8],
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    let Some(channel) = exchange.netlogon_seal.as_mut() else {
+        return plain_reply(parsed, context_id, stub, LEVEL_PRIVACY, exchange);
+    };
+    let mut body = stub.to_vec();
+    let sig = crate::rpc::schannel::seal(&channel.key, channel.seq, false, &mut body);
+    channel.seq += 1;
+    let verifier = AuthReply {
+        auth_type: pdu::AuthVerifier::TYPE_NETLOGON,
+        auth_level: pdu::AuthVerifier::LEVEL_PRIVACY,
+        // The padding is inside the sealed body, so the trailer carries none.
+        auth_pad_length: 0,
+        auth_context_id: parsed.auth.as_ref().map_or(1, |a| a.auth_context_id),
+        token: &sig,
+    };
+    vec![pdu::response(
+        parsed.header.call_id,
+        pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
+        u32::try_from(stub.len()).unwrap_or(u32::MAX),
+        context_id,
+        &body,
+        Some(&verifier),
+    )]
+}
+
+/// An answer that is sealed or signed according to the association's level.
+fn plain_reply(
+    parsed: &Pdu<'_>,
+    context_id: u16,
+    stub: &[u8],
+    level: u8,
+    exchange: &mut Exchange,
+) -> Vec<Vec<u8>> {
+    let (body, header) = seal_answer(stub, level, exchange);
+    // At level 5 the answer is signed rather than sealed: the verifier is a sixteen-octet signature,
+    // and the placeholder it occupies has to be part of the PDU while the signature over that PDU is
+    // computed.
+    let signing = exchange.sign.is_some()
+        && (level == LEVEL_INTEGRITY || (level == LEVEL_PRIVACY && exchange.seals_with_ntlm()));
+    let placeholder = signing.then_some([0_u8; 16]);
+    // One token for two shapes: the seal's header, or the signature's placeholder.
+    let token: Option<&[u8]> = header
+        .as_deref()
+        .or(placeholder.as_ref().map(|zeros| &zeros[..]));
+    let verifier = reply_verifier(token, exchange);
+    let reply = pdu::response(
+        parsed.header.call_id,
+        pdu::PFC_FIRST_FRAG | pdu::PFC_LAST_FRAG,
+        u32::try_from(stub.len()).unwrap_or(u32::MAX),
+        context_id,
+        &body,
+        verifier.as_ref(),
+    );
+    vec![if signing {
+        sign_reply(reply, exchange)
+    } else {
+        reply
+    }]
 }
 
 /// One result per context element, and the accepted ones recorded for later calls.
