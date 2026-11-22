@@ -644,6 +644,27 @@ mod tests {
         let err = decode_init_token(&[0x60, 0x05, 0xAA, 0xBB]).unwrap_err();
         assert!(matches!(err, ProtoError::Auth(_)));
     }
+
+    /// The Kerberos mechanism is the one the client listed first.
+    ///
+    /// A Windows client lists `1.2.840.48018.1.2.2` first and `1.2.840.113554.1.2.2` second, and
+    /// RFC 4178 §4.2.2 makes the target name its selection in `supportedMech`. Both are the same
+    /// mechanism to this server, so answering with the second spelling leaves the client no field
+    /// to say what it disliked — it reports `SEC_E_INVALID_TOKEN` and nothing else.
+    #[test]
+    fn the_kerberos_mechanism_is_the_one_the_client_listed_first() {
+        let mechs = |list: &[&[u8]]| list.iter().map(|m| m.to_vec()).collect::<Vec<_>>();
+
+        // A Windows offer: Microsoft's OID first.
+        let windows = mechs(&[OID_KRB5_MS, OID_KRB5, OID_NTLMSSP]);
+        assert_eq!(offered_kerberos(&windows), Some(OID_KRB5_MS));
+        // The other order, which a client that lists the standard OID first sends.
+        let standard = mechs(&[OID_KRB5, OID_KRB5_MS]);
+        assert_eq!(offered_kerberos(&standard), Some(OID_KRB5));
+        // NTLM alone names no Kerberos mechanism.
+        assert_eq!(offered_kerberos(&mechs(&[OID_NTLMSSP])), None);
+        assert_eq!(offered_kerberos(&[]), None);
+    }
 }
 
 #[cfg(all(test, feature = "krb5"))]
