@@ -2540,4 +2540,186 @@ mod tests {
             "a refused call must not change the directory"
         );
     }
+
+    /// A server configured the way a member expects to find a domain: a DNS name, a flat name that
+    /// differs from the server's, and a share so the builder has something to serve.
+    fn domain_state() -> std::sync::Arc<ServerState> {
+        crate::SmbServer::builder()
+            .listen("127.0.0.1:0".parse().expect("an address"))
+            .netbios_name("SAMBA")
+            .dns_domain("ad.example.com")
+            .domain_netbios("AD")
+            .share(crate::Share::new("home", crate::tests::memfs::MemFsBackend::new()).public())
+            .build()
+            .expect("the server builds")
+            .state()
+    }
+
+    /// A caller with no identity: the calls this module answers do not read it.
+    fn anonymous() -> Caller {
+        Caller {
+            identity: crate::proto::auth::ntlm::Identity::Anonymous,
+            can_encrypt: false,
+            session_key: crate::server::SessionKey([0u8; 16]),
+        }
+    }
+
+    /// The dispatcher: every operation it names is reached, and one it does not is refused by
+    /// number.
+    ///
+    /// This is the function a client's opnum reaches first, and it was at zero coverage: the
+    /// handlers each had a test, and the `match` that chooses between them had none. What it has to
+    /// establish is what a client depends on — an operation this server implements answers, one it
+    /// does not comes back as `NCA_OP_RNG_ERROR` rather than as a protocol error or a panic, because
+    /// those two read to a client as a broken server rather than as a missing call.
+    ///
+    /// The stubs here are deliberately too short for any of the handlers: what is under test is the
+    /// dispatch, and a malformed argument is a fault the call reports instead of a panic it causes.
+    #[tokio::test]
+    async fn every_operation_is_reached_and_an_unknown_one_is_refused_by_number() {
+        let server = domain_state();
+        let caller = anonymous();
+        let mut session = Session::default();
+        let short = [0u8; 2];
+
+        for opnum in [
+            OPNUM_SERVER_REQ_CHALLENGE,
+            OPNUM_SERVER_AUTHENTICATE3,
+            OPNUM_SERVER_PASSWORD_SET2,
+            OPNUM_DSR_GETDCNAME,
+            OPNUM_DSR_GETDCNAME_EX2,
+            OPNUM_LOGON_GET_CAPABILITIES,
+            OPNUM_LOGON_GET_DOMAIN_INFO,
+            OPNUM_SERVER_GET_TRUST_INFO,
+        ] {
+            let answer = serve(&server, &caller, &mut session, opnum, &short).await;
+            // Either an answer or a fault, never a panic: the distinction that matters to a client
+            // is which of those came back, and both are accounted for here.
+            match answer {
+                Ok(_) => {}
+                Err(fault) => assert!(fault.status != 0, "opnum {opnum} refused without a status"),
+            }
+        }
+
+        // The opnum no version of this interface defines.
+        let unknown = serve(&server, &caller, &mut session, 0xFFFF, &short).await;
+        match unknown {
+            Err(fault) => assert_eq!(fault.status, NCA_OP_RNG_ERROR, "refused by number"),
+            Ok(_) => panic!("an unknown opnum was answered"),
+        }
+    }
+
+    /// A DC name in both spellings, and the flags that choose between them.
+    ///
+    /// `DS_RETURN_DNS_NAME` and `DS_RETURN_FLAT_NAME` are what a client uses to say which domain
+    /// name it wants back. A server that answered one for the other is one a member compares against
+    /// its configured domain and rejects — and the two names here are deliberately different
+    /// (`ad.example.com` against `AD`), so an answer that ignored the flag would fail the test
+    /// rather than pass by coincidence.
+    #[test]
+    fn a_dc_name_is_answered_in_the_spelling_that_was_asked_for() {
+        let server = domain_state();
+        let flags = |f: u32| {
+            let mut stub = Vec::new();
+            stub.extend_from_slice(&0u32.to_le_bytes()); // server_unc: absent
+            stub.extend_from_slice(&0u32.to_le_bytes()); // domain_name: absent
+            stub.extend_from_slice(&0u32.to_le_bytes()); // GUID: absent
+            stub.extend_from_slice(&0u32.to_le_bytes()); // site_name: absent
+            stub.extend_from_slice(&f.to_le_bytes());
+            stub
+        };
+
+        let dns = get_dc_name(&server, &flags(DS_RETURN_DNS_NAME), false).expect("answered");
+        let flat = get_dc_name(&server, &flags(DS_RETURN_FLAT_NAME), false).expect("answered");
+
+        // The count is what separates the two answers, because three fields can carry this suffix:
+        // the controller's own name (`\\samba.ad.example.com`, present in both), the `domain_name`
+        // the flag selects, and the `dns_domain` field, which is the domain's DNS name whenever the
+        // config states one. So the DNS answer names it three times and the flat answer twice — and
+        // the difference of exactly one is the field the flag governs.
+        assert_eq!(
+            occurrences(&dns, "ad.example.com"),
+            3,
+            "controller, domain_name and dns_domain"
+        );
+        assert_eq!(
+            occurrences(&flat, "ad.example.com"),
+            2,
+            "controller and dns_domain: domain_name is the flat one here"
+        );
+        assert!(contains(&flat, "AD"), "the flat name is the domain's");
+    }
+
+    /// Whether `haystack` holds `needle` as UTF-16LE, which is how every string in these stubs
+    /// travels.
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        occurrences(haystack, needle) > 0
+    }
+
+    /// How many times `needle` appears in `haystack` as UTF-16LE.
+    ///
+    /// Counted rather than searched for, because these answers name the controller by the same DNS
+    /// suffix the domain carries: "the string is somewhere in the answer" cannot tell the two
+    /// fields apart.
+    fn occurrences(haystack: &[u8], needle: &str) -> usize {
+        let units: Vec<u8> = needle
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        haystack
+            .windows(units.len())
+            .filter(|w| *w == units.as_slice())
+            .count()
+    }
+
+    /// Both calls that report the domain refuse, in the same way, until a channel is proved.
+    ///
+    /// A member asks for the domain's description and for its trust information before it has proved
+    /// the secure channel — and a server that answered either of those to an unproved caller would
+    /// hand the domain's identity to anyone who could reach the pipe. Both refuse with
+    /// `STATUS_ACCESS_DENIED`, and the stubs here are otherwise well formed, so what the test
+    /// establishes is the refusal rather than a parse failure that would refuse anything.
+    #[test]
+    fn the_domain_is_not_described_to_an_unproved_caller() {
+        let server = domain_state();
+
+        // `netr_LogonGetDomainInfo`: the server's name inline, no computer name, then the
+        // credential, its timestamp, the return authenticator and the level.
+        let mut w = NdrWriter::new();
+        w.string("\\\\samba");
+        w.pointer(false); // computer_name: absent
+        w.raw(&[0u8; 8]); // credential
+        w.raw(&[0u8; 8]); // credential.timestamp
+        w.raw(&[0u8; 8]); // return_authenticator
+        w.u32(1); // level 1
+        let answer = logon_get_domain_info(&server, &w.finish()).expect("an answer, not a fault");
+        assert_eq!(
+            last_word(&answer),
+            NTSTATUS_ACCESS_DENIED,
+            "a domain described to an unproved caller"
+        );
+
+        // `netr_ServerGetTrustInfo`: a reference to the server name, the account name inline, the
+        // channel type, the computer name, the credential and its four-octet timestamp.
+        let mut w = NdrWriter::new();
+        w.pointer(true); // server_name: present
+        w.string("\\\\samba");
+        w.string("DOCKERW-W25$");
+        w.raw(&2u16.to_le_bytes()); // secure_channel_type
+        w.string("DOCKERW-W25");
+        w.raw(&[0u8; 8]); // credential
+        w.raw(&0u32.to_le_bytes()); // credential.timestamp
+        let answer = server_get_trust_info(&server, &w.finish()).expect("an answer, not a fault");
+        assert_eq!(
+            last_word(&answer),
+            NTSTATUS_ACCESS_DENIED,
+            "trust information given to an unproved caller"
+        );
+    }
+
+    /// The `WERROR` these calls put last, after the out parameters.
+    fn last_word(answer: &[u8]) -> u32 {
+        let at = answer.len() - 4;
+        u32::from_le_bytes(answer[at..].try_into().expect("four octets"))
+    }
 }
