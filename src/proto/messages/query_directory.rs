@@ -133,4 +133,32 @@ mod tests {
         r.write_to(&mut buf).unwrap();
         assert_eq!(QueryDirectoryResponse::parse(&buf).unwrap(), r);
     }
+
+    /// Every information class this server answers, by the number MS-SMB2 gives it.
+    ///
+    /// The numbers are wire values, and a wrong one is not a compile error: the server would answer
+    /// a class the client did not ask for, or refuse one it did, and both read to the client as a
+    /// directory listing that is subtly wrong. Classes the server does not answer must be refused
+    /// rather than guessed at the nearest neighbour.
+    #[test]
+    fn every_class_this_server_answers_has_its_wire_number() {
+        const NAMED: &[(u8, FileInfoClass)] = &[
+            (0x01, FileInfoClass::FileDirectoryInformation),
+            (0x02, FileInfoClass::FileFullDirectoryInformation),
+            (0x03, FileInfoClass::FileBothDirectoryInformation),
+            (0x0C, FileInfoClass::FileNamesInformation),
+            (0x25, FileInfoClass::FileIdBothDirectoryInformation),
+            (0x26, FileInfoClass::FileIdFullDirectoryInformation),
+        ];
+        for (number, class) in NAMED {
+            assert_eq!(
+                FileInfoClass::from_u8(*number),
+                Some(*class),
+                "{number:#04x}"
+            );
+        }
+        for number in [0x00, 0x04, 0x0D, 0x24, 0x27, 0xFF] {
+            assert!(FileInfoClass::from_u8(number).is_none(), "{number:#04x}");
+        }
+    }
 }

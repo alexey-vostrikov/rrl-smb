@@ -436,4 +436,33 @@ mod tests {
         let p = SmbPath::from_utf16(&utf16("a\\b")).unwrap();
         assert_eq!(p.components(), &["a", "b"]);
     }
+
+    /// A reserved DOS device name, with or without an extension and in any case.
+    ///
+    /// Windows resolves these to devices rather than to files, so a share serving `CON` serves the
+    /// console; the check is done on the host's behalf, which is why it is here and not in the
+    /// share. `COM0` and `LPT0` are not reserved — the numbering starts at one — and a four-letter
+    /// name that merely starts with those letters is an ordinary file.
+    #[test]
+    fn reserved_dos_names_are_recognised_in_every_spelling() {
+        for name in ["CON", "con", "Con", "PRN", "AUX", "NUL", "nul"] {
+            assert!(is_reserved_dos_name(name), "{name}");
+        }
+        for name in ["CON.txt", "con.log", "NUL.dat", "aux.ini"] {
+            assert!(is_reserved_dos_name(name), "{name}");
+        }
+        for name in ["COM1", "com9", "LPT1", "lpt9", "COM1.log"] {
+            assert!(is_reserved_dos_name(name), "{name}");
+        }
+        for name in [
+            "COM0", "LPT0", "CONS", "NULL", "CONSOLE", "COM", "LPT", "COM10", "file.txt",
+        ] {
+            assert!(!is_reserved_dos_name(name), "{name}");
+        }
+        // `matches_com_or_lpt` is the half that decides the numbered ones, and the length is what
+        // separates `COM1` from `COM10`.
+        assert!(matches_com_or_lpt("COM1"));
+        assert!(!matches_com_or_lpt("COM10"));
+        assert!(!matches_com_or_lpt("COM"));
+    }
 }

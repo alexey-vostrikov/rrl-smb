@@ -8,8 +8,12 @@
 # out at 756 — and no amount of testing can lower it, because the file is only ever compiled as part
 # of a test binary.
 #
+# `src/fuzzing.rs` is `#[cfg(fuzzing)]`: compiled only by `cargo fuzz`, absent from every normal
+# build, so its functions can never be covered by the test suite.
+#
 # The rest is gated on the platform it belongs to and is never compiled here: `macos_streams` and
 # `dns_sd` are `target_vendor = "apple"`, `windows_streams`, `windows_eas` and `dnsapi` are
 # `windows`. The Linux halves of the same features — `avahi`, `responder`, `wsd`, `eas`, `inotify`,
 # `streams` — stay in the sample, because those do run here.
-exclude = ["src/tests/**", "src/fs/macos_streams/**", "src/fs/windows_streams/**", "src/fs/windows_eas.rs", "src/discovery/dns_sd.rs", "src/discovery/dnsapi.rs"]
+
+exclude = ["src/fuzzing.rs", "src/tests/**", "src/fs/macos_streams/**", "src/fs/windows_streams/**", "src/fs/windows_eas.rs", "src/discovery/dns_sd.rs", "src/discovery/dnsapi.rs"]
