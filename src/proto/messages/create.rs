@@ -593,4 +593,26 @@ mod tests {
         let decoded = CreateContext::parse_chain(&buf).unwrap();
         assert!(decoded.is_empty());
     }
+
+    /// The oplock levels, by their wire numbers.
+    ///
+    /// `Lease` is `0xff` and not a small number, which is the value a hand-written table gets wrong;
+    /// level `2` exists in the protocol and is deliberately not answered here, so it must come back
+    /// as `None` rather than as the nearest level that is.
+    #[test]
+    fn the_oplock_levels_have_their_wire_numbers() {
+        const NAMED: &[(u8, OplockLevel)] = &[
+            (0x00, OplockLevel::None),
+            (0x01, OplockLevel::Ii),
+            (0x08, OplockLevel::Exclusive),
+            (0x09, OplockLevel::Batch),
+            (0xFF, OplockLevel::Lease),
+        ];
+        for (number, level) in NAMED {
+            assert_eq!(OplockLevel::from_u8(*number), Some(*level), "{number:#04x}");
+        }
+        for number in [0x02, 0x03, 0x04, 0x07, 0x0A, 0xFE] {
+            assert!(OplockLevel::from_u8(number).is_none(), "{number:#04x}");
+        }
+    }
 }
