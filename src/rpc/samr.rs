@@ -2700,4 +2700,148 @@ mod tests {
             NTSTATUS_NOT_SUPPORTED
         );
     }
+    // --- the calls around the password: delete, the domain's policy, and the router ------------
+
+    /// `DeleteUser` on a handle this server issued spends that handle.
+    ///
+    /// The spending is the statement worth pinning: the account is gone, and a client that retries
+    /// with the same handle must not address whatever the number names next. A server that left the
+    /// handle resolvable would answer a second delete with success for an account that no longer
+    /// exists.
+    #[tokio::test]
+    async fn deleting_a_user_spends_the_handle_it_was_called_with() {
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+        assert!(
+            server.samr_user(&handle).is_some(),
+            "the handle names the account"
+        );
+
+        let body = delete_user(&server, &handle).await.expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS
+        );
+        assert!(
+            server.samr_user(&handle).is_none(),
+            "the handle is spent, so a retry addresses nothing"
+        );
+
+        // The retry itself: refused as a handle, not answered with a second success.
+        let again = delete_user(&server, &handle).await.expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(again[..4].try_into().expect("four octets")),
+            NTSTATUS_INVALID_HANDLE
+        );
+    }
+
+    /// A delete the directory declines still spends the handle, and says the name was not found.
+    #[tokio::test]
+    async fn a_delete_the_directory_declines_says_the_name_was_not_found() {
+        use crate::server::MachineAccounts;
+
+        /// A directory that creates accounts and refuses to delete them.
+        #[derive(Debug)]
+        struct Keeps;
+        #[async_trait::async_trait]
+        impl MachineAccounts for Keeps {
+            async fn create_machine(&self, name: &str) -> Option<u32> {
+                name.ends_with('$').then_some(1234)
+            }
+            async fn machine_control(&self, _name: &str) -> Option<u32> {
+                None
+            }
+            async fn set_machine_control(&self, _name: &str, _control: u32) -> bool {
+                false
+            }
+            async fn delete_machine(&self, _name: &str) -> bool {
+                false
+            }
+            async fn account_of_rid(&self, rid: u32) -> Option<String> {
+                (rid == 1234).then(|| "SAMBA$".to_string())
+            }
+        }
+
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(Keeps));
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let body = delete_user(&server, &handle).await.expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_OBJECT_NAME_NOT_FOUND
+        );
+        assert!(server.samr_user(&handle).is_none(), "still spent");
+    }
+
+    /// The domain's password policy: a pointer, the struct, and zero length with no properties.
+    ///
+    /// A join reads this before it sets a password, and a reply without the pointer is a marshalling
+    /// error on the client's side rather than a policy of "no policy".
+    #[tokio::test]
+    async fn the_domain_password_policy_answers_a_pointer_and_an_empty_struct() {
+        let body = user_domain_password_information(&samr_handle()).expect("answered");
+        let word =
+            |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().expect("four octets"));
+        assert_ne!(word(0), 0, "the `[out]` pointer is present");
+        assert_eq!(word(4), 0, "no minimum length and no properties");
+        assert_eq!(
+            word(body.len() - 4),
+            NTSTATUS_SUCCESS,
+            "which is a policy this server has, not one it cannot read"
+        );
+    }
+
+    /// The same call with no handle at all is a malformed request, not an answer.
+    #[test]
+    fn the_password_policy_needs_a_handle() {
+        assert!(user_domain_password_information(&[]).is_err());
+    }
+
+    /// Opening the domain answers a handle and a success, whatever SID the client named.
+    #[test]
+    fn opening_the_domain_answers_a_handle() {
+        let body = open_domain(&[0_u8; 32]).expect("answered");
+        assert_eq!(body.len(), 24, "the handle, then the status");
+        assert_ne!(&body[..20], &[0u8; 20], "a handle this server can resolve");
+    }
+
+    /// The router sends each opnum to its own handler, and an unknown one to a fault.
+    ///
+    /// Worth a test of its own: a router that answered `CreateUser2` with the domain-opening handler
+    /// would look like a working server until a client sent a handle where a domain SID belongs.
+    #[tokio::test]
+    async fn every_call_reaches_its_own_handler() {
+        use crate::rpc::pdu::NCA_OP_RNG_ERROR;
+
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+
+        // `Connect5` answers a domain handle and a revision, then the status: 40 octets is its own
+        // shape, and a different handler would have answered a different one.
+        let connect = serve(&server, &caller(), OPNUM_CONNECT5, &[0_u8; 24])
+            .await
+            .expect("answered");
+        assert_eq!(
+            connect.len(),
+            40,
+            "a handle, the revision and the status: {}",
+            connect.len()
+        );
+
+        // `CloseHandle` answers the handle it was given, cleared.
+        let closed = serve(&server, &caller(), OPNUM_CLOSE, &samr_handle())
+            .await
+            .expect("answered");
+        assert_eq!(&closed[..20], &[0u8; 20], "the handle comes back closed");
+
+        // An opnum nothing routes is a fault with its number, which is what a client reports as
+        // "the procedure number is out of range".
+        let fault = serve(&server, &caller(), 999, &[])
+            .await
+            .expect_err("no handler");
+        assert_eq!(fault.status, NCA_OP_RNG_ERROR);
+    }
 }
