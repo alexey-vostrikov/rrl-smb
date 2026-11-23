@@ -2252,4 +2252,452 @@ mod tests {
             STATUS_SOME_NOT_MAPPED
         );
     }
+    // --- the two calls a join makes to set and read its own account -----------------------------
+
+    /// A directory that creates accounts, and a record of the passwords written to it.
+    ///
+    /// The password is kept as the octets the call decrypted, not as a hash: what a test has to see
+    /// is that the ciphertext the client sent came back as the text the client meant, and a hash
+    /// would let a wrong decryption agree with a wrong expectation.
+    #[derive(Debug, Default)]
+    struct RecordedPasswords(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait::async_trait]
+    impl crate::server::MachinePasswords for RecordedPasswords {
+        async fn set_password(&self, account: &str, password: &[u8]) -> bool {
+            self.0
+                .lock()
+                .expect("not poisoned")
+                .push((account.to_string(), password.to_vec()));
+            true
+        }
+    }
+
+    /// `SAMPR_USER_PASSWORD` (MS-SAMR 2.2.6.21): the text at the **end** of a 512-octet buffer whose
+    /// last four octets say how long it is.
+    fn password_buffer(password: &str) -> Vec<u8> {
+        let units: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut buffer = vec![0_u8; 512];
+        let end = 512 - units.len();
+        buffer[end..].copy_from_slice(&units);
+        buffer.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        buffer
+    }
+
+    /// The same buffer, encrypted the way class 25 carries it: `MD5(salt || key)` as an RC4 key.
+    fn encrypt_with_salt(plain: &[u8], salt: &[u8; 16], key: &[u8; 16]) -> Vec<u8> {
+        use md5::{Digest as _, Md5};
+        use rc4::{KeyInit as _, Rc4, StreamCipher as _};
+
+        let mut digest = Md5::new();
+        digest.update(salt);
+        digest.update(key);
+        let rc4_key = digest.finalize();
+        let mut cipher = plain.to_vec();
+        Rc4::new_from_slice(&rc4_key)
+            .expect("a sixteen-octet key")
+            .apply_keystream(&mut cipher);
+        cipher
+    }
+
+    /// The same buffer encrypted the way class 23 carries it: the session key *is* the RC4 key.
+    fn encrypt_raw(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
+        use rc4::{KeyInit as _, Rc4, StreamCipher as _};
+
+        let mut cipher = plain.to_vec();
+        Rc4::new_from_slice(key)
+            .expect("a sixteen-octet key")
+            .apply_keystream(&mut cipher);
+        cipher
+    }
+
+    /// A `SetInformationUser2` stub: the twenty-octet handle, the class, then `payload`.
+    ///
+    /// The class occupies four octets, and the handler reads it two ways because producers disagree
+    /// about whether the enum is `v1_enum`: a half word at 20, and a word at 20. Writing the half word
+    /// and two zero octets satisfies both — the word then reads the same number in its low half —
+    /// and it is what keeps the union at 24, which is where the password offsets are measured from.
+    /// Writing the class twice, which this did first, moved the block eight octets and every password
+    /// decrypted to nonsense.
+    fn set_info_stub(handle: &[u8], class: u32, payload: &[u8]) -> Vec<u8> {
+        let mut stub = handle.to_vec();
+        stub.extend_from_slice(&(class as u16).to_le_bytes());
+        stub.extend_from_slice(&[0_u8; 2]);
+        stub.extend_from_slice(payload);
+        stub
+    }
+
+    /// A handle this server issued for `SAMBA$`, through `CreateUser2`.
+    async fn machine_handle(server: &ServerState) -> Vec<u8> {
+        let body = create_user2(server, &create_stub("SAMBA$"))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[body.len() - 4..].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS,
+            "the account was created, so the handle names it"
+        );
+        body[..20].to_vec()
+    }
+
+    fn with_machine_hooks() -> (ServerConfig, std::sync::Arc<RecordedPasswords>) {
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(CreatesAccounts));
+        let passwords = std::sync::Arc::new(RecordedPasswords::default());
+        config.machine_passwords = Some(passwords.clone());
+        (config, passwords)
+    }
+
+    /// Class 25: the block is 516 octets of ciphertext and its sixteen-octet salt, at 220.
+    ///
+    /// This is the call a Windows join ends with, and the password inside it is the one the member
+    /// writes into its own keytab. Everything about the answer follows from the decryption: a server
+    /// that reported success without opening the block would leave the directory on no password while
+    /// the member held one, and the next secure channel would be refused for an account that exists.
+    #[tokio::test]
+    async fn a_class_25_password_is_decrypted_under_the_session_key_and_stored() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let salt = [0x7a_u8; 16];
+        let cipher = encrypt_with_salt(
+            &password_buffer("samba-secret"),
+            &salt,
+            &caller().session_key.0,
+        );
+        // The union's in-line part, up to where every client puts the block: the handler reads the
+        // block at 220 and *verifies* it, so a wrong offset is refused rather than mis-read.
+        let mut payload = vec![0_u8; PASSWORD_BLOCK_AT - 24];
+        payload.extend_from_slice(&cipher);
+        payload.extend_from_slice(&salt);
+        payload.extend_from_slice(&0_u32.to_le_bytes()); // the status of the call itself
+
+        let body = set_information_user2(&server, &caller(), &set_info_stub(&handle, 25, &payload))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS,
+            "the password was stored"
+        );
+        let recorded = passwords.0.lock().expect("not poisoned");
+        assert_eq!(recorded.len(), 1, "one write, not one per class");
+        assert_eq!(
+            recorded[0].0, "SAMBA$",
+            "under the account the handle names"
+        );
+        let text: Vec<u16> = recorded[0]
+            .1
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(
+            String::from_utf16_lossy(&text),
+            "samba-secret",
+            "the octets are the text the client encrypted"
+        );
+    }
+
+    /// The same class with a key that is not this session's: refused, and nothing is written.
+    ///
+    /// `NOT_SUPPORTED` and not a plain refusal, because the two failures are different statements: a
+    /// block this server cannot open says the session key is wrong, and a client that is told the
+    /// class is unsupported looks for the wrong fault.
+    #[tokio::test]
+    async fn a_class_25_block_this_key_does_not_open_is_refused_and_not_stored() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let salt = [0x7a_u8; 16];
+        let other_key = [0x99_u8; 16];
+        let cipher = encrypt_with_salt(&password_buffer("samba-secret"), &salt, &other_key);
+        let mut payload = vec![0_u8; PASSWORD_BLOCK_AT - 24];
+        payload.extend_from_slice(&cipher);
+        payload.extend_from_slice(&salt);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let body = set_information_user2(&server, &caller(), &set_info_stub(&handle, 25, &payload))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_NOT_SUPPORTED
+        );
+        assert!(
+            passwords.0.lock().expect("not poisoned").is_empty(),
+            "a password that did not open is not written"
+        );
+    }
+
+    /// A stub too short to hold the block is refused by name, not read past its end.
+    #[tokio::test]
+    async fn a_class_25_without_a_password_block_is_refused() {
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let body =
+            set_information_user2(&server, &caller(), &set_info_stub(&handle, 25, &[0_u8; 8]))
+                .await
+                .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
+
+    /// Class 23: the older form, where the RC4 key is the session key and there is no salt.
+    ///
+    /// `rpcclient setuserinfo2` and Samba's `net rpc password` send this, and answering it is what
+    /// lets a client that is not a Windows join set a password at all.
+    #[tokio::test]
+    async fn a_class_23_password_is_decrypted_without_a_salt() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let cipher = encrypt_raw(&password_buffer("typed-by-hand"), &caller().session_key.0);
+        let mut payload = vec![0_u8; PASSWORD_BLOCK_AT - 24];
+        payload.extend_from_slice(&cipher);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let body = set_information_user2(&server, &caller(), &set_info_stub(&handle, 23, &payload))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS
+        );
+        let recorded = passwords.0.lock().expect("not poisoned");
+        assert_eq!(recorded.len(), 1);
+        let text: String = String::from_utf16_lossy(
+            &recorded[0]
+                .1
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(text, "typed-by-hand");
+    }
+
+    /// A class 23 block that does not open is `WRONG_PASSWORD`: the block was there, the key was not.
+    #[tokio::test]
+    async fn a_class_23_block_that_does_not_open_is_a_wrong_password() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let cipher = encrypt_raw(&password_buffer("typed-by-hand"), &[0x99_u8; 16]);
+        let mut payload = vec![0_u8; PASSWORD_BLOCK_AT - 24];
+        payload.extend_from_slice(&cipher);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let body = set_information_user2(&server, &caller(), &set_info_stub(&handle, 23, &payload))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_WRONG_PASSWORD
+        );
+        assert!(passwords.0.lock().expect("not poisoned").is_empty());
+    }
+
+    /// Class 26 puts the block where the union starts, with no attribute structure in front of it.
+    ///
+    /// `netdom resetpwd` sends this when a member changes its own password. Writing the block at 220
+    /// — where class 25 has it — reads 220 octets of the block as attributes and finds no salt, so
+    /// the call would be refused for a client that is entirely correct about the protocol.
+    #[tokio::test]
+    async fn a_class_26_password_is_read_where_the_union_starts() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let salt = [0x33_u8; 16];
+        let cipher = encrypt_with_salt(
+            &password_buffer("resetpwd-secret"),
+            &salt,
+            &caller().session_key.0,
+        );
+        let mut payload = cipher;
+        payload.extend_from_slice(&salt);
+
+        let body = set_information_user2(&server, &caller(), &set_info_stub(&handle, 26, &payload))
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS
+        );
+        let recorded = passwords.0.lock().expect("not poisoned");
+        let text: String = String::from_utf16_lossy(
+            &recorded[0]
+                .1
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(text, "resetpwd-secret");
+    }
+
+    /// A handle this server never issued is refused, and refused as a handle: a password written
+    /// through an unknown handle is a password written to nobody.
+    #[tokio::test]
+    async fn a_password_for_an_unissued_handle_is_refused_as_a_handle() {
+        let (config, passwords) = with_machine_hooks();
+        let server = state(config);
+        let unknown = [0xab_u8; 20];
+
+        let body = set_information_user2(
+            &server,
+            &caller(),
+            &set_info_stub(&unknown, 25, &[0_u8; 600]),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_INVALID_HANDLE
+        );
+        assert!(passwords.0.lock().expect("not poisoned").is_empty());
+    }
+
+    /// A class this server does not answer is refused by number, and the number reaches the log.
+    #[tokio::test]
+    async fn an_unknown_set_class_is_refused() {
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let body = set_information_user2(
+            &server,
+            &caller(),
+            &set_info_stub(&handle, 24, &[0_u8; 600]),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
+
+    /// `QueryInformationUser` for the account's flags: the pointer, the union's tag, the flags, and
+    /// the status, in that order.
+    ///
+    /// The tag is what a client unmarshals the union by, and a reply without it is read as an arm of
+    /// another number — `0x6c5`, `RPC_S_INVALID_BOUND`, on the client's side.
+    #[tokio::test]
+    async fn querying_the_flags_answers_the_tag_and_the_directorys_control() {
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+
+        let mut stub = handle.clone();
+        stub.extend_from_slice(&(USER_CONTROL_INFORMATION as u16).to_le_bytes());
+        stub.extend_from_slice(&(USER_CONTROL_INFORMATION as u16).to_le_bytes());
+        let body = query_information_user(&server, &stub)
+            .await
+            .expect("answered");
+
+        let word =
+            |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().expect("four octets"));
+        // NDR numbers referents from `0x00020000`; any non-zero word here is a pointer that a client
+        // follows, and zero is the "nothing to point at" this server answers when it has no flags.
+        assert_ne!(word(0), 0, "the `[out]` pointer is present");
+        assert_eq!(word(4), USER_CONTROL_INFORMATION, "the union's tag");
+        assert_eq!(
+            word(8),
+            acct_flags(0x1000),
+            "the directory's control, in the flags this call speaks"
+        );
+        assert_eq!(*body.last().expect("a status"), 0, "and a success status");
+        assert_eq!(
+            u32::from_le_bytes(body[body.len() - 4..].try_into().expect("four octets")),
+            NTSTATUS_SUCCESS
+        );
+    }
+
+    /// A directory that creates accounts and cannot read their control.
+    #[derive(Debug)]
+    struct NoControl;
+
+    #[async_trait::async_trait]
+    impl crate::server::MachineAccounts for NoControl {
+        async fn create_machine(&self, name: &str) -> Option<u32> {
+            name.ends_with('$').then_some(1234)
+        }
+
+        async fn machine_control(&self, _name: &str) -> Option<u32> {
+            None
+        }
+
+        async fn set_machine_control(&self, _name: &str, _control: u32) -> bool {
+            false
+        }
+
+        async fn delete_machine(&self, _name: &str) -> bool {
+            false
+        }
+
+        async fn account_of_rid(&self, rid: u32) -> Option<String> {
+            (rid == 1234).then(|| "SAMBA$".to_string())
+        }
+    }
+
+    /// An account this server cannot read answers no pointer, and says the name was not found.
+    #[tokio::test]
+    async fn querying_the_flags_of_an_unreadable_account_answers_no_pointer() {
+        let mut config = config();
+        config.machine_accounts = Some(std::sync::Arc::new(NoControl));
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+        let mut stub = handle.clone();
+        stub.extend_from_slice(&(USER_CONTROL_INFORMATION as u16).to_le_bytes());
+        stub.extend_from_slice(&(USER_CONTROL_INFORMATION as u16).to_le_bytes());
+        let body = query_information_user(&server, &stub)
+            .await
+            .expect("answered");
+
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            0,
+            "no pointer: there is nothing to point at"
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[body.len() - 4..].try_into().expect("four octets")),
+            NTSTATUS_OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    /// A class this server does not fill is refused, with the same no-pointer shape.
+    #[tokio::test]
+    async fn querying_an_unknown_class_is_refused() {
+        let (config, _) = with_machine_hooks();
+        let server = state(config);
+        let handle = machine_handle(&server).await;
+        let mut stub = handle.clone();
+        stub.extend_from_slice(&3_u16.to_le_bytes());
+        stub.extend_from_slice(&3_u16.to_le_bytes());
+
+        let body = query_information_user(&server, &stub)
+            .await
+            .expect("answered");
+        assert_eq!(
+            u32::from_le_bytes(body[..4].try_into().expect("four octets")),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[body.len() - 4..].try_into().expect("four octets")),
+            NTSTATUS_NOT_SUPPORTED
+        );
+    }
 }
