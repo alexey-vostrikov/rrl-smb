@@ -863,6 +863,85 @@ mod tests {
             .to_string()
     }
 
+    /// The running handlers follow the links that exist, and an address that cannot be announced on
+    /// is reported once rather than on every poll.
+    ///
+    /// `update` is where the discovery task's decision becomes sockets, and its three outcomes are
+    /// separate facts a parser test cannot see: a link that appeared gets a handler, the same link
+    /// with a changed prefix updates the one it has instead of starting a second, and a link that
+    /// went away takes its handler with it. The fourth is the failure path — an address that is not
+    /// on any interface cannot join the multicast group — and it has its own trap: the poll runs
+    /// every second, so a failure that is not remembered would write its warning once a second for
+    /// the life of the server.
+    #[tokio::test]
+    async fn handlers_follow_the_links_that_exist() {
+        let shared = Arc::new(Shared::new(
+            crate::discovery::wsd::samples::device(),
+            Instant::now(),
+        ));
+        let mut handlers: HashMap<Key, Handler> = HashMap::new();
+        let mut failed: HashSet<(u32, IpAddr)> = HashSet::new();
+
+        // `192.0.2.0/24` is TEST-NET-1: an address no interface has, so the group cannot be joined.
+        let impossible = Link {
+            index: 99,
+            addr: ip("192.0.2.1"),
+            networks: vec![(ip("192.0.2.1"), 24)],
+        };
+        update(
+            &mut handlers,
+            vec![impossible.clone()],
+            &shared,
+            &mut failed,
+        )
+        .await;
+        assert!(
+            handlers.is_empty(),
+            "no handler for a link that cannot be answered"
+        );
+        assert_eq!(failed.len(), 1, "the failure is remembered");
+
+        update(&mut handlers, vec![impossible], &shared, &mut failed).await;
+        assert_eq!(
+            failed.len(),
+            1,
+            "a remembered failure is not logged again on the next poll"
+        );
+
+        // `127.0.0.2`, not `127.0.0.1`: the send socket binds the link's own address on port 3702
+        // *without* SO_REUSEPORT, because that is the port Windows replies to, and two tests holding
+        // the same address would fail each other. The whole `127.0.0.0/8` is loopback, so the group
+        // is joinable here just the same.
+        let lo = Link {
+            index: 0,
+            addr: ip("127.0.0.2"),
+            networks: vec![(ip("127.0.0.2"), 8)],
+        };
+        update(&mut handlers, vec![lo.clone()], &shared, &mut failed).await;
+        assert_eq!(
+            handlers.len(),
+            1,
+            "a link the sockets accept gets a handler"
+        );
+
+        // The same link, one prefix wider: `key` is (interface, family), so this is the same handler
+        // with a new network list rather than a second one on the same ports.
+        let mut wider = lo;
+        wider.networks = vec![(ip("127.0.0.2"), 16)];
+        update(&mut handlers, vec![wider], &shared, &mut failed).await;
+        assert_eq!(
+            handlers.len(),
+            1,
+            "the same link is updated, not started a second time"
+        );
+
+        update(&mut handlers, Vec::new(), &shared, &mut failed).await;
+        assert!(
+            handlers.is_empty(),
+            "a link that went away takes its handler with it"
+        );
+    }
+
     /// The Actions of the datagrams `client` receives until it has been
     /// quiet for `quiet`.
     async fn received(client: &UdpSocket, quiet: Duration) -> Vec<String> {
