@@ -113,6 +113,32 @@ pub struct NegResp {
     pub mic: Option<Vec<u8>>,
 }
 
+/// Wrap a bare Kerberos mechanism token in the GSS framing RFC 2743 §3.1 defines.
+///
+/// `SESSION_SETUP` carries the mechanism's own token — `TOK_ID` and the AP-REP, no envelope — because
+/// that is what Samba and MIT put in `mechToken` and what their clients parse. A client that speaks
+/// GSS-API reads the enclosing `[APPLICATION 0]` with the mechanism OID, so a test that drives the
+/// crate's `InitiatorContext` puts the envelope back: `0x60`, the OID `1.2.840.113554.1.2.2`, then the
+/// token unchanged. Handing `step` the bare token leaves it reading `TOK_ID` where it expects a tag,
+/// which reports as a DER error about 0x60 and says nothing about the real cause.
+pub fn gss(token: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x06, 0x09];
+    body.extend_from_slice(OID_KRB5);
+    body.extend_from_slice(token);
+    let mut out = vec![0x60];
+    // DER definite length: one octet below 128, else a long form with the count of octets that follow.
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else if n < 0x100 {
+        out.extend_from_slice(&[0x81, n as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (n >> 8) as u8, (n & 0xff) as u8]);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
 pub fn parse_neg_resp(buf: &[u8]) -> NegResp {
     let (tag, inner, _) = split_tlv(buf);
     assert_eq!(tag, 0xa1, "NegTokenResp");
