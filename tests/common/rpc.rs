@@ -113,6 +113,41 @@ pub fn with_auth(pdu: Vec<u8>, auth_type: u8, token: &[u8]) -> Vec<u8> {
     finish(out)
 }
 
+/// `pdu` with a verifier at `level`, for `context`, carrying `token` (MS-RPCE 2.2.2.11).
+///
+/// `with_auth` fixes the level at 2, which is what the SMB pipes use; a call at integrity (5) or
+/// privacy (6) differs only in that octet and in what the token then is.
+pub fn with_auth_level(
+    pdu: Vec<u8>,
+    auth_type: u8,
+    level: u8,
+    context: u32,
+    token: &[u8],
+) -> Vec<u8> {
+    let mut out = pdu;
+    out.extend_from_slice(&[auth_type, level, 0, 0]);
+    out.extend_from_slice(&context.to_le_bytes());
+    out.extend_from_slice(token);
+    out[10..12].copy_from_slice(&(token.len() as u16).to_le_bytes());
+    finish(out)
+}
+
+/// The verifier of a PDU: its `sec_trailer` and the token that follows it.
+pub fn auth_of(pdu: &[u8]) -> Option<(u8, u8, u32, Vec<u8>)> {
+    let len = usize::from(u16::from_le_bytes([pdu[10], pdu[11]]));
+    if len == 0 {
+        return None;
+    }
+    let at = pdu.len() - len - 8;
+    let trailer = &pdu[at..at + 8];
+    Some((
+        trailer[0],
+        trailer[1],
+        u32::from_le_bytes(trailer[4..8].try_into().expect("four octets")),
+        pdu[at + 8..].to_vec(),
+    ))
+}
+
 /// A request fragment.
 pub fn request_pdu(call_id: u32, flags: u8, context: u16, opnum: u16, stub: &[u8]) -> Vec<u8> {
     let mut out = header(PTYPE_REQUEST, flags, call_id);

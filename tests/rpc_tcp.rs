@@ -315,6 +315,50 @@ async fn an_ntlm_logon_is_answered_over_tcp() {
     );
 }
 
+/// A `netlogon` negotiate: the names a member announces, and the answer that names none.
+///
+/// `NL_AUTH_NEGOTIATE` (MS-NRPC 2.2.1.3.1) travels in the bind's verifier with `auth_type` 68, and
+/// its flags describe the names in the *request*. The answer's flags are zero and its buffer is a
+/// single `NULL`, because echoing the client's word back claims the answer carries names it does not —
+/// which a Windows member reports as `SEC_E_INVALID_TOKEN` and never follows with the `auth3` that
+/// would have proved the channel.
+#[tokio::test]
+async fn a_netlogon_negotiate_names_its_computer_and_the_answer_names_none() {
+    let (_addr, mut s) = started().await;
+
+    // Message type 0 (`NL_NEGOTIATE_REQUEST`), then the flag word: NetBIOS domain, NetBIOS computer,
+    // DNS domain and the computer again as UTF-8 — the four a member announces.
+    let flags: u32 = 0x01 | 0x02 | 0x04 | 0x10;
+    let mut token = Vec::new();
+    token.extend_from_slice(&0u32.to_le_bytes());
+    token.extend_from_slice(&flags.to_le_bytes());
+    for name in ["AD", "SAMBA", "ad.example.com", "SAMBA"] {
+        token.extend_from_slice(name.as_bytes());
+        token.push(0);
+    }
+
+    let bind = with_verifier(bind_pdu(1, 4280, &[(0, NETLOGON, NDR)]), 68, 5, &token);
+    let ack = transceive(&mut s, &bind).await;
+    assert_eq!(ptype(&ack), PTYPE_BIND_ACK);
+    let answer = verifier_token(&ack);
+    assert_eq!(
+        answer,
+        {
+            let mut expected = 1u32.to_le_bytes().to_vec(); // NL_NEGOTIATE_RESPONSE
+            expected.extend_from_slice(&[0u8; 8]);
+            expected
+        },
+        "the answer is a response with no flags and a NULL buffer"
+    );
+
+    // The computer the negotiate named is the one the channel's key belongs to, and it was taken
+    // from the NetBIOS form. A call on `netlogon` then fails by number - this listener has no channel
+    // state - which is what makes the refusal distinguishable from an association that died.
+    let call = request_pdu(2, FIRST | LAST, 0, 4, &[]);
+    let fault = transceive(&mut s, &call).await;
+    assert_eq!(fault_status(&fault), NCA_OP_RNG_ERROR);
+}
+
 /// `pdu` with an auth verifier naming `auth_type` and `level` (MS-RPCE 2.2.2.11).
 fn with_verifier(mut pdu: Vec<u8>, auth_type: u8, level: u8, token: &[u8]) -> Vec<u8> {
     pdu.extend_from_slice(&[auth_type, level, 0, 0, 0, 0, 0, 0]);
