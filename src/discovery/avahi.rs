@@ -645,4 +645,148 @@ mod tests {
         assert!(!machine.committed);
         assert_eq!(machine.server_state(SERVER_RUNNING), Step::Register);
     }
+
+    /// A service as the server builds one, for the stand.
+    fn service(name: &str) -> Service {
+        Service {
+            name: name.to_string(),
+            default_name: false,
+            model: Some("stand".to_string()),
+            port: 1445,
+            scope: Scope::V4,
+            host: "stand-host".to_string(),
+            device: None,
+        }
+    }
+
+    /// Gives up when the stand is not there, rather than failing: a test that needs a daemon must not
+    /// turn a plain `cargo test` red. The run that measures coverage starts the stand and sets
+    /// `RRL_AVAHI_STAND`, so the statements below are executed where they can be.
+    fn stand_missing() -> bool {
+        std::env::var_os("RRL_AVAHI_STAND").is_none()
+    }
+
+    /// The whole registration against a real avahi-daemon: connect, ask for the state, and commit.
+    ///
+    /// `try_connect` and `Group::apply` are the two things a mock cannot stand in for. `try_connect`
+    /// is a system-bus connection plus two match rules and a `GetNameOwner` that answers differently
+    /// while the daemon is stopped; `apply` is a loop over `EntryGroupNew`, two `AddService` calls,
+    /// `Commit`, and the collision error Avahi sends back as a D-Bus error rather than a reply.
+    #[tokio::test]
+    async fn the_records_are_committed_with_a_live_daemon() {
+        if stand_missing() {
+            return;
+        }
+        let Some(bus) = Bus::connect().await else {
+            panic!("the stand promised a system bus and there is none");
+        };
+        // The daemon announces, so the state is RUNNING: a bus answer is not the same as a daemon
+        // that is ready, and registering against a daemon that is still starting is a collision
+        // Avahi reports as a failure.
+        let state = call(&bus.conn, "/", SERVER, "GetState", &())
+            .await
+            .expect("GetState")
+            .body()
+            .deserialize::<i32>()
+            .expect("a state");
+        assert_eq!(state, SERVER_RUNNING, "avahi-daemon is running");
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(bus.run(service("Stand Files"), rx));
+        // Long enough for EntryGroupNew, the two AddService calls and the state that follows Commit.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the registration stops when it is told to")
+            .expect("it does not panic");
+    }
+
+    /// A system bus with no daemon on it: the built-in responder answers meanwhile.
+    ///
+    /// `answer_until_avahi` is the code that covers a machine where D-Bus is there and avahi-daemon
+    /// is installed but stopped — the state a distribution ships in and a container is always in. It
+    /// runs the mDNS responder and watches for the bus name, and what it must not do is exit when
+    /// nothing arrives: the stop signal is the only way out.
+    #[tokio::test]
+    async fn without_a_daemon_the_built_in_responder_answers() {
+        if std::env::var_os("RRL_DBUS_STAND").is_none() {
+            return;
+        }
+        let Some(bus) = Bus::connect().await else {
+            panic!("the stand promised a system bus and there is none");
+        };
+        assert!(
+            bus.owner.is_empty(),
+            "this mode is for a bus with no avahi-daemon on it"
+        );
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(bus.run(service("Stand Files"), rx));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!task.is_finished(), "nothing has arrived to make it stop");
+        let _ = tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the stop signal is what ends it")
+            .expect("it does not panic");
+    }
+
+    /// A name that is already registered is refused, and Avahi is asked for another one.
+    ///
+    /// The second registration of the same instance name is what Avahi answers with
+    /// `org.freedesktop.Avahi.CollisionError` — an error, not a reply — and that error is the only
+    /// way `apply` learns to rename. Two registrations are enough to produce it.
+    #[tokio::test]
+    async fn a_name_taken_by_another_registration_is_renamed() {
+        if stand_missing() {
+            return;
+        }
+        let Some(first) = Bus::connect().await else {
+            panic!("the stand promised a system bus and there is none");
+        };
+        let (tx, rx) = oneshot::channel();
+        let held = tokio::spawn(first.run(service("Stand Files"), rx));
+        // The first registration has to be committed before the second is refused for the same
+        // name: Avahi compares against what is already on the network, not against what arrived.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let Some(second) = Bus::connect().await else {
+            panic!("the stand promised a second system bus connection");
+        };
+
+        // The stand is real: while the first registration holds the name, Avahi itself says another
+        // name is needed. Asked here rather than assumed, because a collision that never happened
+        // would leave the test green and `apply`'s rename branch unexecuted. Asked on the second
+        // connection, because the first one went with the registration it is running.
+        let offered = call(
+            &second.conn,
+            "/",
+            SERVER,
+            "GetAlternativeServiceName",
+            &("Stand Files",),
+        )
+        .await
+        .expect("GetAlternativeServiceName")
+        .body()
+        .deserialize::<String>()
+        .expect("a name");
+        assert_ne!(
+            offered, "Stand Files",
+            "the name is taken, and Avahi offers '{offered}' instead"
+        );
+        let (tx2, rx2) = oneshot::channel();
+        let renamed = tokio::spawn(second.run(service("Stand Files"), rx2));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let _ = tx2.send(());
+        tokio::time::timeout(Duration::from_secs(10), renamed)
+            .await
+            .expect("the second registration stops")
+            .expect("it does not panic");
+        let _ = tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), held)
+            .await
+            .expect("the first registration stops")
+            .expect("it does not panic");
+    }
 }
