@@ -201,6 +201,131 @@ pub fn parse_challenge(msg: &[u8]) -> ([u8; 8], Vec<u8>) {
     (challenge, msg[off..off + len].to_vec())
 }
 
+/// Which way a signed message travels, for the key derivation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NtlmDir {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// The client's own NTLM signing state, written here rather than taken from the crate.
+///
+/// Deliberately a second implementation. The crate has `NtlmMac`, and a test that used it would be
+/// asking the code whether the code is right: the RC4 stream, the sequence number and the choice of
+/// key are exactly the parts a peer gets wrong, and only an independent reading of MS-NLMP 3.4.4
+/// proves they agree.
+pub struct NtlmSign {
+    signing_key: [u8; 16],
+    /// The sealing-key stream, advanced eight octets per signature when `KEY_EXCH` was negotiated.
+    handle: Option<rc4::Rc4>,
+    seq: u32,
+}
+
+impl NtlmSign {
+    /// The state a peer derives from `NegotiateFlags` and the ExportedSessionKey (MS-NLMP 3.4.4.1).
+    pub fn new(flags: u32, exported: &[u8; 16], dir: NtlmDir) -> Option<Self> {
+        let (sign_magic, seal_magic): (&[u8], &[u8]) = match dir {
+            NtlmDir::ClientToServer => (
+                b"session key to client-to-server signing key magic constant\0",
+                b"session key to client-to-server sealing key magic constant\0",
+            ),
+            NtlmDir::ServerToClient => (
+                b"session key to server-to-client signing key magic constant\0",
+                b"session key to server-to-client sealing key magic constant\0",
+            ),
+        };
+        if flags & NTLM_ESS == 0 || flags & NTLM_SIGN == 0 {
+            return None;
+        }
+        // The sealing key is truncated to the negotiated key length *before* the magic is appended;
+        // the signing key is not.
+        let seal_len = if flags & NTLM_128 != 0 {
+            16
+        } else if flags & NTLM_56 != 0 {
+            7
+        } else {
+            5
+        };
+        let sealing = md5_concat(&exported[..seal_len], seal_magic);
+        let handle = (flags & NTLM_KEY_EXCH != 0)
+            .then(|| rc4::Rc4::new_from_slice(&sealing).expect("RC4 takes a sixteen-octet key"));
+        Some(Self {
+            signing_key: md5_concat(exported, sign_magic),
+            handle,
+            seq: 0,
+        })
+    }
+
+    /// RC4s `data` in place with the sealing stream, advancing it (MS-NLMP 3.4.4.2).
+    ///
+    /// A sealed message consumes its own length from the stream *before* the checksum is masked, so
+    /// the two calls have an order and swapping them produces a signature that verifies nowhere.
+    pub fn seal(&mut self, data: &mut [u8]) -> bool {
+        match self.handle.as_mut() {
+            Some(handle) => {
+                handle.apply_keystream(data);
+                true
+            }
+            // Without `KEY_EXCH` there is no sealing stream, and an association at privacy level
+            // cannot seal anything.
+            None => false,
+        }
+    }
+
+    /// `NTLMSSP_MESSAGE_SIGNATURE` over `message` at the next sequence number.
+    pub fn mac(&mut self, message: &[u8]) -> [u8; 16] {
+        let digest = hmac_md5(&self.signing_key, &[&self.seq.to_le_bytes(), message]);
+        let mut checksum = [0_u8; 8];
+        checksum.copy_from_slice(&digest[..8]);
+        if let Some(handle) = self.handle.as_mut() {
+            handle.apply_keystream(&mut checksum);
+        }
+        let mut out = [0_u8; 16];
+        out[..4].copy_from_slice(&1u32.to_le_bytes());
+        out[4..12].copy_from_slice(&checksum);
+        out[12..].copy_from_slice(&self.seq.to_le_bytes());
+        self.seq = self.seq.wrapping_add(1);
+        out
+    }
+}
+
+/// `MD5(data || magic)`: how both NTLM keys are derived.
+fn md5_concat(data: &[u8], magic: &[u8]) -> [u8; 16] {
+    let mut hasher = md5::Md5::new();
+    hasher.update(data);
+    hasher.update(magic);
+    hasher.finalize().into()
+}
+
+/// Which reading of a signed PDU a peer signs, when the two implementations disagree.
+///
+/// MS-RPCE 2.2.2.11.1 leaves the covered range implicit, and two readings circulate: everything the
+/// PDU holds ahead of the signature, and the whole PDU with the signature octets zeroed. They differ
+/// by sixteen octets of input, so a peer that guesses wrong fails on the first call and on every call
+/// after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SigStyle {
+    /// Header, arguments and `sec_trailer`: everything ahead of the signature.
+    BeforeSignature,
+    /// The whole PDU, with the sixteen signature octets read as zero.
+    Zeroed,
+}
+
+impl SigStyle {
+    /// The octets this style signs, taken from a whole PDU that carries `sig` in its last sixteen.
+    pub fn message(self, pdu: &[u8]) -> Vec<u8> {
+        match self {
+            SigStyle::BeforeSignature => pdu[..pdu.len() - 16].to_vec(),
+            SigStyle::Zeroed => {
+                let mut copy = pdu.to_vec();
+                let from = copy.len() - 16;
+                copy[from..].fill(0);
+                copy
+            }
+        }
+    }
+}
+
 /// Options for [`ntlm_authenticate`].
 #[derive(Clone, Copy)]
 pub struct AuthOptions {

@@ -2502,4 +2502,59 @@ mod tests {
             "and the sequence does not advance for it"
         );
     }
+    /// A mechanism token inside a GSS-API envelope is what the Kerberos layer reads.
+    ///
+    /// A client that keeps the envelope and hands it on has its DER parser look for the mechanism's
+    /// opening octet where the envelope's `0x60` sits, and report `expected tag 0x6e, got 0x60` for
+    /// a token that is entirely valid. `0x6e` opens an AP-REQ and `0x6f` an AP-REP; anything else is
+    /// already the token and is passed through unchanged.
+    #[test]
+    fn a_gss_envelope_is_stripped_to_the_mechanism_token() {
+        let envelope = |inner: &[u8]| {
+            let mut body = vec![0x06, 0x09];
+            body.extend_from_slice(super::spnego::OID_KRB5);
+            body.extend_from_slice(inner);
+            let mut out = vec![0x60, u8::try_from(body.len()).expect("a short envelope")];
+            out.extend_from_slice(&body);
+            out
+        };
+        let ap_req = [0x6e, 0x01, 0x02];
+        let ap_rep = [0x6f, 0x03];
+        assert_eq!(mechanism_token(&envelope(&ap_req)), &ap_req);
+        assert_eq!(mechanism_token(&envelope(&ap_rep)), &ap_rep);
+        // Already a mechanism token: nothing to strip, and stripping again would eat its first
+        // octets.
+        assert_eq!(mechanism_token(&ap_req), &ap_req);
+        // An NTLMSSP token in a SPNEGO envelope has neither octet, so it passes through whole.
+        let ntlm = b"NTLMSSP\x00\x01\x00\x00\x00";
+        assert_eq!(mechanism_token(&envelope(ntlm)), envelope(ntlm));
+    }
+
+    /// Who a call is made as: the principal a ticket proved, or nobody.
+    ///
+    /// The caller this endpoint hands a handler is deliberately narrow: the session key is zero and
+    /// encryption is not claimed, because this transport authenticates the association and not the
+    /// payload. A handler that trusted `can_encrypt` here would accept a sealed password it cannot
+    /// open.
+    #[test]
+    fn a_caller_is_the_principal_a_ticket_proved() {
+        let mut exchange = Exchange::default();
+        let anonymous = caller(&exchange);
+        assert!(matches!(
+            anonymous.identity,
+            crate::proto::auth::ntlm::Identity::Anonymous
+        ));
+        assert!(!anonymous.can_encrypt);
+        assert_eq!(anonymous.session_key.0, [0_u8; 16]);
+
+        exchange.principal = Some("machine$@AD.EXAMPLE.COM".to_string());
+        let who = caller(&exchange);
+        match who.identity {
+            crate::proto::auth::ntlm::Identity::User { user, domain } => {
+                assert_eq!(user, "machine$@AD.EXAMPLE.COM");
+                assert!(domain.is_empty(), "the principal carries its own realm");
+            }
+            other => panic!("a proved principal is a user, not {other:?}"),
+        }
+    }
 }
