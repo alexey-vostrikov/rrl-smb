@@ -2672,6 +2672,146 @@ mod tests {
             .count()
     }
 
+    /// The domain's description, at the level a member asks for, on a channel that is proved.
+    ///
+    /// This is the answer `netr_LogonGetDomainInfo` gives once the credential chain checks out —
+    /// three earlier refusals stand in front of it (unproved channel, wrong credential, no DNS name
+    /// to describe), and each of them is one branch away from reaching it. What the test establishes
+    /// is the honest part: the two names this server answers with are the ones it was configured
+    /// with, the GUID is derived from the DNS name rather than random, and the status is success.
+    ///
+    /// What it does **not** establish is that a Windows member accepts the marshalling. Measured, it
+    /// does not: the client answers `NlUpdateDomainInfo failed 0xC0020023`, so at least one field is
+    /// laid out differently from what it expects, and the comment on the function says so. A test
+    /// that pinned today's bytes as correct would make the defect look settled; this one pins the
+    /// facts the answer must carry, which stay true whichever field moves.
+    #[test]
+    fn the_domain_is_described_to_a_proved_caller() {
+        let server = crate::SmbServer::builder()
+            .listen("127.0.0.1:0".parse().expect("an address"))
+            .netbios_name("SAMBA")
+            .dns_domain("ad.example.com")
+            .domain_netbios("AD")
+            .domain_sid("S-1-5-21-1-2-3".to_string())
+            .share(crate::Share::new("home", crate::tests::memfs::MemFsBackend::new()).public())
+            .build()
+            .expect("the server builds")
+            .state();
+
+        // The channel as the authenticate would have left it, and the credential the *next* call
+        // owes: computed here from the same seed the server holds, which is what a member does.
+        let mut channel = crate::server::ChannelState {
+            key: live_key(),
+            seed: octets(LIVE_SEED),
+            client_credential: octets(LIVE_SEED),
+            server_credential: octets(LIVE_SERVER),
+            flags: 0x610f_ffff,
+        };
+        let (client, _) = advance_credential(&mut channel, LIVE_SEQUENCE);
+        server.remember_channel(
+            "SAMBA",
+            crate::server::ChannelState {
+                key: live_key(),
+                seed: octets(LIVE_SEED),
+                client_credential: octets(LIVE_SEED),
+                server_credential: octets(LIVE_SERVER),
+                flags: 0x610f_ffff,
+            },
+        );
+
+        let mut w = NdrWriter::new();
+        w.string("\\\\samba.ad.example.com");
+        w.pointer(true);
+        w.string("SAMBA");
+        w.raw(&client); // credential: the half the chain produces for this sequence
+        w.raw(&LIVE_SEQUENCE.to_le_bytes()); // the sequence the credential was stepped with
+        w.raw(&[0u8; 4]); // ...and the rest of the eight-octet timestamp
+        w.raw(&[0u8; 8]); // return_authenticator
+        w.u32(1); // level 1
+        let answer = logon_get_domain_info(&server, &w.finish()).expect("an answer, not a fault");
+
+        assert_eq!(
+            last_word(&answer),
+            NTSTATUS_SUCCESS,
+            "the channel is proved"
+        );
+        // The names travel as UTF-16, and each is the one the server was configured with.
+        assert!(
+            occurrences(&answer, "ad.example.com") >= 1,
+            "the DNS name of the domain is in the answer"
+        );
+        assert!(
+            occurrences(&answer, "AD") >= 1,
+            "and its flat name, which is not the server's own"
+        );
+        // The GUID is `v5` over the DNS name: the same domain described by two calls has to give the
+        // same GUID, and a random one passes every other assertion here.
+        let guid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, "ad.example.com".as_bytes());
+        // `write_guid` lays the GUID out the way MS-DTYP does: the first three fields little-endian,
+        // the last eight octets as they are. `Uuid::as_bytes` keeps the first three big-endian, so
+        // comparing against it finds nothing even though the field is right.
+        let (data1, data2, data3, data4) = guid.as_fields();
+        let wire: Vec<u8> = data1
+            .to_le_bytes()
+            .into_iter()
+            .chain(data2.to_le_bytes())
+            .chain(data3.to_le_bytes())
+            .chain(data4.iter().copied())
+            .collect();
+        assert!(
+            answer.windows(16).any(|w| w == wire.as_slice()),
+            "the GUID is derived from the domain name, in the order the wire wants"
+        );
+    }
+
+    /// A level this server does not answer, and a realm with no DNS name, are both refused as
+    /// unsupported rather than described wrongly.
+    #[test]
+    fn a_level_or_a_realm_this_server_cannot_describe_is_refused() {
+        let server = domain_state();
+        let mut channel = crate::server::ChannelState {
+            key: live_key(),
+            seed: octets(LIVE_SEED),
+            client_credential: octets(LIVE_SEED),
+            server_credential: octets(LIVE_SERVER),
+            flags: 0x610f_ffff,
+        };
+
+        for level in [0u32, 2] {
+            // The server steps the chain itself when it reads the call, so what it must remember is
+            // the seed *before* the step — remembering the stepped one makes it compute a credential
+            // one link further on, and the answer is `ACCESS_DENIED` for a call that was right.
+            let before = channel;
+            let (client, _) = advance_credential(&mut channel, LIVE_SEQUENCE);
+            server.remember_channel(
+                "SAMBA",
+                crate::server::ChannelState {
+                    key: before.key,
+                    seed: before.seed,
+                    client_credential: before.client_credential,
+                    server_credential: before.server_credential,
+                    flags: before.flags,
+                },
+            );
+            let mut w = NdrWriter::new();
+            w.string("\\\\samba");
+            w.pointer(true);
+            w.string("SAMBA");
+            w.raw(&client);
+            w.raw(&LIVE_SEQUENCE.to_le_bytes());
+            w.raw(&[0u8; 4]);
+            w.raw(&[0u8; 8]);
+            w.u32(level);
+            let answer =
+                logon_get_domain_info(&server, &w.finish()).expect("an answer, not a fault");
+            assert_eq!(
+                last_word(&answer),
+                NTSTATUS_NOT_SUPPORTED,
+                "level {level} is not one this server describes the domain at"
+            );
+        }
+    }
+
     /// Both calls that report the domain refuse, in the same way, until a channel is proved.
     ///
     /// A member asks for the domain's description and for its trust information before it has proved
