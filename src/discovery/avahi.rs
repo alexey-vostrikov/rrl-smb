@@ -731,6 +731,116 @@ mod tests {
             .expect("it does not panic");
     }
 
+    /// A `NameOwnerChanged` body, as the one place its three strings are read.
+    ///
+    /// The signal is the only notification that avahi-daemon came to the bus or left it, and its body
+    /// is three strings: the name, the old owner and the new one. Reading the wrong one of them is
+    /// invisible — all three are strings, and a bus name in the wrong slot looks like an owner.
+    #[test]
+    fn the_new_owner_is_the_third_name() {
+        let message = |body: &(&str, &str, &str)| {
+            zbus::Message::signal(
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+            )
+            .build(body)
+            .expect("a message")
+        };
+        assert_eq!(
+            new_owner(&message(&("org.freedesktop.Avahi", "", ":1.7"))).as_deref(),
+            Some(":1.7"),
+            "the third string is the owner that arrived"
+        );
+        assert_eq!(
+            new_owner(&message(&("org.freedesktop.Avahi", ":1.7", ""))).as_deref(),
+            Some(""),
+            "and it is empty when the daemon left"
+        );
+        // A body of another shape is not an owner at all: a signal this server did not ask for must
+        // not be read as one, or the registration follows a name nobody owns.
+        let wrong = zbus::Message::signal("/org/freedesktop/DBus", "org.freedesktop.DBus", "X")
+            .build(&("only one string",))
+            .expect("a message");
+        assert_eq!(new_owner(&wrong), None);
+    }
+
+    /// A group to drive step by step, with a connection of its own.
+    async fn group(name: &str) -> Group {
+        let bus = Bus::connect()
+            .await
+            .expect("the stand promised a system bus");
+        Group {
+            conn: bus.conn,
+            service: service(name),
+            interface: IF_UNSPEC,
+            protocol: PROTO_INET,
+            machine: Machine::new(name.to_string()),
+        }
+    }
+
+    /// The rename: the records are withdrawn, Avahi names another, and the new one is registered.
+    ///
+    /// Driven through `apply(Step::Rename)` rather than through `run`, because `run` only reaches
+    /// this when a conflict arrives as a state change — and a stand cannot make one arrive on demand.
+    /// Something measured while trying: a second registration of the same instance name *on this
+    /// daemon* is accepted, so a `CollisionError` at `Commit` needs a conflict with another host on
+    /// the network. Everything from the collision onwards is exercised here; the error itself is not.
+    #[tokio::test]
+    async fn a_rename_withdraws_the_records_and_registers_the_new_name() {
+        if stand_missing() {
+            return;
+        }
+        let mut group = group("Stand Rename").await;
+        group.apply(Step::Register).await;
+        assert!(group.machine.committed, "the first registration holds");
+        let path = group.machine.path.clone();
+
+        group.apply(Step::Rename).await;
+        assert_ne!(
+            group.machine.name, "Stand Rename",
+            "the name it was configured with is not the one it keeps"
+        );
+        assert!(group.machine.committed, "and the new name is registered");
+        assert_eq!(
+            group.machine.path, path,
+            "the entry group is kept across the rename: the records are reset, not the group freed"
+        );
+        // `renames` counts collisions, not renames, and a registration that went through on the first
+        // try leaves it at zero — which is why it is not the measure of this test.
+        assert_eq!(group.machine.renames, 0, "no collision was answered here");
+
+        group.free().await;
+    }
+
+    /// While another registration holds the name, Avahi offers a different one.
+    ///
+    /// This is the call the rename stands on: `GetAlternativeServiceName` is a *reply*, not an error,
+    /// and a server that expected an error here would treat a taken name as a failed registration.
+    #[tokio::test]
+    async fn an_alternative_name_is_offered_when_the_name_is_held() {
+        if stand_missing() {
+            return;
+        }
+        let holder = Bus::connect().await.expect("a first bus");
+        let (tx, rx) = oneshot::channel();
+        let held = tokio::spawn(holder.run(service("Stand Held"), rx));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let group = group("Stand Held").await;
+        let offered = group
+            .alternative_name()
+            .await
+            .expect("GetAlternativeServiceName answers");
+        assert_ne!(
+            offered, "Stand Held",
+            "the name is in use, so another one is offered"
+        );
+
+        let _ = tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(10), held).await;
+    }
+
     /// A name that is already registered is refused, and Avahi is asked for another one.
     ///
     /// The second registration of the same instance name is what Avahi answers with
