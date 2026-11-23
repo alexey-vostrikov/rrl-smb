@@ -296,6 +296,84 @@ mod tests {
         assert!(!answerable("My.NAS"));
     }
 
+    /// A service as the server builds one, for the stand.
+    fn service(name: &str) -> Service {
+        Service {
+            name: name.to_string(),
+            default_name: false,
+            model: Some("stand".to_string()),
+            port: 1445,
+            scope: Scope::V4,
+            host: "stand-host".to_string(),
+            device: None,
+        }
+    }
+
+    /// Announces until told to stop, and returns.
+    async fn announce(service: Service, leave: Leave, after: Duration) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run(service, async move {
+            let _ = rx.await;
+            leave
+        }));
+        tokio::time::sleep(after).await;
+        let _ = tx.send(());
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the responder stops when it is told to")
+            .expect("the responder does not panic");
+    }
+
+    /// The responder against a real socket: it takes the port, announces, and gives the records back.
+    ///
+    /// A stand rather than a unit test, because every statement in `run` is about something outside
+    /// the process — a UDP port it must be able to bind, a multicast socket, interfaces the daemon
+    /// filters. The default gates do not set `RRL_MDNS_STAND`, so they neither bind 5353 nor race the
+    /// host's own responder; the run that measures coverage sets it.
+    #[tokio::test]
+    async fn the_responder_announces_over_sockets_and_withdraws() {
+        if std::env::var_os("RRL_MDNS_STAND").is_none() {
+            return;
+        }
+
+        // A name with a dot cannot be answered for, and the responder says so without touching the
+        // port: the check is before the probe, so a rejected name costs nothing.
+        let held = std::net::UdpSocket::bind(("0.0.0.0", MDNS_PORT)).expect("port 5353 is free");
+        announce(
+            service("St.and"),
+            Leave::Withdraw,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        // The port is taken by something that does not share it: the responder does not announce,
+        // and does not take the port away from whoever has it.
+        announce(
+            service("Stand Files"),
+            Leave::Withdraw,
+            Duration::from_millis(50),
+        )
+        .await;
+        drop(held);
+
+        // For real. Long enough for the probe (under a second) and the first announcement, short
+        // enough that the test is not a wait.
+        announce(
+            service("Stand Files"),
+            Leave::Withdraw,
+            Duration::from_millis(1500),
+        )
+        .await;
+        // The other way of leaving: the records stay registered, so the daemon is disabled instead
+        // of withdrawing them — the path taken when another responder is taking the records over.
+        announce(
+            service("Stand Again"),
+            Leave::HandOver,
+            Duration::from_millis(600),
+        )
+        .await;
+    }
+
     #[test]
     fn service_names_are_recognized_in_any_case() {
         assert!(is_service_name("FILES._smb._tcp.local."));
