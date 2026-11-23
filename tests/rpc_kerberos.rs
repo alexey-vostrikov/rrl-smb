@@ -17,15 +17,18 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::auth::{OID_KRB5, mech_type_list, parse_neg_resp, spnego_init};
-use common::rpc::{NDR, PTYPE_BIND_ACK, PTYPE_RESPONSE, auth_of, bind_pdu, call_id, ptype, request_pdu, with_auth_level};
+use common::rpc::{
+    NDR, PTYPE_BIND_ACK, PTYPE_RESPONSE, auth_of, bind_pdu, call_id, ptype, request_pdu,
+    with_auth_level,
+};
 use smb_server::tcp::{Endpoint, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// `drsuapi` 4.0.
 const DRSUAPI: [u8; 20] = [
-    0x35, 0x42, 0x51, 0xe3, 0x06, 0x4b, 0xd1, 0x11, 0xab, 0x04, 0x00, 0xc0, 0x4f, 0xc2, 0xdc, 0xd2, 4,
-    0, 0, 0,
+    0x35, 0x42, 0x51, 0xe3, 0x06, 0x4b, 0xd1, 0x11, 0xab, 0x04, 0x00, 0xc0, 0x4f, 0xc2, 0xdc, 0xd2,
+    4, 0, 0, 0,
 ];
 
 /// `1.2.840.48018.1.2.2`, Microsoft's own Kerberos OID, which a Windows client lists first.
@@ -110,7 +113,9 @@ fn free_port() -> u16 {
 
 /// A listener that accepts tickets from `keytab`, and a client that reached it.
 async fn started(keytab: &str) -> TcpStream {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("an address");
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port())
+        .parse()
+        .expect("an address");
     let endpoint = Endpoint {
         addr,
         nb_domain: "AD".to_string(),
@@ -232,7 +237,10 @@ async fn a_ticket_is_accepted_and_the_call_after_it_is_sealed() {
     let mut framed = vec![0x02_u8, 0x00];
     framed.extend_from_slice(&ap_rep);
     initiator.step(&gss(&framed)).expect("the AP-REP verifies");
-    assert!(initiator.is_established(), "mutual authentication completed");
+    assert!(
+        initiator.is_established(),
+        "mutual authentication completed"
+    );
 
     // The sealed call. The token's first sixteen octets go in the verifier and the rest where the
     // arguments would be — that split is the transport's, not Kerberos's.
@@ -259,8 +267,7 @@ async fn a_ticket_is_accepted_and_the_call_after_it_is_sealed() {
         "a sealed call is answered, not faulted: {answer:02x?}"
     );
     assert_eq!(call_id(&answer), 2);
-    let (auth_type, level, _, answer_header) =
-        auth_of(&answer).expect("the answer is sealed too");
+    let (auth_type, level, _, answer_header) = auth_of(&answer).expect("the answer is sealed too");
     assert_eq!(
         (auth_type, level),
         (AUTH_GSS, LEVEL_PRIVACY),
@@ -334,7 +341,7 @@ async fn a_ticket_this_keytab_cannot_open_falls_back_to_spnego() {
         .expect("an initiator context");
 
     let blob = spnego_init(
-        &mech_type_list(&[OID_KRB5_MS, &common::OID_NTLMSSP]),
+        &mech_type_list(&[OID_KRB5_MS, common::OID_NTLMSSP]),
         Some(&ap_req),
     );
     let bind = with_auth_level(
@@ -356,7 +363,7 @@ async fn a_ticket_this_keytab_cannot_open_falls_back_to_spnego() {
     );
     assert_eq!(
         resp.mech.as_deref(),
-        Some(&common::OID_NTLMSSP[..]),
+        Some(common::OID_NTLMSSP),
         "and it is told which one"
     );
 }
