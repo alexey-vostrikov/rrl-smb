@@ -21,7 +21,9 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::auth::{OID_KRB5, mech_type_list, ntlm_negotiate, parse_neg_resp, spnego_init, spnego_resp};
+use common::auth::{
+    OID_KRB5, mech_type_list, ntlm_negotiate, parse_neg_resp, spnego_init, spnego_resp,
+};
 use common::rpc::{NDR, PTYPE_BIND_ACK, auth_of, bind_pdu, ptype, with_auth_level};
 use smb_server::tcp::{Endpoint, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,8 +32,8 @@ use tokio::net::TcpStream;
 /// `drsuapi` 4.0. Any interface would do: the bind is refused or accepted on its verifier, before the
 /// context is examined.
 const DRSUAPI: [u8; 20] = [
-    0x35, 0x42, 0x51, 0xe3, 0x06, 0x4b, 0xd1, 0x11, 0xab, 0x04, 0x00, 0xc0, 0x4f, 0xc2, 0xdc, 0xd2, 4,
-    0, 0, 0,
+    0x35, 0x42, 0x51, 0xe3, 0x06, 0x4b, 0xd1, 0x11, 0xab, 0x04, 0x00, 0xc0, 0x4f, 0xc2, 0xdc, 0xd2,
+    4, 0, 0, 0,
 ];
 
 /// `RPC_C_AUTHN_GSS_NEGOTIATE`: the verifier is an SPNEGO token.
@@ -56,7 +58,9 @@ fn free_port() -> u16 {
 
 /// A listener on a fresh port and a client that reached it.
 async fn started() -> TcpStream {
-    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("an address");
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port())
+        .parse()
+        .expect("an address");
     let endpoint = Endpoint {
         addr,
         nb_domain: "AD".to_string(),
@@ -249,8 +253,8 @@ async fn a_negotiate_inside_an_init_token_is_challenged() {
 /// A `NegTokenResp` whose body does not parse is refused.
 #[tokio::test]
 async fn a_response_token_that_does_not_parse_gets_no_verifier() {
-    let token = [0xa1, 0x04, 0xde, 0xad, 0xbe, 0xef];
-    assert!(bind_with(AUTH_GSS, &token.to_vec()).await.is_none());
+    let token: [u8; 6] = [0xa1, 0x04, 0xde, 0xad, 0xbe, 0xef];
+    assert!(bind_with(AUTH_GSS, token.as_ref()).await.is_none());
 }
 
 /// A NEGOTIATE that arrives in a `NegTokenResp` is challenged: this is the second half of the
