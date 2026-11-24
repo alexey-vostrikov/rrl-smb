@@ -433,9 +433,11 @@ pub(crate) mod info_class;
 pub mod ntstatus;
 
 /// `drsuapi` over `ncacn_ip_tcp`: the endpoint a Windows join reaches after asking the mapper.
+#[cfg(feature = "ipc")]
 pub use rpc::tcp;
 mod path;
 mod proto;
+#[cfg(feature = "ipc")]
 mod rpc;
 #[cfg(feature = "s3")]
 mod s3;

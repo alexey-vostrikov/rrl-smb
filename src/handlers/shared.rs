@@ -9,6 +9,7 @@ use tracing::warn;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};
 use crate::files::close_open;
+#[cfg(feature = "ipc")]
 use crate::handlers::pipes;
 use crate::ntstatus;
 
@@ -67,6 +68,9 @@ pub async fn discard_open(tree: &Arc<RwLock<TreeConnect>>, file_id: FileId) {
         drop(tree);
         close_open(&open, false).await;
     } else {
+        // A pipe, on a tree that has them. Without the feature a FileId names nothing at all, and
+        // dropping it is what the caller asked for either way.
+        #[cfg(feature = "ipc")]
         pipes(&tree).remove(&file_id);
     }
 }

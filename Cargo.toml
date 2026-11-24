@@ -112,7 +112,7 @@ mdns-sd = { version = "0.21.6", optional = true }
 zbus = { version = "6.2", default-features = false, features = ["tokio"], optional = true }
 
 [features]
-default = ["localfs"]
+default = ["localfs", "ipc"]
 localfs = ["dep:cap-std", "dep:rustix", "dep:windows-sys"]
 s3 = [
     "dep:hyper",
@@ -130,6 +130,13 @@ s3 = [
 # Kerberos authentication in SESSION_SETUP. Off by default: a server that accepts a keytab has
 # another credential to protect, and most deployments of this crate are anonymous file shares.
 krb5 = ["dep:krb5"]
+# `IPC$`, its named pipes and the DCE/RPC on them: `srvsvc`, `lsarpc`, `samr`, `netlogon`,
+# `drsuapi`, the endpoint mapper, and `ncacn_ip_tcp`.
+#
+# On by default, because that is what this crate has always answered. Off for a server that shares
+# files and nothing else: the pipes are a third of the crate, and a deployment that serves no
+# domain has no client that will ever ask for one.
+ipc = []
 discovery = [
     "dep:mdns-sd",
     "dep:zbus",

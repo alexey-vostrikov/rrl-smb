@@ -20,6 +20,7 @@ use crate::files::{
     end_opens, finish_close,
 };
 use crate::path::SmbPath;
+#[cfg(feature = "ipc")]
 use crate::rpc::pipe::{Pipe, PipeBudget};
 use crate::server::ShareBindings;
 
@@ -113,6 +114,7 @@ pub struct Connection {
     pub(crate) pending: PendingOps,
 
     /// The named pipes open on this connection and the bytes they hold.
+    #[cfg(feature = "ipc")]
     pub(crate) pipe_budget: Arc<PipeBudget>,
 
     /// The change notification watches of this connection's opens and the
@@ -161,6 +163,7 @@ impl Connection {
             peer_addr: None,
             outbound: Arc::default(),
             pending: PendingOps::default(),
+            #[cfg(feature = "ipc")]
             pipe_budget: Arc::default(),
             notify_budget: Arc::default(),
             aapl_read_dir_attr: AtomicBool::new(false),
@@ -356,6 +359,7 @@ async fn detach_session(sess_arc: &Arc<RwLock<Session>>) -> Vec<Arc<RwLock<Open>
 async fn detach_tree(tree_arc: &Arc<RwLock<TreeConnect>>) -> Vec<Arc<RwLock<Open>>> {
     let mut tree = tree_arc.write().await;
     tree.closed = true;
+    #[cfg(feature = "ipc")]
     tree.pipes
         .get_mut()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -438,6 +442,7 @@ pub struct TreeConnect {
     pub opens: RwLock<HashMap<FileId, Arc<RwLock<Open>>>>,
     /// Named pipe opens, on an IPC$ tree. They hold no backend handle and
     /// no place in a file table.
+    #[cfg(feature = "ipc")]
     pub(crate) pipes: Mutex<HashMap<FileId, Arc<Pipe>>>,
     /// Set once the tree is disconnected or revoked. Opens are no longer
     /// added to it.
@@ -455,6 +460,7 @@ impl TreeConnect {
             share,
             granted_access,
             opens: RwLock::new(HashMap::new()),
+            #[cfg(feature = "ipc")]
             pipes: Mutex::default(),
             closed: false,
         }

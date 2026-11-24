@@ -29,6 +29,7 @@ mod lock;
 mod logoff;
 pub(crate) mod negotiate;
 mod oplock_break;
+#[cfg(feature = "ipc")]
 mod pipe;
 mod query_directory;
 mod query_info;
@@ -41,6 +42,7 @@ mod tree_connect;
 mod tree_disconnect;
 mod write;
 
+#[cfg(feature = "ipc")]
 pub(crate) use pipe::pipes;
 
 /// What a handler produced: a response, or a request that completes later.
@@ -69,6 +71,9 @@ pub(crate) async fn dispatch_command(
     encrypted: bool,
     retained: usize,
 ) -> Outcome {
+    // `IPC$` and the pipes on it, before any command's own handler: a request on a pipe is a
+    // request on a pipe whatever its command says.
+    #[cfg(feature = "ipc")]
     if let Some(outcome) = pipe::route(server, conn, hdr, body, retained).await {
         return outcome;
     }

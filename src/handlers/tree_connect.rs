@@ -64,8 +64,10 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
 
-    // IPC$: synthetic share, whose opens are named pipes.
-    let is_ipc = share_name.eq_ignore_ascii_case("IPC$");
+    // IPC$: synthetic share, whose opens are named pipes. Without the `ipc` feature there are no
+    // pipes, so the name falls through to the configured shares and answers BAD_NETWORK_NAME -
+    // which is what a client is told about a share that is not served.
+    let is_ipc = cfg!(feature = "ipc") && share_name.eq_ignore_ascii_case("IPC$");
     let share = if is_ipc {
         crate::server::ShareBindings::ipc()
     } else {

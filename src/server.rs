@@ -193,6 +193,10 @@ impl ShareBindings {
     }
 
     /// Synthetic IPC$ share, whose opens are named pipes.
+    ///
+    /// Only where the pipes are built: a tree connected to a share this build cannot answer on is a
+    /// client that sees the connect succeed and then every call fail.
+    #[cfg(feature = "ipc")]
     pub fn ipc() -> Arc<Self> {
         Self::new(
             "IPC$".to_string(),

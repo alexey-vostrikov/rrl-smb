@@ -282,6 +282,7 @@ pub fn durable_ask(data: &[u8]) {
 }
 
 /// Parses `data` as a DCE/RPC PDU a client sends.
+#[cfg(feature = "ipc")]
 pub fn rpc_pdu(data: &[u8]) {
     let _ = crate::rpc::pdu::parse(data);
 }
@@ -290,6 +291,7 @@ pub fn rpc_pdu(data: &[u8]) {
 /// byte picks, answering every call with a fault and with its stub as
 /// a response. Every PDU sent back parses, a response fits in the size
 /// the bind negotiated, and what the association holds stays bounded.
+#[cfg(feature = "ipc")]
 pub fn rpc_association(data: &[u8]) {
     use crate::rpc::association::{Association, Fault, Step};
     use crate::rpc::pdu::{
@@ -333,6 +335,7 @@ pub fn rpc_association(data: &[u8]) {
 /// Runs `data` as a srvsvc request stub. The first byte picks the
 /// operation: NetrShareEnum, NetrShareGetInfo, NetrServerGetInfo or,
 /// with the second byte, any opnum. The caller sees three shares.
+#[cfg(feature = "ipc")]
 pub fn srvsvc_request(data: &[u8]) {
     use crate::rpc::srvsvc::{self, ListedShare, ShareView};
 
