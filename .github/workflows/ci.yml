@@ -62,6 +62,13 @@ jobs:
       - name: clippy (encryption)
         run: cargo clippy --workspace --all-targets --no-default-features --features encryption -- -D warnings
 
+      # The configuration the embedding daemon builds: `default-features = false, features = ["krb5"]`
+      # plus the pipes, which are off by default in that spelling. Both gates live here - Kerberos was
+      # named without one and broke every build but `--all-features`, and `ipc` is the seam the pipes
+      # were cut along - and neither was checked before this step existed.
+      - name: clippy (krb5, ipc)
+        run: cargo clippy --workspace --all-targets --no-default-features --features krb5,ipc -- -D warnings
+
   test:
     strategy:
       fail-fast: false
@@ -85,6 +92,12 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-features
+
+      # The suite in the build the daemon ships: no file shares to open, no S3, and the pipes the
+      # daemon does answer on. A test gated on a feature the deployment leaves out is a test that
+      # only ever ran in a configuration nobody ships.
+      - name: cargo test (krb5, ipc)
+        run: cargo test --workspace --no-default-features --features krb5,ipc
 
   test-temp-on-share:
     runs-on: windows-latest
