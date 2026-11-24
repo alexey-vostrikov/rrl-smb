@@ -1065,6 +1065,63 @@ fn a_stream_is_set_aside_restored_and_dropped_inside_the_store() {
     );
 }
 
+/// A rename whose replacement cannot be set aside puts nothing out of reach.
+///
+/// `Aside::take` moves the replaced stream aside before the rename runs, and its failure path is
+/// `put_back`: whatever was already taken goes back where it was, so a rename that cannot proceed
+/// leaves the file exactly as it was. This is a rollback path in the strict sense — it runs only
+/// when the filesystem refuses halfway through — so it is reached here by making the store's
+/// directory unwritable, which is the shape of a real failure (a full or read-only filesystem under
+/// `.smb-streams`) rather than a mock.
+///
+/// Two statements, both about data: the rename is refused, and the stream that was to be replaced is
+/// still readable under its own name afterwards. A rollback that returned the error but left the
+/// stream under a side name would pass the first and lose a stream.
+#[tokio::test]
+async fn a_rename_that_cannot_set_aside_its_replacement_puts_back_what_it_took() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    // The target is in the store, so replacing it goes through `set_aside` rather than through a
+    // value held in memory.
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    assert!(
+        spilled(&td, "f.txt", "s").exists(),
+        "the target is in the store"
+    );
+    create(&backend, "g.txt", "s", b"the source").await;
+
+    let entry_dir = entry(&td, "f.txt");
+    let original = std::fs::metadata(&entry_dir).unwrap().permissions();
+    std::fs::set_permissions(&entry_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let refused = backend
+        .rename_stream(
+            &p("g.txt"),
+            id(&td, "g.txt"),
+            Some(&name("s")),
+            Some(&name("s")),
+            true,
+        )
+        .await;
+
+    // Restore the permissions before asserting, so a failing assertion does not leave a directory
+    // the rest of the suite cannot clean up.
+    std::fs::set_permissions(&entry_dir, original).unwrap();
+
+    assert!(
+        refused.is_err(),
+        "a store that cannot be written to must refuse the rename: {refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(spilled(&td, "f.txt", "s")).unwrap().len(),
+        70_000,
+        "the stream that was to be replaced is still there, and whole"
+    );
+}
+
 /// Gives `to` the record of `from`, as a host copy with extended
 /// attributes does.
 fn copy_record(td: &TempDir, from: &str, to: &str) {
