@@ -54,6 +54,7 @@ pub struct Share {
     pub(crate) change_notify: bool,
     pub(crate) named_streams: bool,
     pub(crate) extended_attributes: bool,
+    pub(crate) server_side_copy: bool,
     pub(crate) listed: bool,
     pub(crate) remark: String,
 }
@@ -72,6 +73,7 @@ impl Share {
             change_notify: true,
             named_streams: true,
             extended_attributes: true,
+            server_side_copy: true,
             listed: true,
             remark: String::new(),
         }
@@ -214,6 +216,24 @@ impl Share {
         self
     }
 
+    /// Copy file data on the server when a client asks for it. Windows
+    /// Explorer, Linux `cp` and the macOS Finder send such a request for a
+    /// copy within a share; Windows and Linux also for a copy between two
+    /// shares of one session, which needs this on both. When off, the
+    /// requests fail with STATUS_NOT_SUPPORTED, a macOS whole-file copy of a
+    /// file fails with STATUS_ACCESS_DENIED, and a request on a named stream
+    /// fails with STATUS_INVALID_DEVICE_REQUEST; clients then read and write
+    /// the data themselves. The requests to clone a range of a file that a
+    /// backend with [`BackendCapabilities::block_cloning`] serves fail with
+    /// STATUS_INVALID_DEVICE_REQUEST too, and the share does not report
+    /// FILE_SUPPORTS_BLOCK_REFCOUNTING. On by default.
+    ///
+    /// [`BackendCapabilities::block_cloning`]: crate::BackendCapabilities::block_cloning
+    pub fn server_side_copy(mut self, enabled: bool) -> Self {
+        self.server_side_copy = enabled;
+        self
+    }
+
     /// Whether the share appears when clients list the server's shares.
     /// An unlisted share is still reachable by name, and a client that may
     /// connect to it can still look it up by name, so this is not access
@@ -353,6 +373,7 @@ pub struct SmbServerBuilder {
     share_listing: bool,
     apple_extensions: bool,
     apple_model: String,
+    apple_copyfile: bool,
     #[cfg(feature = "discovery")]
     discovery: Option<crate::discovery::Discovery>,
     /// Keytab bytes, when Kerberos is configured.
@@ -416,6 +437,7 @@ impl SmbServerBuilder {
             keytab: None,
             apple_extensions: true,
             apple_model: DEFAULT_APPLE_MODEL.to_string(),
+            apple_copyfile: true,
             #[cfg(feature = "discovery")]
             discovery: None,
         }
@@ -746,6 +768,18 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Offers macOS clients the whole-file copy: a COPYCHUNK or
+    /// COPYCHUNK_WRITE without chunks copies a file with its named streams
+    /// and its creation and write times in one request. Offered on shares
+    /// that serve named streams and allow server-side copies, while
+    /// [`apple_extensions`](Self::apple_extensions) is on. A connection
+    /// keeps the offer for every share, and a copy onto a share without
+    /// named streams carries the data only. On by default.
+    pub fn apple_copyfile(mut self, enabled: bool) -> Self {
+        self.apple_copyfile = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -877,6 +911,7 @@ impl SmbServerBuilder {
             limits: self.limits,
             share_listing: self.share_listing,
             apple_model: self.apple_extensions.then_some(self.apple_model),
+            apple_copyfile: self.apple_copyfile,
             #[cfg(feature = "discovery")]
             discovery,
         };

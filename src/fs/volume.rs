@@ -2,13 +2,11 @@
 //! space, serial number and the case rule of name lookups.
 
 use std::io;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 
-use cap_std::fs::Dir;
-
+use super::dir::Dir;
 use crate::backend::VolumeInfo;
-
-/// Longest name `SmbPath` accepts, in UTF-16 code units.
-const MAX_NAME_LENGTH: u32 = 255;
 
 /// Size and identity of the volume holding `dir`. `root_dev` is the host
 /// device of `dir`, used for the serial number where the host reports no
@@ -16,103 +14,46 @@ const MAX_NAME_LENGTH: u32 = 255;
 #[cfg(unix)]
 pub(super) fn volume_info(dir: &Dir, root_dev: Option<u64>) -> io::Result<VolumeInfo> {
     let st = rustix::fs::fstatvfs(dir)?;
-    // f_blocks, f_bfree and f_bavail count f_frsize units.
-    let unit = [st.f_frsize, st.f_bsize]
-        .into_iter()
-        .find(|&u| u > 0)
-        .unwrap_or(512);
     let id = if st.f_fsid != 0 {
         st.f_fsid
     } else {
         root_dev.unwrap_or(0)
     };
-    let max_name_length = u32::try_from(st.f_namemax)
-        .ok()
-        .filter(|&n| n > 0)
-        .map_or(MAX_NAME_LENGTH, |n| n.min(MAX_NAME_LENGTH));
-    Ok(VolumeInfo {
-        total_allocation_units: st.f_blocks,
-        caller_available_allocation_units: st.f_bavail,
-        actual_available_allocation_units: st.f_bfree,
-        sectors_per_allocation_unit: 1,
-        bytes_per_sector: u32::try_from(unit).unwrap_or(u32::MAX),
-        serial_number: (id ^ (id >> 32)) as u32,
-        label: None,
-        max_name_length,
-    })
+    Ok(crate::host::volume_info(&st, id))
 }
 
 /// Size and identity of the volume holding `dir`.
 #[cfg(windows)]
 pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<VolumeInfo> {
-    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FileFsFullSizeInformation, NtQueryVolumeInformationFile,
-    };
+    crate::host::volume_info_of(dir)
+}
+
+/// The file system flags and name of the volume `file` is open on.
+#[cfg(windows)]
+pub(super) fn volume_of(file: &impl AsHandle) -> Option<(u32, String)> {
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    /// FILE_FS_FULL_SIZE_INFORMATION (MS-FSCC 2.5.4).
-    #[repr(C)]
-    #[derive(Default)]
-    struct FullSize {
-        total: i64,
-        caller_available: i64,
-        actual_available: i64,
-        sectors_per_unit: u32,
-        bytes_per_sector: u32,
-    }
-
-    let handle = dir.as_handle().as_raw_handle();
-    let mut serial = 0u32;
-    let mut max_component = 0u32;
-    // SAFETY: `handle` stays open while `dir` is borrowed, and every non-null
-    // pointer refers to a live local.
+    let handle = file.as_handle().as_raw_handle();
+    let mut flags = 0u32;
+    let mut name = [0u16; 64];
+    // SAFETY: `handle` stays open while `file` is borrowed, `flags` is a live
+    // local and `name` a live buffer of the length passed; the other buffers
+    // are null with size 0.
     let ok = unsafe {
         GetVolumeInformationByHandleW(
             handle,
             std::ptr::null_mut(),
             0,
-            &mut serial,
-            &mut max_component,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            &mut flags,
+            name.as_mut_ptr(),
+            name.len() as u32,
         )
     };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut size = FullSize::default();
-    // SAFETY: IO_STATUS_BLOCK is plain data, valid when zeroed.
-    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    // SAFETY: as above; `size` matches the layout of the requested class.
-    let status = unsafe {
-        NtQueryVolumeInformationFile(
-            handle,
-            &mut iosb,
-            (&raw mut size).cast(),
-            size_of::<FullSize>() as u32,
-            FileFsFullSizeInformation,
-        )
-    };
-    if status < 0 {
-        return Err(io::Error::other(format!(
-            "NtQueryVolumeInformationFile failed with {status:#010x}"
-        )));
-    }
-
-    Ok(VolumeInfo {
-        total_allocation_units: u64::try_from(size.total).unwrap_or(0),
-        caller_available_allocation_units: u64::try_from(size.caller_available).unwrap_or(0),
-        actual_available_allocation_units: u64::try_from(size.actual_available).unwrap_or(0),
-        sectors_per_allocation_unit: size.sectors_per_unit,
-        bytes_per_sector: size.bytes_per_sector,
-        serial_number: serial,
-        label: None,
-        max_name_length: max_component.clamp(1, MAX_NAME_LENGTH),
-    })
+    let len = name.iter().position(|&u| u == 0).unwrap_or(name.len());
+    (ok != 0).then(|| (flags, String::from_utf16_lossy(&name[..len])))
 }
 
 /// Whether names in `dir` are looked up case-sensitively. On Linux, FAT

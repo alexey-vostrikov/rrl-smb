@@ -20,6 +20,7 @@ use crate::server::ServerState;
 mod aapl;
 mod change_notify;
 mod close;
+mod copy;
 pub(crate) mod create;
 mod echo;
 mod flush;
@@ -77,6 +78,7 @@ pub(crate) async fn dispatch_command(
         Command::ChangeNotify => {
             return change_notify::handle(server, conn, hdr, body, retained).await;
         }
+        Command::Ioctl => return ioctl::handle(server, conn, hdr, body, retained).await,
         Command::Negotiate => negotiate::handle(server, conn, hdr, body).await,
         Command::SessionSetup => session_setup::handle(server, conn, hdr, body).await,
         Command::Logoff => logoff::handle(server, conn, hdr, body).await,
@@ -87,7 +89,6 @@ pub(crate) async fn dispatch_command(
         Command::Read => read::handle(server, conn, hdr, body).await,
         Command::Write => write::handle(server, conn, hdr, body).await,
         Command::Lock => lock::handle(server, conn, hdr, body).await,
-        Command::Ioctl => ioctl::handle(server, conn, hdr, body).await,
         Command::Echo => echo::handle(server, conn, hdr, body).await,
         Command::QueryDirectory => query_directory::handle(server, conn, hdr, body).await,
         Command::QueryInfo => query_info::handle(server, conn, hdr, body).await,

@@ -271,6 +271,15 @@ pub struct BackendCapabilities {
     /// [`Share::extended_attributes`](crate::Share::extended_attributes)
     /// describes for a share that turns them off.
     pub extended_attributes: bool,
+    /// The backend can make a range of one file share its storage with a
+    /// range of another file on the same volume, served by
+    /// [`ShareBackend::clone_range`]. On a share that leaves
+    /// [`Share::server_side_copy`](crate::Share::server_side_copy) on,
+    /// FileFsAttributeInformation then reports
+    /// FILE_SUPPORTS_BLOCK_REFCOUNTING and FSCTL_DUPLICATE_EXTENTS_TO_FILE
+    /// reaches the backend. Without it, that FSCTL fails with
+    /// STATUS_INVALID_DEVICE_REQUEST.
+    pub block_cloning: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +299,8 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// `path` is missing and [`SmbError::NotFound`] when only the last
     /// component is.
     ///
+    /// A new entry is stored under the spelling of the last name of `path`.
+    ///
     /// A backend that reports [`BackendCapabilities::named_streams`] keeps
     /// the named streams of a file that [`OpenIntent::Truncate`] or
     /// [`OpenIntent::OverwriteOrCreate`] overwrites: the protocol layer
@@ -307,11 +318,15 @@ pub trait ShareBackend: Send + Sync + 'static {
 
     /// Rename `from` to `to`.
     ///
-    /// If `to` names an existing file other than `from`, including another
-    /// hard link to the same file, fail with [`SmbError::Exists`] unless
-    /// `replace_if_exists` is set, in which case the existing file is
-    /// replaced. An existing directory at `to` is never
-    /// replaced: fail with [`SmbError::AccessDenied`].
+    /// If `to` names an existing file or directory other than `from`,
+    /// including another hard link to the same file, fail with
+    /// [`SmbError::Exists`] unless `replace_if_exists` is set. With it set,
+    /// an existing file is replaced; an existing directory is never
+    /// replaced: fail with [`SmbError::AccessDenied`] (MS-FSA 2.1.5.15.12).
+    ///
+    /// A rename gives the entry the spelling of `to`, also when only the
+    /// case changes. A rename that replaces an entry spelled differently,
+    /// or that names its own path, may keep the stored spelling.
     async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
 
     /// Static capabilities. TREE_CONNECT clamps access to read-only when
@@ -418,6 +433,78 @@ pub trait ShareBackend: Send + Sync + 'static {
         _from: Option<&StreamName>,
         _to: Option<&StreamName>,
         _replace_if_exists: bool,
+    ) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Copies `len` bytes from `src_offset` of `src` to `dst_offset` of
+    /// `dst` inside the storage, for a client's server-side copy, and
+    /// returns the number copied. `dst` is a handle this backend gave. `src`
+    /// may be a handle of another backend or share, or of the same file as
+    /// `dst`. A copy past the end of `dst` leaves a gap that reads as
+    /// zeros, as [`Handle::write`] does.
+    ///
+    /// The ranges can overlap when `src` and `dst` are one file; the server
+    /// cannot tell for two shares over one directory, or for hard links on a
+    /// backend without file ids. Copy such a range in full as a buffered
+    /// copy would, fail with an error, or return [`SmbError::NotSupported`]
+    /// to have the server copy it; never return a short count for it.
+    ///
+    /// Return [`SmbError::NotSupported`] or [`SmbError::NotSameDevice`] when
+    /// the backend has no faster way to copy between these two handles than
+    /// reading one and writing the other, such as when [`Handle::as_any`] of
+    /// either is `None`, as this crate's named-stream handles do. The
+    /// server then reads `src` and writes `dst` with [`Handle::read`] and
+    /// [`Handle::write`], and does the same for what is left when this
+    /// returns fewer than `len` bytes. Outside an overlapping copy, a
+    /// backend that copied some bytes and then fails returns the number
+    /// copied, and an error only when it copied nothing. Byte-range locks,
+    /// leases and change reports are the server's. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn copy_range(
+        &self,
+        _src: &dyn Handle,
+        _src_offset: u64,
+        _dst: &dyn Handle,
+        _dst_offset: u64,
+        _len: u64,
+    ) -> SmbResult<u64> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Makes the `len` bytes at `dst_offset` of `dst` share their storage
+    /// with the `len` bytes at `src_offset` of `src`, for a client's
+    /// duplicate extents request: the bytes read the same, and a later write
+    /// to either file leaves the other as it is. `dst` is a handle this
+    /// backend gave. `src` may be a handle of another backend or share.
+    ///
+    /// Called only when [`BackendCapabilities::block_cloning`] is set, with a
+    /// `len` other than 0. The server has checked that `src` and `dst` are
+    /// files open with the access a clone needs, that both offsets are
+    /// multiples of the allocation unit [`ShareBackend::volume_info`]
+    /// reports, that `len` is a multiple of it too or the range of `src`
+    /// ends at the end of `src` and the range of `dst` at the end of `dst`,
+    /// that each range lies inside its file, and that no byte-range lock of
+    /// another open covers either range. Byte-range locks, leases and change
+    /// reports are the server's.
+    ///
+    /// Return [`SmbError::NotSameDevice`] when `src` is on another volume
+    /// than `dst`, which includes a handle of another backend,
+    /// [`SmbError::NotSupported`] when the storage cannot share blocks
+    /// between these two files, and [`SmbError::InvalidParameter`] for ranges
+    /// it refuses, such as overlapping ranges of one file. Clients see
+    /// STATUS_INVALID_PARAMETER for the first and the last, and
+    /// STATUS_INVALID_DEVICE_REQUEST for `NotSupported`. These three leave
+    /// `dst` as it was. A clone that fails with another error may have
+    /// changed part of the range. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn clone_range(
+        &self,
+        _src: &dyn Handle,
+        _src_offset: u64,
+        _dst: &dyn Handle,
+        _dst_offset: u64,
+        _len: u64,
     ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
@@ -608,6 +695,14 @@ pub trait Handle: Send + Sync {
     async fn set_eas(&self, _eas: &[Ea]) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
+
+    /// This handle as [`Any`](std::any::Any), for [`ShareBackend::copy_range`]
+    /// to tell the handles its backend gave from others. A handle that wraps
+    /// another and changes what it does must not forward it. The default
+    /// returns `None`.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
 }
 
 /// What a backend saw happen to an entry of a watched directory.
@@ -699,6 +794,7 @@ impl ShareBackend for NotSupportedBackend {
             case_sensitive: false,
             named_streams: false,
             extended_attributes: false,
+            block_cloning: false,
         }
     }
 }
@@ -734,6 +830,13 @@ pub struct VolumeInfo {
     pub label: Option<String>,
     /// Longest file name the volume stores, in characters.
     pub max_name_length: u32,
+}
+
+impl VolumeInfo {
+    /// Bytes in one allocation unit, at least 1.
+    pub(crate) fn allocation_unit(&self) -> u64 {
+        (u64::from(self.sectors_per_allocation_unit) * u64::from(self.bytes_per_sector)).max(1)
+    }
 }
 
 impl Default for VolumeInfo {

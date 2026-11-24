@@ -48,8 +48,8 @@ const TAG_CTX_3: u8 = 0xa3;
 
 // --- OIDs ------------------------------------------------------------------
 
-/// SPNEGO `1.3.6.1.5.5.2` encoded as the *content* of an OBJECT IDENTIFIER
-/// (i.e. **without** the leading 0x06 tag + length).
+/// SPNEGO `1.3.6.1.5.5.2` encoded as the content of an OBJECT IDENTIFIER
+/// (i.e. without the leading 0x06 tag + length).
 pub const OID_SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
 /// Kerberos v5 `1.2.840.113554.1.2.2` encoded as the *content* of an OBJECT IDENTIFIER.
@@ -232,7 +232,7 @@ pub struct NegTokenResp {
     pub mech_list_mic: Option<Vec<u8>>,
 }
 
-/// Decode the **initial** SPNEGO blob from the client. This is wrapped in
+/// Decode the initial SPNEGO blob from the client. This is wrapped in
 /// the GSS-API outer `[APPLICATION 0]` tag, contains a `thisMech` OID
 /// (SPNEGO), and a `[0] NegTokenInit`.
 ///
@@ -354,7 +354,7 @@ pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
     Ok(out)
 }
 
-/// Encode the **initial** server response to NEGOTIATE - a GSS-API-wrapped
+/// Encode the initial server response to NEGOTIATE - a GSS-API-wrapped
 /// `NegTokenInit` advertising NTLMSSP only. Used during SMB2 NEGOTIATE
 /// when the server publishes its security blob.
 pub fn encode_init_response() -> Vec<u8> {

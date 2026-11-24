@@ -55,9 +55,7 @@ pub fn lease_context(data: &[u8]) {
 pub fn create_name(data: &[u8]) {
     use crate::stream::{StreamPart, StreamType, parse_create_name, parse_stream_target};
     let units: Vec<u16> = data
-        .as_chunks::<2>()
-        .0
-        .iter()
+        .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     if let Ok(target) = parse_stream_target(&units) {
@@ -166,6 +164,64 @@ pub fn aapl_context(data: &[u8]) {
     assert_eq!(reply.len(), at);
 }
 
+/// Parses `data` as the input of a copy request and checks the limits and
+/// the fields read. Reads the first 24 bytes as a resume key and checks
+/// that it maps to the FileId it holds, and to nothing under another tag.
+/// Parses `data` as the input of a duplicate extents request too, and
+/// checks the fields read and the end of the source range.
+pub fn copychunk(data: &[u8]) {
+    use crate::proto::messages::copychunk::{
+        CopychunkRequest, MAX_CHUNK_LEN, MAX_CHUNKS, MAX_COPY_LEN, resume_key, resume_key_file_id,
+    };
+    use crate::proto::messages::duplicate_extents::DuplicateExtentsRequest;
+    match CopychunkRequest::parse(data) {
+        Ok(request) => {
+            assert_eq!(request.source_key, data[..24]);
+            assert_eq!(
+                request.chunks.len() as u32,
+                u32::from_le_bytes(data[24..28].try_into().expect("4 bytes"))
+            );
+            assert!(request.chunks.len() <= MAX_CHUNKS as usize);
+            let mut total = 0u64;
+            for (chunk, raw) in request.chunks.iter().zip(data[32..].chunks_exact(24)) {
+                assert_eq!(chunk.source_offset.to_le_bytes(), raw[..8]);
+                assert_eq!(chunk.target_offset.to_le_bytes(), raw[8..16]);
+                assert_eq!(chunk.length.to_le_bytes(), raw[16..20]);
+                assert!((1..=MAX_CHUNK_LEN).contains(&chunk.length));
+                assert!(chunk.target_offset <= i64::MAX as u64 || chunk.target_offset == u64::MAX);
+                total += u64::from(chunk.length);
+            }
+            assert!(total <= u64::from(MAX_COPY_LEN));
+        }
+        Err(over) => match over.source_key {
+            Some(key) => {
+                assert!(data.len() >= 32);
+                assert_eq!(key, data[..24]);
+            }
+            None => assert!(data.len() < 32),
+        },
+    }
+    if let Some(key) = data.first_chunk::<24>() {
+        let tag: [u8; 8] = key[16..].try_into().expect("8 bytes");
+        let id = resume_key_file_id(key, &tag).expect("a key ends in its tag");
+        assert_eq!(resume_key(id, &tag), *key);
+        assert_eq!(resume_key_file_id(key, &tag.map(|b| !b)), None);
+    }
+    match DuplicateExtentsRequest::parse(data) {
+        Some(request) => {
+            assert!(data.len() >= 40);
+            assert_eq!(request.source.persistent.to_le_bytes(), data[..8]);
+            assert_eq!(request.source.volatile.to_le_bytes(), data[8..16]);
+            assert_eq!(request.source_offset.to_le_bytes(), data[16..24]);
+            assert_eq!(request.target_offset.to_le_bytes(), data[24..32]);
+            assert_eq!(request.byte_count.to_le_bytes(), data[32..40]);
+            let end = u128::from(request.source_offset) + u128::from(request.byte_count);
+            assert_eq!(request.source_end(), u64::try_from(end).ok());
+        }
+        None => assert!(data.len() < 40),
+    }
+}
+
 /// Parses `data` as a FILE_FULL_EA_INFORMATION list and as a
 /// FILE_GET_EA_INFORMATION list. Every attribute read has a valid name
 /// and reads back the same from the list it encodes to; every name read
@@ -247,7 +303,7 @@ pub fn rpc_association(data: &[u8]) {
     let mut assoc = Association::default();
     let mut max_frag = MAX_FRAG;
     for mut piece in data.chunks(chunk) {
-        while let Some(step) = assoc.next_step(&mut piece, &|_| None) {
+        while let Some(step) = assoc.next_step(&mut piece) {
             let sent = match step {
                 Step::Send(pdu) => vec![pdu],
                 Step::Call(call) => {
@@ -323,6 +379,14 @@ pub fn wsd_datagram(data: &[u8]) {
 #[cfg(all(feature = "discovery", unix))]
 pub fn wsd_http(data: &[u8]) {
     crate::discovery::wsd::fuzz_http(data);
+}
+
+/// Parses `data` as stored data of an encrypted share under a fixed key.
+/// The first byte picks the parser (marker, file header, short name, long
+/// name, sizes or block) and the rest is its input.
+#[cfg(feature = "encryption")]
+pub fn encrypted_input(data: &[u8]) {
+    crate::encrypted::fuzz_input::run(data);
 }
 
 /// Dispatches one frame payload on a fresh connection to `server`.

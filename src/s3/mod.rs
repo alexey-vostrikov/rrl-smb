@@ -1,0 +1,44 @@
+//! S3 storage backend.
+
+mod backend;
+mod builder;
+mod cache;
+pub(crate) mod cachedir;
+mod change;
+pub(crate) mod client;
+mod data;
+pub(crate) mod date;
+mod dirmove;
+pub(crate) mod encode;
+mod entry;
+pub(crate) mod error;
+mod handle;
+mod job;
+mod jobs;
+mod keys;
+mod list;
+mod lookup;
+mod merge;
+mod meta;
+pub(crate) mod object;
+mod open;
+mod outcome;
+mod overlay;
+mod parts;
+pub(crate) mod payload;
+mod queue;
+mod ranges;
+mod read;
+mod readahead;
+pub(crate) mod record;
+mod rename;
+pub(crate) mod retry;
+pub(crate) mod sigv4;
+mod tombs;
+pub(crate) mod transport;
+mod unlink;
+pub(crate) mod xml;
+
+pub use backend::S3Backend;
+pub use builder::S3BackendBuilder;
+pub use error::S3Error;

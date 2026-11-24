@@ -24,6 +24,8 @@ use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
 use crate::files::{DurableTable, close_opens};
+use crate::proto::messages::copychunk::RESUME_TAG_LEN;
+use crate::utils::fill_random;
 
 // ---------------------------------------------------------------------------
 // ShareMode / ShareBindings
@@ -123,6 +125,11 @@ pub struct ShareBindings {
     /// Extended attributes are served: the share allows them and the
     /// backend stores them.
     pub(crate) extended_attributes: bool,
+    /// Clients may ask the server to copy file data on the share.
+    pub(crate) server_side_copy: bool,
+    /// Clients may ask the server to clone ranges of files on the share:
+    /// server-side copy is on and the backend clones ranges.
+    pub(crate) block_cloning: bool,
     /// The directories clients watch for changes, on any connection.
     pub(crate) watches: crate::files::WatchTable,
 }
@@ -153,6 +160,8 @@ impl ShareBindings {
             change_notify: !is_ipc,
             named_streams: !is_ipc && capabilities.named_streams,
             extended_attributes: !is_ipc && capabilities.extended_attributes,
+            server_side_copy: !is_ipc,
+            block_cloning: !is_ipc && capabilities.block_cloning,
             watches,
         })
     }
@@ -177,6 +186,8 @@ impl ShareBindings {
             change_notify: share.change_notify,
             named_streams: share.named_streams && capabilities.named_streams,
             extended_attributes: share.extended_attributes && capabilities.extended_attributes,
+            server_side_copy: share.server_side_copy,
+            block_cloning: share.server_side_copy && capabilities.block_cloning,
             watches,
         })
     }
@@ -415,6 +426,8 @@ pub struct ServerConfig {
     /// The model string of `AAPL` replies; `None` when the server ignores
     /// the `AAPL` create context.
     pub(crate) apple_model: Option<String>,
+    /// `AAPL` replies offer OSX_COPYFILE.
+    pub(crate) apple_copyfile: bool,
     /// The server is announced on the local network while it serves.
     #[cfg(feature = "discovery")]
     pub(crate) discovery: Option<crate::discovery::Settings>,
@@ -447,6 +460,7 @@ impl ServerConfig {
             dc_address: None,
             share_listing: true,
             apple_model: None,
+            apple_copyfile: true,
             #[cfg(feature = "discovery")]
             discovery: None,
         }
@@ -620,6 +634,8 @@ pub struct ServerState {
     /// the name from the handle's own bytes, would put the name on the wire inside a field the
     /// client is free to invent.
     pub(crate) samr_users: std::sync::RwLock<std::collections::HashMap<[u8; 20], String>>,
+    /// The last 8 bytes of every resume key this server hands out.
+    pub(crate) resume_tag: [u8; RESUME_TAG_LEN],
 }
 
 impl ServerState {
@@ -721,6 +737,8 @@ impl ServerState {
             config.limits.durable_handle_timeout,
             config.limits.max_disconnected_opens,
         ));
+        let mut resume_tag = [0; RESUME_TAG_LEN];
+        fill_random(&mut resume_tag).expect("the OS random number generator works");
         Self {
             config,
             users,
@@ -741,6 +759,7 @@ impl ServerState {
             ),
             leases: Arc::default(),
             durable,
+            resume_tag,
         }
     }
 

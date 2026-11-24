@@ -54,6 +54,9 @@ SmbServer::builder()
 //! SET_INFO on that open until the open is closed. `LocalFsBackend`
 //! (feature `localfs`) is the reference implementation; its documentation
 //! says where it keeps named streams and extended attributes on each host.
+//! `S3Backend` (feature `s3`) serves a bucket of an S3-compatible store.
+//! `EncryptedBackend` (feature `encryption`) wraps another backend and stores
+//! file contents, and by default names, encrypted under a key.
 //!
 //! What the protocol layer does around the backend calls:
 //!
@@ -102,7 +105,10 @@ SmbServer::builder()
 //!   [`FileInfo::unix_mode`], and, on shares with named streams, the
 //!   Finder info of each entry's `AFP_AfpInfo` stream and the size of its
 //!   `AFP_Resource` stream, read through one [`Handle::peek_streams`] call
-//!   per response.
+//!   per response. A client that asks for the server caps on a share that
+//!   serves named streams and allows server-side copies is offered
+//!   OSX_COPYFILE for its connection, unless
+//!   [`SmbServerBuilder::apple_copyfile`] turns it off.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
@@ -374,6 +380,36 @@ SmbServer::builder()
 //! [`FileInfo::new`], [`DirChange::new`] and the `Default` impls, and
 //! matches `OpenIntent` and `DirChangeKind` with a wildcard arm keeps
 //! compiling.
+//!
+//! # Server-side copy
+//!
+//! COPYCHUNK and COPYCHUNK_WRITE copy ranges between two open files, within
+//! a share or between two shares of one session, and either side may be a
+//! named stream. A request holds at most 256 chunks of up to 1 MiB, 16 MiB
+//! in all. On a connection that was offered OSX_COPYFILE through the `AAPL`
+//! context, a COPYCHUNK or COPYCHUNK_WRITE without chunks between the
+//! default streams of two files copies the whole source in one request: it
+//! truncates the target with [`Handle::truncate`], copies the data in pieces
+//! of 1 MiB the way it copies chunks, copies the named streams where both
+//! shares serve them, and passes the creation and last write times to
+//! [`Handle::set_times`]. FSCTL_DUPLICATE_EXTENTS_TO_FILE makes a range of
+//! one file share its storage with a range of another on shares whose
+//! backend reports [`BackendCapabilities::block_cloning`]; those shares
+//! report FILE_SUPPORTS_BLOCK_REFCOUNTING and accept FSCTL_SET_SPARSE.
+//!
+//! The server passes each chunk to [`ShareBackend::copy_range`], except a
+//! chunk whose source and target ranges overlap in one file, which it reads
+//! and writes itself. When the backend does not implement `copy_range`,
+//! returns [`SmbError::NotSupported`] or [`SmbError::NotSameDevice`], or
+//! copies fewer bytes than asked, the server reads the rest with
+//! [`Handle::read`] and writes it with [`Handle::write`]. [`Handle::as_any`]
+//! lets `copy_range` tell the handles of its backend from others.
+//! [`ShareBackend::clone_range`] serves duplicate extents on a backend that
+//! reports `block_cloning`. Byte-range locks, leases and change
+//! notifications stay with the server.
+//!
+//! [`Share::server_side_copy`] turns these requests off for a share, cloning
+//! included, and a copy between two shares needs both to serve them.
 
 mod access_mask;
 mod auth_policy;
@@ -384,11 +420,15 @@ pub(crate) mod conn;
 mod discovery;
 mod dispatch;
 mod ea;
+#[cfg(feature = "encryption")]
+mod encrypted;
 mod error;
 mod files;
 #[cfg(feature = "localfs")]
 mod fs;
 mod handlers;
+#[cfg(any(feature = "localfs", feature = "s3"))]
+mod host;
 pub(crate) mod info_class;
 pub mod ntstatus;
 
@@ -397,23 +437,44 @@ pub use rpc::tcp;
 mod path;
 mod proto;
 mod rpc;
+#[cfg(feature = "s3")]
+mod s3;
 mod server;
 mod stream;
 #[cfg(test)]
 mod tests {
     mod aapl;
     mod async_requests;
+    mod contract;
+    mod copy;
+    pub(crate) mod data;
     #[cfg(feature = "discovery")]
     mod discovery;
     mod durable;
     mod dynamic_config;
     mod eas;
+    pub(crate) mod faulty;
+    pub(crate) mod file_ids;
+    #[cfg(all(target_os = "linux", feature = "localfs"))]
+    pub(crate) mod filesystems;
+    pub(crate) mod folding;
+    pub(crate) mod gated;
+    #[cfg(any(
+        feature = "s3",
+        feature = "encryption",
+        all(windows, feature = "localfs")
+    ))]
+    pub(crate) mod logs;
     pub(crate) mod memfs;
     mod notify;
     pub(crate) mod peer;
     mod pipes;
+    pub(crate) mod recorder;
+    #[cfg(feature = "s3")]
+    mod s3;
     mod stream_leases;
     mod streams;
+    pub(crate) mod util;
 }
 mod utils;
 mod wildcard;
@@ -427,6 +488,8 @@ pub use bytes::Bytes;
 #[cfg(feature = "discovery")]
 pub use discovery::Discovery;
 pub use ea::Ea;
+#[cfg(feature = "encryption")]
+pub use encrypted::{EncryptedBackend, EncryptedBackendBuilder, EncryptionError};
 pub use error::{SmbError, SmbResult};
 pub use files::{
     DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,
@@ -439,6 +502,8 @@ pub use proto::auth::ntlm::{AuthOutcome, Identity, NtlmServer, NtlmTargetInfo, U
 // The SPNEGO codec, for a protocol that negotiates the same mechanism outside SMB: the framing of a
 // `NegTokenResp` is not SMB's and a second encoder would be a second place to be wrong about DER.
 pub use proto::auth::spnego::{NegState, encode_resp_token};
+#[cfg(feature = "s3")]
+pub use s3::{S3Backend, S3BackendBuilder, S3Error};
 pub use server::{
     ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachineAccounts,
     MachinePasswords, MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
@@ -452,7 +517,6 @@ pub mod wire {
 
 /// Entry points for the cargo-fuzz targets in `fuzz/`. Built only with
 /// `--cfg fuzzing`, which `cargo fuzz` sets.
-/// Parsers the crate exposes to `cargo fuzz`, reached through `--cfg fuzzing`.
 ///
 /// In its own file: nothing here is compiled into a normal build, so it belongs beside the crate's
 /// other modules rather than in its root.

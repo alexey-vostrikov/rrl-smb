@@ -173,7 +173,7 @@ fn gmac_nonce(msg: &[u8]) -> [u8; 12] {
 /// Compute and embed a signature in `msg`. Mutates `msg` in place.
 ///
 /// The caller is responsible for setting the SMB2 SIGNED flag (`0x00000008`)
-/// on the header *before* calling - it is part of the bytes that get MAC'd.
+/// on the header before calling - it is part of the bytes that get MAC'd.
 ///
 /// Errors if `msg` is too short to contain an SMB2 header (< 64 bytes).
 pub fn sign(msg: &mut [u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()> {
@@ -189,7 +189,7 @@ pub fn sign(msg: &mut [u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()
     Ok(())
 }
 
-/// Verify the signature in `msg`. Does **not** modify `msg`.
+/// Verify the signature in `msg`. Does not modify `msg`.
 ///
 /// Uses constant-time comparison. Returns `Ok(())` if the embedded signature
 /// matches the freshly computed MAC.

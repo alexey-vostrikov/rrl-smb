@@ -1,11 +1,12 @@
 [package]
 name = "smb-server"
-version = "0.9.1"
+version = "0.12.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
+exclude = ["src/encrypted/wycheproof_gcm.rs", "src/encrypted/wycheproof_siv.rs"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -18,14 +19,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.12.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 
 [workspace.dependencies]
-smb-server = { path = ".", version = "0.9.1" }
+smb-server = { path = ".", version = "0.12.2" }
 
 tokio = { version = "1.40", features = ["full"] }
 binrw = "0.15"
@@ -35,7 +36,6 @@ tracing = "0.1"
 thiserror = "1"
 uuid = { version = "1.10", features = ["v4", "v5"] }
 cap-std = "3"
-cap-primitives = "~3.4"
 
 # RustCrypto family
 hmac  = "0.12"
@@ -48,7 +48,7 @@ md-5  = "0.10"
 aes   = "0.8"
 cmac  = "0.7"
 rc4   = "0.2"
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 ccm   = { version = "0.5", default-features = false }
 
 [dependencies]
@@ -60,7 +60,6 @@ thiserror.workspace = true
 uuid = { workspace = true, features = ["v4", "v5"] }
 binrw = { workspace = true }
 getrandom = "0.4"
-cap-std = { workspace = true, optional = true }
 hmac.workspace = true
 sha2.workspace = true
 md-5.workspace = true
@@ -75,8 +74,19 @@ aes-gcm.workspace = true
 # the two copies here had already done so once on the secure channel.
 rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 ccm.workspace = true
+aes-siv = { version = "0.7", default-features = false, optional = true }
+zeroize = { version = "1", optional = true }
 socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
+quick-xml = { version = "0.42", optional = true }
+hyper = { version = "1.12", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+http = { version = "1.5", optional = true }
+http-body-util = { version = "0.1", optional = true }
+tower-service = { version = "0.3", optional = true }
 # Kerberos accept side, in pure Rust: no libgssapi, no Heimdal, no C. The GSS-API framing, the token
 # ids, the AP-REP envelope and the PAC all come from here rather than from this crate.
 #
@@ -88,13 +98,12 @@ if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
 krb5 = { git = "https://github.com/alexey-vostrikov/krb5", branch = "main", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-cap-primitives = { workspace = true, optional = true }
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"], optional = true }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
+cap-std = { workspace = true, optional = true }
 rustix = { version = "1", features = ["fs"], optional = true }
-libc = "0.2"
-quick-xml = { version = "0.42", optional = true }
+libc = "0.2.173"
 
 [target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
 mdns-sd = { version = "0.21.6", optional = true }
@@ -104,7 +113,20 @@ zbus = { version = "6.2", default-features = false, features = ["tokio"], option
 
 [features]
 default = ["localfs"]
-localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+localfs = ["dep:cap-std", "dep:rustix", "dep:windows-sys"]
+s3 = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:tower-service",
+    "dep:quick-xml",
+    "dep:rustix",
+    "dep:windows-sys",
+]
 # Kerberos authentication in SESSION_SETUP. Off by default: a server that accepts a keytab has
 # another credential to protect, and most deployments of this crate are anonymous file shares.
 krb5 = ["dep:krb5"]
@@ -119,6 +141,7 @@ discovery = [
     "windows-sys/Win32_NetworkManagement_Dns",
     "windows-sys/Win32_System_SystemInformation",
 ]
+encryption = ["dep:aes-siv", "dep:zeroize", "aes/zeroize", "aes-gcm/zeroize"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -130,6 +153,11 @@ tracing-subscriber = "0.3"
 tempfile = "3"
 hex = "0.4"
 des = "0.9"
+
+[[test]]
+name = "integration_encrypted"
+path = "tests/integration_encrypted.rs"
+required-features = ["localfs", "encryption"]
 
 [[test]]
 name = "integration_localfs"
