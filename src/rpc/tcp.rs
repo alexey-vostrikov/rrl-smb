@@ -47,6 +47,24 @@ use super::pdu::{self, AuthReply, Body, ContextResult, Pdu, SyntaxId};
 use crate::proto::auth::ntlm::{Direction, NtlmMac, NtlmServer, NtlmTargetInfo};
 use crate::proto::auth::spnego::{self, NegState, OID_NTLMSSP};
 
+/// The keytab whose keys accept a client's service ticket, when the `krb5` feature is built.
+#[cfg(feature = "krb5")]
+use krb5::Keytab;
+
+/// Without the mechanism there is no acceptor and no such type in the crate; a type that cannot be
+/// constructed is what keeps a keytab from quietly becoming an NTLM-only endpoint.
+#[cfg(not(feature = "krb5"))]
+#[derive(Debug)]
+pub enum Keytab {}
+
+/// The RFC 4121 per-message machinery of an accepted ticket: what seals a call at level 6.
+#[cfg(feature = "krb5")]
+type Sealing = krb5::token::PerMessageTokens<krb5::token::ContextKey>;
+
+/// Nothing produces one without the mechanism, so the field that holds it can hold nothing.
+#[cfg(not(feature = "krb5"))]
+type Sealing = std::convert::Infallible;
+
 pub use super::epm::Published;
 
 /// What this endpoint needs in order to answer a client's SPNEGO exchange.
@@ -110,6 +128,7 @@ struct Exchange {
     /// verifies - but the answer then carries no MIC, and Windows ends the binding with
     /// `RPC_S_PROTOCOL_ERROR` (0x6c0) however good the ticket was.
     /// The session key from an accepted ticket.
+    #[cfg(feature = "krb5")]
     kerberos: Option<[u8; 16]>,
     /// Who the client proved to be.
     principal: Option<String>,
@@ -118,13 +137,15 @@ struct Exchange {
     /// Keyed on the ticket's base key, which is the initiator's subkey when one was offered - the
     /// same choice SMB signing makes, and taking the plain session key here would seal with a key the
     /// client never uses.
-    seal: Option<krb5::token::PerMessageTokens<krb5::token::ContextKey>>,
+    seal: Option<Sealing>,
     /// Sequence numbers, one per direction.
     ///
     /// GSS wrap does not carry them in a DCE/RPC PDU - only in the token header, which this server
     /// writes itself - so both sides count from zero: the client's first sealed call is 0 and the
     /// answer to it is 0 too.
+    #[cfg(feature = "krb5")]
     recv_seq: u64,
+    #[cfg(feature = "krb5")]
     send_seq: u64,
     /// The mechanism and level this association agreed on, for the answers that carry a verifier.
     ///
@@ -444,7 +465,7 @@ fn assoc_group() -> u32 {
 fn auth_answer(
     parsed: &Pdu<'_>,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<krb5::Keytab>>,
+    #[cfg_attr(not(feature = "krb5"), allow(unused_variables))] kerberos: Option<&Arc<Keytab>>,
     exchange: &mut Exchange,
 ) -> Option<Vec<u8>> {
     let auth = parsed.auth.as_ref()?;
@@ -492,68 +513,73 @@ fn auth_answer(
                 "rpc: SPNEGO offer"
             );
 
-            // Kerberos, from the keytab. Two details here are not choices and are the whole of a
-            // `RPC_S_PROTOCOL_ERROR` (0x6c0): the answer must name **the mechanism the client listed
-            // first** - it builds its token for that one, and answering with the other Kerberos OID
-            // leaves it no field to say what it disliked - and the AP-REP must be sent as the
-            // mechanism's own token, not as the GSS-API envelope the acceptor produced.
-            if let (Some(keytab), Some(inner)) = (kerberos, init.mech_token.as_deref())
-                && matches!(inner.first(), Some(&0x60) | Some(&0x6e))
+            // Only where the mechanism is built: without it no token is a ticket, and the
+            // exchange goes straight to NTLM below.
+            #[cfg(feature = "krb5")]
             {
-                // The context, not an identity: the per-message tokens that seal a call at level 6
-                // are derived from its base key, and an acceptor that returns only a session key
-                // cannot seal anything the client would accept.
-                let accepted = match inner.first() {
-                    Some(&0x60) => krb5::KerberosContext::accept_token(keytab, inner),
-                    _ => krb5::KerberosContext::accept_ap_req(
-                        keytab,
-                        inner,
-                        &krb5::acceptor::AcceptOptions::default(),
-                    ),
-                };
-                match accepted {
-                    Ok((context, ap_rep)) => {
-                        let principal = context.client_principal.clone();
-                        let mechanism = spnego::offered_kerberos(&init.mech_types);
-                        // The base key is the initiator's subkey when one was offered (RFC 4121 §2),
-                        // and SMB signing takes the same one; sealing with the ticket's session key
-                        // instead would produce tokens the client refuses without saying why.
-                        match context.per_message_tokens() {
-                            Ok(tokens) => exchange.seal = Some(tokens),
-                            Err(err) => {
-                                warn!(%err, "rpc: no per-message tokens; calls cannot be sealed");
+                // Kerberos, from the keytab. Two details here are not choices and are the whole of a
+                // `RPC_S_PROTOCOL_ERROR` (0x6c0): the answer must name **the mechanism the client listed
+                // first** - it builds its token for that one, and answering with the other Kerberos OID
+                // leaves it no field to say what it disliked - and the AP-REP must be sent as the
+                // mechanism's own token, not as the GSS-API envelope the acceptor produced.
+                if let (Some(keytab), Some(inner)) = (kerberos, init.mech_token.as_deref())
+                    && matches!(inner.first(), Some(&0x60) | Some(&0x6e))
+                {
+                    // The context, not an identity: the per-message tokens that seal a call at level 6
+                    // are derived from its base key, and an acceptor that returns only a session key
+                    // cannot seal anything the client would accept.
+                    let accepted = match inner.first() {
+                        Some(&0x60) => krb5::KerberosContext::accept_token(keytab, inner),
+                        _ => krb5::KerberosContext::accept_ap_req(
+                            keytab,
+                            inner,
+                            &krb5::acceptor::AcceptOptions::default(),
+                        ),
+                    };
+                    match accepted {
+                        Ok((context, ap_rep)) => {
+                            let principal = context.client_principal.clone();
+                            let mechanism = spnego::offered_kerberos(&init.mech_types);
+                            // The base key is the initiator's subkey when one was offered (RFC 4121 §2),
+                            // and SMB signing takes the same one; sealing with the ticket's session key
+                            // instead would produce tokens the client refuses without saying why.
+                            match context.per_message_tokens() {
+                                Ok(tokens) => exchange.seal = Some(tokens),
+                                Err(err) => {
+                                    warn!(%err, "rpc: no per-message tokens; calls cannot be sealed");
+                                }
                             }
+                            exchange.kerberos = Some(truncate_key(&context.base_key));
+                            exchange.principal = Some(principal.clone());
+                            let ap_rep = (!ap_rep.is_empty()).then_some(ap_rep);
+                            info!(
+                                %principal,
+                                ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
+                                "rpc: a service ticket was accepted"
+                            );
+                            // One round or two. Measured with ETW: answering `accept-completed` made the
+                            // client's own security package fail internally (`RPC_S_SEC_PKG_ERROR` 0x721
+                            // and `SEC_E_INTERNAL_ERROR` 0x80090304, reported as "an internal error"),
+                            // which is the package saying it was still waiting for a round the server had
+                            // already closed. The switch exists because the SMB path needed it too and the
+                            // right answer differs per client.
+                            let state = if std::env::var_os("RRL_RPC_KRB_TWOROUND").is_some() {
+                                NegState::AcceptIncomplete
+                            } else {
+                                NegState::AcceptCompleted
+                            };
+                            return Some(spnego::encode_resp_token(
+                                state,
+                                mechanism,
+                                ap_rep.as_deref().map(mechanism_token),
+                                None,
+                            ));
                         }
-                        exchange.kerberos = Some(truncate_key(&context.base_key));
-                        exchange.principal = Some(principal.clone());
-                        let ap_rep = (!ap_rep.is_empty()).then_some(ap_rep);
-                        info!(
-                            %principal,
-                            ap_rep = ap_rep.as_ref().map_or(0, Vec::len),
-                            "rpc: a service ticket was accepted"
-                        );
-                        // One round or two. Measured with ETW: answering `accept-completed` made the
-                        // client's own security package fail internally (`RPC_S_SEC_PKG_ERROR` 0x721
-                        // and `SEC_E_INTERNAL_ERROR` 0x80090304, reported as "an internal error"),
-                        // which is the package saying it was still waiting for a round the server had
-                        // already closed. The switch exists because the SMB path needed it too and the
-                        // right answer differs per client.
-                        let state = if std::env::var_os("RRL_RPC_KRB_TWOROUND").is_some() {
-                            NegState::AcceptIncomplete
-                        } else {
-                            NegState::AcceptCompleted
-                        };
-                        return Some(spnego::encode_resp_token(
-                            state,
-                            mechanism,
-                            ap_rep.as_deref().map(mechanism_token),
-                            None,
-                        ));
-                    }
-                    Err(err) => {
-                        // Named, not swallowed: a ticket this server cannot use and a client that
-                        // offers no ticket are different faults with the same remedy in the log.
-                        debug!(%err, "rpc: the offered ticket was refused; falling back to SPNEGO");
+                        Err(err) => {
+                            // Named, not swallowed: a ticket this server cannot use and a client that
+                            // offers no ticket are different faults with the same remedy in the log.
+                            debug!(%err, "rpc: the offered ticket was refused; falling back to SPNEGO");
+                        }
                     }
                 }
             }
@@ -645,6 +671,7 @@ fn auth_answer(
 /// The pad is stripped **after** the seal opens. MS-RPCE 2.2.2.11 has `auth_pad_length` count octets
 /// at the end of the stub, and at this level those octets are inside the ciphertext - subtracting
 /// them from the ciphertext instead would hand the handler a stub that is short and still parses.
+#[cfg(feature = "krb5")]
 fn open_sealed_call(
     header: &[u8],
     stub: &[u8],
@@ -678,10 +705,25 @@ fn open_sealed_call(
     Ok(Some(message))
 }
 
+/// Without the mechanism an association cannot accept a ticket, so no call arrives sealed: its stub
+/// is arguments in clear text, not a token that failed.
+#[cfg(not(feature = "krb5"))]
+fn open_sealed_call(
+    header: &[u8],
+    stub: &[u8],
+    pad: usize,
+    exchange: &mut Exchange,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let _ = (header, stub, pad, exchange);
+    Ok(None)
+}
+
 /// The first sixteen octets of a key, for the paths that take a fixed-size session key.
 ///
 /// Every KDF this crate implements for a *session* consumes 128 bits, and a shorter key is a
-/// configuration the caller has to see rather than a key padded with zeros.
+/// configuration the caller has to see rather than a key padded with zeros. Only a ticket hands out a
+/// key longer than that, so the cut is made only where one can be accepted.
+#[cfg(feature = "krb5")]
 fn truncate_key(base_key: &[u8]) -> [u8; 16] {
     let mut key = [0_u8; 16];
     let take = base_key.len().min(16);
@@ -698,6 +740,7 @@ fn truncate_key(base_key: &[u8]) -> [u8; 16] {
 ///
 /// The plaintext is padded to four octets before it is sealed, and the padding goes **inside** the
 /// seal: MS-RPCE 2.2.2.11.1 puts it in the encrypted data, so the PDU reports none.
+#[cfg(feature = "krb5")]
 fn seal_answer(stub: &[u8], level: u8, exchange: &mut Exchange) -> (Vec<u8>, Option<Vec<u8>>) {
     if level != 6 {
         return (stub.to_vec(), None);
@@ -734,6 +777,14 @@ fn seal_answer(stub: &[u8], level: u8, exchange: &mut Exchange) -> (Vec<u8>, Opt
     }
 }
 
+/// Without the mechanism no ticket is ever accepted, so nothing here is sealed: an answer travels
+/// plain, and a signed association signs it on top through [`seal_answer_ntlm`].
+#[cfg(not(feature = "krb5"))]
+fn seal_answer(stub: &[u8], level: u8, exchange: &mut Exchange) -> (Vec<u8>, Option<Vec<u8>>) {
+    let _ = (level, exchange);
+    (stub.to_vec(), None)
+}
+
 /// Hex for a log line, in the form a trace of the wire reads.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|octet| format!("{octet:02x}")).collect()
@@ -743,6 +794,7 @@ fn hex(bytes: &[u8]) -> String {
 ///
 /// `0x6e` opens an AP-REQ and `0x6f` an AP-REP; a client that receives the envelope where it expects
 /// the token has no field to say so. Taken from the SMB path, which learned it against a live client.
+#[cfg(feature = "krb5")]
 fn mechanism_token(token: &[u8]) -> &[u8] {
     if token.first() == Some(&0x60)
         && let Some(position) = token.iter().position(|byte| *byte == 0x6f || *byte == 0x6e)
@@ -1127,10 +1179,23 @@ pub async fn serve(endpoint: Endpoint) -> std::io::Result<()> {
     // The raw `Keytab`, not a ready-made acceptor: accepting a ticket has to yield the *context*,
     // because the per-message tokens that seal a call at level 6 are derived from its base key, and
     // an acceptor that returns only an identity and a session key throws that away.
-    let kerberos = match &endpoint.keytab {
+    let kerberos: Option<Arc<Keytab>> = match &endpoint.keytab {
         None => None,
+        // A keytab this build cannot use is a startup error naming the file: an endpoint that
+        // silently accepts NTLM only is one whose Kerberos failures look like client bugs.
+        #[cfg(not(feature = "krb5"))]
         Some(path) => {
-            let keytab = krb5::Keytab::load(path).map_err(|err| {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "drsuapi keytab '{}': this build has no krb5 feature, so no ticket can be accepted",
+                    path.display()
+                ),
+            ));
+        }
+        #[cfg(feature = "krb5")]
+        Some(path) => {
+            let keytab = Keytab::load(path).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("drsuapi keytab '{}': {err:?}", path.display()),
@@ -1179,7 +1244,7 @@ async fn connection(
     mut stream: TcpStream,
     port: u16,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<krb5::Keytab>>,
+    kerberos: Option<&Arc<Keytab>>,
 ) -> std::io::Result<()> {
     let mut inbox: Vec<u8> = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -1239,7 +1304,7 @@ async fn answer(
     contexts: &mut Vec<(u16, SyntaxId)>,
     port: u16,
     endpoint: &Endpoint,
-    kerberos: Option<&Arc<krb5::Keytab>>,
+    kerberos: Option<&Arc<Keytab>>,
     exchange: &mut Exchange,
 ) -> Vec<Vec<u8>> {
     // Computed once here, because both bind-shaped answers carry it and a call does not.
@@ -2039,6 +2104,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "krb5")]
     async fn a_ticket_offer_without_a_keytab_keeps_the_exchange_alive() {
         // The offer's token is not NTLMSSP but a Kerberos AP-REQ (`6e`), and there is no keytab to
         // accept it with. The answer must name NTLMSSP and leave the negotiation running: a
@@ -2293,6 +2359,7 @@ mod tests {
     /// verifier carrying the token header, and that the sequence numbers advance - and all of that
     /// is the same arithmetic whoever agreed on the key. Accepting the ticket that produces the key
     /// is tested by the SMB path (`proto::auth::kerberos`) and, live, by the stand.
+    #[cfg(feature = "krb5")]
     fn endpoints_of_one_context() -> (
         krb5::token::PerMessageTokens<krb5::token::ContextKey>,
         krb5::token::PerMessageTokens<krb5::token::ContextKey>,
@@ -2309,6 +2376,7 @@ mod tests {
 
     /// A request whose stub is a sealed token: the RFC 4121 header travels in the verifier and the
     /// ciphertext where the arguments would be, which is what MS-RPCE 2.2.2.11.1 asks for at level 6.
+    #[cfg(feature = "krb5")]
     fn sealed_request_pdu(call_id: u32, opnum: u16, token: &[u8], pad: u8) -> Vec<u8> {
         let (header_part, body) = token.split_at(krb5::token::HEADER_LEN);
         let mut out = header(pdu::PTYPE_REQUEST, call_id, 0);
@@ -2335,6 +2403,7 @@ mod tests {
     }
 
     /// A context accepted on this association, the way a bind leaves it.
+    #[cfg(feature = "krb5")]
     async fn accepted_context() -> Vec<(u16, SyntaxId)> {
         let raw = bind_pdu(&[context(0, pdu::DRSUAPI, pdu::NDR)]);
         let parsed = pdu::parse(&raw).expect("a bind");
@@ -2355,6 +2424,7 @@ mod tests {
     /// The acceptance of the level-6 path: a sealed call is opened, and the answer comes back
     /// sealed, with the token's header in the verifier and its ciphertext in the body.
     #[tokio::test]
+    #[cfg(feature = "krb5")]
     async fn a_sealed_call_is_opened_and_the_answer_is_sealed_back() {
         let (server, client) = endpoints_of_one_context();
         let mut contexts = accepted_context().await;
@@ -2430,6 +2500,7 @@ mod tests {
     /// the token opens. Stripping it from the ciphertext instead would shorten a stub that still
     /// parses - the failure would be a handler reading somebody else's octets.
     #[tokio::test]
+    #[cfg(feature = "krb5")]
     async fn the_pad_reported_by_the_trailer_is_removed_after_the_seal_opens() {
         let (server, client) = endpoints_of_one_context();
         let mut contexts = accepted_context().await;
@@ -2467,6 +2538,7 @@ mod tests {
     /// A token sealed under a key this context does not hold is refused, and nothing is sent: an
     /// answer built from ciphertext nobody can read would be a protocol error invented here.
     #[tokio::test]
+    #[cfg(feature = "krb5")]
     async fn a_call_sealed_under_another_key_is_refused_without_an_answer() {
         let (server, _client) = endpoints_of_one_context();
         let mut contexts = accepted_context().await;
@@ -2509,6 +2581,7 @@ mod tests {
     /// a token that is entirely valid. `0x6e` opens an AP-REQ and `0x6f` an AP-REP; anything else is
     /// already the token and is passed through unchanged.
     #[test]
+    #[cfg(feature = "krb5")]
     fn a_gss_envelope_is_stripped_to_the_mechanism_token() {
         let envelope = |inner: &[u8]| {
             let mut body = vec![0x06, 0x09];

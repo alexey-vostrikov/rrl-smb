@@ -11,6 +11,10 @@
 //! that a stand which is not running does not look like a passing test. The run that measures
 //! coverage happens inside `docker/kerberos-stand.Dockerfile`, where the variables are set.
 
+// Every round here needs a KDC to issue the ticket and the keytab to match it, so the file
+// is built only with the mechanism.
+#![cfg(feature = "krb5")]
+
 mod common;
 
 use common::auth::{

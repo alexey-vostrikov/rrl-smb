@@ -10,7 +10,9 @@ use crate::proto::auth::ntlm::{
     AuthOutcome, Direction, Identity, NTLMSSP_SIGNATURE, NtlmAuthenticate, NtlmMac, NtlmServer,
     NtlmTargetInfo, UserCreds,
 };
-#[cfg(feature = "krb5")]
+/// The codec itself is not gated: SPNEGO negotiates NTLM as well, and a server built without the
+/// mechanism still speaks it for the one it has. Only the choice Kerberos makes is gated, and it is
+/// written in full where it is used.
 use crate::proto::auth::spnego::{
     NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
 };
@@ -376,6 +378,7 @@ async fn accept_kerberos(
 ///
 /// Everything here was proved in the previous round: the ticket, the session key, and the identity.
 /// What this round adds is the client's confirmation, and only then does a session exist.
+#[cfg(feature = "krb5")]
 async fn finish_kerberos(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
@@ -616,6 +619,7 @@ fn more_processing(sid: u64, outbound: &[u8]) -> HandlerResponse {
 ///
 /// `RRL_SMB_KRB_GSS=1` keeps the envelope, because a client exists that wants it and the difference
 /// is one environment variable rather than one build.
+#[cfg(feature = "krb5")]
 fn mechanism_token(token: &[u8]) -> &[u8] {
     if std::env::var_os("RRL_SMB_KRB_GSS").is_some() {
         return token;

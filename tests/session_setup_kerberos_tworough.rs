@@ -9,6 +9,10 @@
 //! and refuses a session it never completed. `finish_kerberos` is the handler for that second
 //! message, and nothing else reaches it.
 
+// Same as the one-round file: a KDC issues the ticket, and the mode is read only where the
+// mechanism is built.
+#![cfg(feature = "krb5")]
+
 mod common;
 
 use common::auth::{

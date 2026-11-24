@@ -231,7 +231,7 @@ fn encryption_key() -> Result<Option<[u8; 32]>, String> {
         return Err(invalid());
     }
     let mut key = [0u8; 32];
-    for (byte, pair) in key.iter_mut().zip(digits.chunks_exact(2)) {
+    for (byte, pair) in key.iter_mut().zip(digits.as_chunks::<2>().0) {
         let high = hex_digit(pair[0]).ok_or_else(invalid)?;
         let low = hex_digit(pair[1]).ok_or_else(invalid)?;
         *byte = (high << 4) | low;

@@ -68,12 +68,17 @@ pub const OID_KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x
 /// selects the initiator's first choice that it supports, and names it in `supportedMech`; answering with
 /// a mechanism the client did not choose is what an SMB client reports as `SEC_E_INVALID_TOKEN`
 /// (0x80090308) with no further detail.
+#[cfg(feature = "krb5")]
 pub const OID_KRB5_MS: &[u8] = &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02];
 
 /// The Kerberos OID a client offered, preferring the one it listed first.
 ///
 /// Both spell the same mechanism here, so the choice is the client's: it is the one whose token it built,
 /// and RFC 4178 §4.2.2 has the target name its selection in `supportedMech`.
+///
+/// Only when the mechanism is built: it answers with one of the two Kerberos OIDs, and an offer of
+/// Kerberos to a server that cannot accept a ticket is not a choice it has.
+#[cfg(feature = "krb5")]
 pub fn offered_kerberos(mech_types: &[Vec<u8>]) -> Option<&'static [u8]> {
     // The order the client listed them in: it built its token for the mechanism it named, and
     // answering with the other spelling is a difference it has no field to describe.
@@ -652,6 +657,7 @@ mod tests {
     /// mechanism to this server, so answering with the second spelling leaves the client no field
     /// to say what it disliked — it reports `SEC_E_INVALID_TOKEN` and nothing else.
     #[test]
+    #[cfg(feature = "krb5")]
     fn the_kerberos_mechanism_is_the_one_the_client_listed_first() {
         let mechs = |list: &[&[u8]]| list.iter().map(|m| m.to_vec()).collect::<Vec<_>>();
 

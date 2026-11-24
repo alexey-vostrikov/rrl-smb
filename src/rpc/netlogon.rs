@@ -330,6 +330,9 @@ const DS_ADDRESS_TYPE_INET: u32 = 1;
 mod dc_flags {
     pub const DS_LDAP_FLAG: u32 = 0x0000_0008;
     pub const DS_DS_FLAG: u32 = 0x0000_0010;
+    /// A domain controller that runs the KDC: true of this server only where it can accept a
+    /// ticket, so the flag is read in the same build that sets it.
+    #[cfg(feature = "krb5")]
     pub const DS_KDC_FLAG: u32 = 0x0000_0020;
     pub const DS_WRITABLE_FLAG: u32 = 0x0000_0100;
     /// The functional levels this controller's answer is good for (`MS-ADTS` 6.3.1.2).
@@ -416,6 +419,8 @@ fn get_dc_name(server: &ServerState, stub: &[u8], ex2: bool) -> Result<Vec<u8>, 
     );
 
     let site = DEFAULT_SITE;
+    // `mut` only where the KDC flag is added: without the feature nothing changes it after this.
+    #[cfg_attr(not(feature = "krb5"), allow(unused_mut))]
     let mut dc = dc_flags::DS_LDAP_FLAG
         | dc_flags::DS_DS_FLAG
         | dc_flags::DS_WRITABLE_FLAG

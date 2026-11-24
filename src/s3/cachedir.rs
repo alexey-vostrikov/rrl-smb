@@ -325,11 +325,10 @@ impl CacheDir {
     pub(crate) fn write_record(&self, id: &RecordId, text: &str) -> io::Result<()> {
         #[cfg(test)]
         {
-            let skipped = self.hooks.record_write_skips.try_update(
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            );
+            let skipped =
+                self.hooks
+                    .record_write_skips
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             if skipped.is_err() {
                 self.hooks.take(&self.hooks.record_writes)?;
             }

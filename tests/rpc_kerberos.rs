@@ -11,6 +11,9 @@
 //! its first line and reports nothing, so the plain gates neither need a KDC nor pass a test they did
 //! not run.
 
+// The endpoint accepts the ticket through `krb5`, so the file is built only with it.
+#![cfg(feature = "krb5")]
+
 mod common;
 
 use std::net::SocketAddr;
