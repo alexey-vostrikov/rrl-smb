@@ -26,17 +26,18 @@ use crate::access_mask::{
 use crate::backend::{
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FileInfo,
-    FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, VALID_SET_ATTRIBUTES,
+    FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
-use crate::conn::state::{Connection, Open};
+use crate::conn::state::{Connection, Open, TreeConnect};
 use crate::dispatch::HandlerResponse;
 use crate::ea::{self, Ea};
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, CONTENT_CHANGED, Change, Closing, Durability, FileRef, Granted, LeaseId, LeaseRef,
-    LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
-    STREAM_BASE_CHANGED, STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
+    BreakWait, CONTENT_CHANGED, Change, Closing, Durability, DurableReg, FileRef, GrantGuard,
+    Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT,
+    OpenRequest, OpenSlot, Refused, STREAM_BASE_CHANGED, STREAM_CHANGED, Sharing, Trigger,
+    finish_close, v2_timeout,
 };
 use crate::handlers::aapl;
 use crate::handlers::reconnect::{self, Reconnect};
@@ -865,6 +866,10 @@ pub async fn handle(
 
 /// One try at opening the file. Runs the session and tree checks again, so
 /// a CREATE that waited fails once its session or tree is gone.
+///
+/// The attempt is a pipeline of named decisions; each step either hands the
+/// next one what it needs or answers the client itself, so no step holds a
+/// decision that belongs to another.
 async fn attempt(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
@@ -895,215 +900,91 @@ async fn attempt(
     }
 
     let stream = args.stream.as_ref();
-    let open_request = |overwrite, break_handles| OpenRequest {
-        sharing: args.sharing,
-        stream: args.stream.clone(),
-        owner: Arc::downgrade(&conn.outbound),
-        lease: args.lease.map(|l| l.id),
-        overwrite,
-        supersede: args.create_disposition == FILE_SUPERSEDE && stream.is_none(),
-        break_handles,
-    };
     let break_handles = stage.break_handles();
+    let open_request = open_request_of(args, conn, stream);
+
+    let seats = match seats_of(
+        server,
+        conn,
+        &share,
+        path,
+        args,
+        stage,
+        &open_request,
+        break_handles,
+    )
+    .await
+    {
+        Ok(seats) => seats,
+        Err(step) => return step,
+    };
+    let Seats {
+        slot,
+        lease_ref,
+        reserved,
+        opened,
+        registered,
+    } = seats;
+
     let refused = |refused: Refused, stage: Stage| match refused.wait {
         Some(wait) => Step::Wait(wait, stage),
         None => fail(refused.status),
     };
+    let open_failed = open_failed_of(&share, path);
 
-    let open_failed = |e: Failed| {
-        debug!(error = ?e, path = %path, "backend open failed");
-        let case_sensitive = backend.capabilities().case_sensitive;
-        if matches!(e, Failed::Backend(SmbError::Exists))
-            && share.files.delete_pending_at(path, case_sensitive)
-        {
-            return fail(ntstatus::STATUS_DELETE_PENDING);
-        }
-        fail(e.status())
-    };
-
-    let (slot, lease_ref, reserved, opened, registered) = match stage {
-        Stage::Reserved(reserved) => {
-            match reserved.file.end_wait() {
-                // Write caching other clients still hold keeps it waiting.
-                Ok(Some(wait)) => return Step::Wait(wait, Stage::Reserved(reserved)),
-                Ok(None) => {}
-                Err(status) => {
-                    Stage::Reserved(reserved).release().await;
-                    return fail(status);
-                }
-            }
-            let Reserved {
-                file,
-                slot,
-                lease_ref,
-                opened,
-                ..
-            } = *reserved;
-            let opened = opened.map(|(handle, action)| (handle.take(), action));
-            let registered = opened.is_some();
-            (slot, lease_ref, Some(file), opened, registered)
-        }
-        Stage::Start | Stage::AfterHandleBreak => {
-            let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
-            let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
-                warn!(limit, "open limit reached");
-                return fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
-            };
-            let lease_ref = match &args.lease {
-                Some(l) => match server.leases.acquire(l.id, &share, path, stream) {
-                    Ok(lease_ref) => Some(lease_ref),
-                    Err(status) => return fail(status),
-                },
-                None => None,
-            };
-            let truncating = matches!(
-                args.intent,
-                OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
-            );
-            // An open that truncates checks the file and takes its place
-            // in the table first, so a refused open leaves the file as it
-            // was, no other open slips in while the backend truncates, and
-            // clients caching writes write back before it does. A file
-            // that is missing is created instead; one that appears
-            // meanwhile is checked again.
-            let mut tries = 0;
-            let (reserved, opened) = loop {
-                if !truncating {
-                    break (None, None);
-                }
-                let request = open_request(true, break_handles);
-                let checks = Checks {
-                    delete_on_close: args.opts.delete_on_close,
-                    no_ea_knowledge: args.no_ea_knowledge,
-                    attributes: stream.is_none().then_some(args.new_attributes),
-                };
-                match reserve_existing(&share, path, stream, args.opts, checks, request).await {
-                    Ok(Probe::Reserved(file, Some(wait))) => {
-                        let reserved = Reserved {
-                            file,
-                            slot,
-                            lease_ref,
-                            opened: None,
-                            made_without_eas: false,
-                        };
-                        return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
-                    }
-                    Ok(Probe::Reserved(file, None)) => break (Some(file), None),
-                    Ok(Probe::Missing(e)) if args.intent == OpenIntent::Truncate => {
-                        return open_failed(e);
-                    }
-                    Ok(Probe::Missing(_)) => {
-                        if stream.is_none()
-                            && let Err(status) = &args.eas
-                        {
-                            return fail(*status);
-                        }
-                        let create = OpenOptions {
-                            intent: OpenIntent::Create,
-                            ..args.opts
-                        };
-                        match open_reported(&share, path, stream, create, false).await {
-                            Ok(opened) => break (None, Some(opened)),
-                            Err(Failed::Backend(SmbError::Exists)) if tries < 2 => tries += 1,
-                            Err(e) => return open_failed(e),
-                        }
-                    }
-                    Err(r) => return refused(r, Stage::AfterHandleBreak),
-                }
-            };
-            (slot, lease_ref, reserved, opened, false)
-        }
-    };
-
-    // An overwrite or supersede replaces the file's extended attributes
-    // before it truncates the file, so a set that fails leaves the file
-    // as it was.
-    // A directory, which the truncating open refuses, keeps them.
-    let mut replaced = None;
-    if let (Some(file), None) = (&reserved, &opened)
-        && stream.is_none()
-        && share.extended_attributes
-        && !file.is_directory()
+    let (handle, action) = match opened_and_replaced(
+        &share,
+        path,
+        args,
+        &reserved,
+        opened,
+        stream,
+        &open_failed,
+    )
+    .await
     {
-        match replace_eas_of(&share, path, file, args).await {
-            Ok(old) => replaced = old,
-            Err(status) => return fail(status),
-        }
-    }
-    // A CREATE that would make a file with extended attributes it refuses
-    // fails, unless the file is there and the CREATE opens it.
-    if let (None, None, Err(status)) = (&reserved, &opened, &args.eas)
-        && stream.is_none()
-        && matches!(args.intent, OpenIntent::Create | OpenIntent::OpenOrCreate)
-        && !exists(&share, path, args.opts).await
-    {
-        return fail(*status);
-    }
-
-    // The open this attempt made, or the one a waiting CREATE kept.
-    let (handle, action) = match opened {
-        Some(opened) => opened,
-        None => match open_reported(&share, path, stream, args.opts, replaced.is_some()).await {
-            Ok(opened) => opened,
-            Err(e) => {
-                // The file stays as it was, its extended attributes too.
-                if let (Some(old), Some(file)) = (&replaced, &reserved)
-                    && let Err(status) = restore_eas(&share, path, file, &args.eas, old).await
-                {
-                    return fail(status);
-                }
-                return open_failed(e);
-            }
-        },
+        Ok(opened) => opened,
+        Err(step) => return step,
     };
 
-    // Stat for the response.
-    let mut info = match handle.stat().await {
-        Ok(i) => i,
-        Err(e) => {
+    // Stat for the response, and the refusals the file's own state demands.
+    let info = match checked_stat(handle.as_ref(), action, args).await {
+        Ok(info) => info,
+        Err(status) => {
             let _ = handle.close().await;
-            return fail(e.to_nt_status());
+            return fail(status);
         }
     };
-    // MS-FSA 2.1.5.1.2.1: a read-only file cannot be opened for deletion.
-    if args.delete_on_close && info.read_only {
-        let _ = handle.close().await;
-        return fail(ntstatus::STATUS_CANNOT_DELETE);
-    }
-    if action == OpenAction::Opened
-        && args.no_ea_knowledge
-        && let Err(status) = refuse_needed_eas(handle.as_ref()).await
+
+    let (mut file, slot, lease_ref) = match file_of(
+        &share,
+        path,
+        action,
+        &info,
+        reserved,
+        registered,
+        &open_request,
+        slot,
+        lease_ref,
+    )
+    .await
     {
-        let _ = handle.close().await;
-        return fail(status);
-    }
-    let mut file = match reserved {
-        Some(file) if registered || file.is_for(&info, path) => file,
-        // The file was replaced between the two opens, or did not exist.
-        reserved => {
-            drop(reserved);
-            let overwrite = action == OpenAction::Overwritten;
-            match FileRef::register(&share, &info, path, open_request(overwrite, break_handles)) {
-                Ok((file, None)) => file,
-                Ok((file, Some(wait))) => {
-                    let reserved = Reserved {
-                        file,
-                        slot,
-                        lease_ref,
-                        opened: Some((HeldHandle(Some(handle)), action)),
-                        made_without_eas: action == OpenAction::Created
-                            && stream.is_none()
-                            && args.eas.as_ref().is_ok_and(|eas| !eas.is_empty()),
-                    };
-                    return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
-                }
-                Err(r) => {
-                    let _ = handle.close().await;
-                    return refused(r, Stage::AfterHandleBreak);
-                }
-            }
+        Ok(FileOrWait::File(file, slot, lease_ref)) => (file, slot, lease_ref),
+        Ok(FileOrWait::Wait(wait, reserved)) => {
+            let opened = (HeldHandle(Some(handle)), action);
+            let reserved = Reserved {
+                opened: Some(opened),
+                made_without_eas: made_without_eas(args, action, stream),
+                ..reserved
+            };
+            return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
+        }
+        Err(r) => {
+            let _ = handle.close().await;
+            return refused(r, Stage::AfterHandleBreak);
         }
     };
+
     // The streams are marked before another CREATE can open one, and the
     // ones made after the overwrite are left alone.
     let unopened = if action == OpenAction::Overwritten && stream.is_none() && share.named_streams {
@@ -1113,89 +994,72 @@ async fn attempt(
     };
     drop(names);
     file.remove_streams(unopened).await;
+
     // A new file whose extended attributes cannot be set goes again, as a
     // delete-on-close open of it would, once no other open is on it.
-    let new_eas = match &args.eas {
-        Ok(eas) if action == OpenAction::Created && stream.is_none() => Ok(eas.as_slice()),
-        Err(status) if action == OpenAction::Created && stream.is_none() => Err(*status),
-        _ => Ok(&[][..]),
-    };
-    let made_with_eas = new_eas.is_ok_and(|eas| !eas.is_empty());
-    let set = match new_eas {
-        Ok(eas) if !eas.is_empty() => {
-            let _setting = file.lock_eas().await;
-            handle.set_eas(eas).await.map_err(|e| e.to_nt_status())
-        }
-        Ok(_) => Ok(()),
-        Err(status) => Err(status),
-    };
-    if let Err(status) = set {
-        debug!(status, path = %path, "extended attributes of a new file not set");
-        let is_directory = info.is_directory;
-        finish_close(
-            Some(handle),
-            Some(file),
-            true,
-            is_directory,
-            Closing::ReadOnly,
-            false,
-        )
-        .await;
-        return fail(status);
-    }
-    let mut granted = None;
-    let mut after_send = None;
-    if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
-        && (stream.is_some() || !info.is_directory)
-    {
-        match server
-            .leases
-            .grant(lease_ref, &mut file, &lease, GRANTABLE_LEASE)
-        {
-            Ok((lease, guard)) => {
-                granted = Some(lease);
-                after_send = Some(guard);
-            }
-            Err(status) => {
-                drop(file);
-                let _ = handle.close().await;
-                return fail(status);
-            }
+    match set_new_eas(&file, handle.as_ref(), path, args, action, stream).await {
+        Ok(()) => {}
+        Err(status) => {
+            let is_directory = info.is_directory;
+            finish_close(
+                Some(handle),
+                Some(file),
+                true,
+                is_directory,
+                Closing::ReadOnly,
+                false,
+            )
+            .await;
+            return fail(status);
         }
     }
-    // MS-SMB2 3.3.5.9.6, 3.3.5.9.10: an open asking for a durable handle
-    // gets one when its lease caches handles; any other open gets none and
-    // no durable context in the response. Anonymous sessions get none,
-    // since they all count as one user, and neither does a client without a
-    // ClientGuid. The PERSISTENT flag of a version 2 request is ignored:
-    // no share is continuously available.
-    let durability = match args.queries.durable {
-        DurableAsk::V1 => Some(Durability {
-            create_guid: None,
-            timeout: server.durable.timeout,
-            replay_eligible: false,
-        }),
-        DurableAsk::V2(request) => Some(Durability {
-            create_guid: Some(request.create_guid),
-            timeout: v2_timeout(request.timeout_ms, server.durable.timeout),
-            replay_eligible: args.open_access & REPLAYABLE_ACCESS != 0,
-        }),
-        _ => None,
-    };
-    let durable = match (&granted, &args.owner, durability) {
-        (Some(lease), Some(owner), Some(durability))
-            if lease.state.contains(LeaseState::H)
-                && share.durable_handles
-                && !lease.id.client.is_nil() =>
-        {
-            let lease = (lease.id, lease.version);
-            server
-                .durable
-                .register(owner, &share, lease, durability, conn)
-                .map(|reg| (reg, durability))
+
+    let Leases {
+        granted,
+        after_send,
+    } = match lease_granted(server, &mut file, args, stream, &info, lease_ref).await {
+        Ok(leases) => leases,
+        Err(status) => {
+            let _ = handle.close().await;
+            return fail(status);
         }
-        _ => None,
     };
+
+    registered_open(
+        server, conn, &share, &backend, path, &tree_arc, args, action, stream, info, handle, file,
+        slot, granted, after_send,
+    )
+    .await
+}
+
+/// What the open asks the server for after the lease: a durable handle,
+/// the attributes of the file it made or overwrote, and a place in its
+/// tree. The FileId and the volume serial it answers with come from here.
+///
+/// The many arguments are the pipeline's edge: the open and everything the
+/// earlier steps decided about it, each named so the call site reads as
+/// the order the decisions happen in.
+#[allow(clippy::too_many_arguments)]
+async fn registered_open(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    share: &Arc<ShareBindings>,
+    backend: &Arc<dyn ShareBackend>,
+    path: &SmbPath,
+    tree_arc: &Arc<tokio::sync::RwLock<TreeConnect>>,
+    args: &CreateArgs,
+    action: OpenAction,
+    stream: Option<&StreamName>,
+    mut info: FileInfo,
+    handle: Box<dyn Handle>,
+    file: FileRef,
+    slot: OpenSlot,
+    granted: Option<Granted>,
+    after_send: Option<GrantGuard>,
+) -> Step {
+    let fail = |status| Step::Done(HandlerResponse::err(status));
+    let durability = durability_of(server, args);
+    let durable = durable_of(server, conn, share, args, &granted, durability);
     if let Some((reg, _)) = &durable {
         file.mark_durable(&server.durable, reg.id());
     }
@@ -1245,7 +1109,538 @@ async fn attempt(
         None => tree.alloc_file_id(),
     };
     let (durable, durability) = durable.unzip();
-    let open = Open {
+    tree.opens.get_mut().insert(
+        file_id,
+        Arc::new(tokio::sync::RwLock::new(open_of(
+            file_id, handle, args, &info, action, stream, file, slot, durable,
+        ))),
+    );
+    drop(tree);
+
+    create_reply(
+        server,
+        conn,
+        share,
+        args,
+        action,
+        info,
+        file_id,
+        volume_serial,
+        granted,
+        durability,
+        after_send,
+    )
+}
+
+/// The [`OpenRequest`] this CREATE registers its open with: the sharing it
+/// asked for, the lease it acquired, and whether a refused open breaks
+/// oplocks or handles instead.
+fn open_request_of<'a>(
+    args: &'a CreateArgs,
+    conn: &'a Arc<Connection>,
+    stream: Option<&'a StreamName>,
+) -> impl Fn(bool, bool) -> OpenRequest + use<'a> {
+    move |overwrite, break_handles| OpenRequest {
+        sharing: args.sharing,
+        stream: args.stream.clone(),
+        owner: Arc::downgrade(&conn.outbound),
+        lease: args.lease.map(|l| l.id),
+        overwrite,
+        supersede: args.create_disposition == FILE_SUPERSEDE && stream.is_none(),
+        break_handles,
+    }
+}
+
+/// The seats a CREATE takes for its attempt: the ones a waiting one kept,
+/// or fresh ones. A wait on the way answers with itself, holding what the
+/// CREATE took so it can go on once the break is over.
+///
+/// The many arguments are the pipeline's edge, in the order the decisions
+/// happen in.
+#[allow(clippy::too_many_arguments)]
+async fn seats_of(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    share: &Arc<ShareBindings>,
+    path: &SmbPath,
+    args: &CreateArgs,
+    stage: Stage,
+    open_request: &(impl Fn(bool, bool) -> OpenRequest + '_),
+    break_handles: bool,
+) -> Result<Seats, Step> {
+    match stage {
+        Stage::Reserved(reserved) => resumed(reserved).await,
+        Stage::Start | Stage::AfterHandleBreak => {
+            match started(server, conn, share, path, args, open_request, break_handles).await {
+                Ok(SeatsOrWait::Seats(seats)) => Ok(seats),
+                Ok(SeatsOrWait::Wait(wait, reserved)) => {
+                    Err(Step::Wait(wait, Stage::Reserved(Box::new(reserved))))
+                }
+                Err(step) => Err(step),
+            }
+        }
+    }
+}
+
+/// The answer to a backend open that failed: an `Exists` the file table
+/// already knows is a delete-pending file, and everything else is what the
+/// backend said.
+fn open_failed_of<'a>(
+    share: &'a ShareBindings,
+    path: &'a SmbPath,
+) -> impl Fn(Failed) -> Step + use<'a> {
+    move |e| {
+        debug!(error = ?e, path = %path, "backend open failed");
+        let case_sensitive = share.backend.capabilities().case_sensitive;
+        if matches!(e, Failed::Backend(SmbError::Exists))
+            && share.files.delete_pending_at(path, case_sensitive)
+        {
+            return Step::Done(HandlerResponse::err(ntstatus::STATUS_DELETE_PENDING));
+        }
+        Step::Done(HandlerResponse::err(e.status()))
+    }
+}
+
+/// What one attempt of a CREATE holds: its place against the connection's
+/// open limit, the lease it acquired, the open already in the share's file
+/// table when the CREATE truncates, and the backend open already run.
+/// `registered` says the reserved file is already under this open: it was
+/// kept waiting while the backend truncated.
+struct Seats {
+    slot: OpenSlot,
+    lease_ref: Option<LeaseRef>,
+    reserved: Option<FileRef>,
+    opened: Option<(Box<dyn Handle>, OpenAction)>,
+    registered: bool,
+}
+
+/// [`started`] answers with seats, or with a CREATE that has to wait for a
+/// lease break first.
+enum SeatsOrWait {
+    Seats(Seats),
+    Wait(BreakWait, Reserved),
+}
+
+/// A CREATE that waited for a lease break resumes: its wait is over, its
+/// backend open has already run, and it keeps the seat it took.
+async fn resumed(reserved: Box<Reserved>) -> Result<Seats, Step> {
+    match reserved.file.end_wait() {
+        // Write caching other clients still hold keeps it waiting.
+        Ok(Some(wait)) => return Err(Step::Wait(wait, Stage::Reserved(reserved))),
+        Ok(None) => {}
+        Err(status) => {
+            Stage::Reserved(reserved).release().await;
+            return Err(Step::Done(HandlerResponse::err(status)));
+        }
+    }
+    let Reserved {
+        file,
+        slot,
+        lease_ref,
+        opened,
+        ..
+    } = *reserved;
+    let opened = opened.map(|(handle, action)| (handle.take(), action));
+    let registered = opened.is_some();
+    Ok(Seats {
+        slot,
+        lease_ref,
+        reserved: Some(file),
+        opened,
+        registered,
+    })
+}
+
+/// A fresh attempt takes a seat against the connection's open limit and a
+/// lease, then runs the truncating open: the file is checked and takes its
+/// place in the table first, so a refused open leaves the file as it was,
+/// no other open slips in while the backend truncates, and clients caching
+/// writes write back before it does. A file that is missing is created
+/// instead; one that appears meanwhile is checked again.
+async fn started(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    share: &Arc<ShareBindings>,
+    path: &SmbPath,
+    args: &CreateArgs,
+    open_request: &(impl Fn(bool, bool) -> OpenRequest + '_),
+    break_handles: bool,
+) -> Result<SeatsOrWait, Step> {
+    let fail = |status| Step::Done(HandlerResponse::err(status));
+    let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
+    let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
+        warn!(limit, "open limit reached");
+        return Err(fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES));
+    };
+    let stream = args.stream.as_ref();
+    let lease_ref = match &args.lease {
+        Some(l) => match server.leases.acquire(l.id, share, path, stream) {
+            Ok(lease_ref) => Some(lease_ref),
+            Err(status) => return Err(fail(status)),
+        },
+        None => None,
+    };
+    let truncating = matches!(
+        args.intent,
+        OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+    );
+    let open_failed = open_failed_of(share, path);
+    let mut tries = 0;
+    loop {
+        if !truncating {
+            return Ok(SeatsOrWait::Seats(Seats {
+                slot,
+                lease_ref,
+                reserved: None,
+                opened: None,
+                registered: false,
+            }));
+        }
+        let request = open_request(true, break_handles);
+        let checks = Checks {
+            delete_on_close: args.opts.delete_on_close,
+            no_ea_knowledge: args.no_ea_knowledge,
+            attributes: stream.is_none().then_some(args.new_attributes),
+        };
+        match reserve_existing(share, path, stream, args.opts, checks, request).await {
+            Ok(Probe::Reserved(file, Some(wait))) => {
+                return Ok(SeatsOrWait::Wait(
+                    wait,
+                    Reserved {
+                        file,
+                        slot,
+                        lease_ref,
+                        opened: None,
+                        made_without_eas: false,
+                    },
+                ));
+            }
+            Ok(Probe::Reserved(file, None)) => {
+                return Ok(SeatsOrWait::Seats(Seats {
+                    slot,
+                    lease_ref,
+                    reserved: Some(file),
+                    opened: None,
+                    registered: false,
+                }));
+            }
+            Ok(Probe::Missing(e)) if args.intent == OpenIntent::Truncate => {
+                return Err(open_failed(e));
+            }
+            Ok(Probe::Missing(_)) => {
+                if stream.is_none()
+                    && let Err(status) = &args.eas
+                {
+                    return Err(fail(*status));
+                }
+                let create = OpenOptions {
+                    intent: OpenIntent::Create,
+                    ..args.opts
+                };
+                match open_reported(share, path, stream, create, false).await {
+                    Ok(opened) => {
+                        return Ok(SeatsOrWait::Seats(Seats {
+                            slot,
+                            lease_ref,
+                            reserved: None,
+                            opened: Some(opened),
+                            registered: false,
+                        }));
+                    }
+                    Err(Failed::Backend(SmbError::Exists)) if tries < 2 => tries += 1,
+                    Err(e) => return Err(open_failed(e)),
+                }
+            }
+            // A refused truncating open either waits for the break or
+            // fails the CREATE.
+            Err(r) => {
+                return Err(match r.wait {
+                    Some(wait) => Step::Wait(wait, Stage::AfterHandleBreak),
+                    None => fail(r.status),
+                });
+            }
+        }
+    }
+}
+
+/// The backend open: the one a truncating attempt already ran, or a fresh
+/// one. Before the fresh open, the extended attributes of an overwrite or
+/// supersede are replaced, so a set that fails leaves the file as it was,
+/// and a CREATE that would make a file with extended attributes it refuses
+/// fails, unless the file is there and the CREATE opens it.
+async fn opened_and_replaced(
+    share: &ShareBindings,
+    path: &SmbPath,
+    args: &CreateArgs,
+    reserved: &Option<FileRef>,
+    opened: Option<(Box<dyn Handle>, OpenAction)>,
+    stream: Option<&StreamName>,
+    open_failed: &impl Fn(Failed) -> Step,
+) -> Result<(Box<dyn Handle>, OpenAction), Step> {
+    let fail = |status| Step::Done(HandlerResponse::err(status));
+    // An overwrite or supersede replaces the file's extended attributes
+    // before it truncates the file, so a set that fails leaves the file
+    // as it was. A directory, which the truncating open refuses, keeps
+    // them.
+    let mut replaced = None;
+    if let (Some(file), None) = (reserved.as_ref(), opened.as_ref().map(|_| ()))
+        && stream.is_none()
+        && share.extended_attributes
+        && !file.is_directory()
+    {
+        match replace_eas_of(share, path, file, args).await {
+            Ok(old) => replaced = old,
+            Err(status) => return Err(fail(status)),
+        }
+    }
+    // A CREATE that would make a file with extended attributes it refuses
+    // fails, unless the file is there and the CREATE opens it.
+    if let (None, None, Err(status)) = (reserved.as_ref(), opened.as_ref(), &args.eas)
+        && stream.is_none()
+        && matches!(args.intent, OpenIntent::Create | OpenIntent::OpenOrCreate)
+        && !exists(share, path, args.opts).await
+    {
+        return Err(fail(*status));
+    }
+    let opened = match opened {
+        Some(opened) => opened,
+        None => match open_reported(share, path, stream, args.opts, replaced.is_some()).await {
+            Ok(opened) => opened,
+            Err(e) => {
+                // The file stays as it was, its extended attributes too.
+                if let (Some(old), Some(file)) = (&replaced, reserved.as_ref())
+                    && let Err(status) = restore_eas(share, path, file, &args.eas, old).await
+                {
+                    return Err(fail(status));
+                }
+                return Err(open_failed(e));
+            }
+        },
+    };
+    Ok(opened)
+}
+
+/// The stat the response reports, after the refusals the file's own state
+/// demands: a read-only file cannot be opened for deletion
+/// (MS-FSA 2.1.5.1.2.1), and an open that claims no knowledge of extended
+/// attributes fails when the file has ones the client would not see.
+async fn checked_stat(
+    handle: &dyn Handle,
+    action: OpenAction,
+    args: &CreateArgs,
+) -> Result<FileInfo, u32> {
+    let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
+    if args.delete_on_close && info.read_only {
+        return Err(ntstatus::STATUS_CANNOT_DELETE);
+    }
+    if action == OpenAction::Opened
+        && args.no_ea_knowledge
+        && let Err(status) = refuse_needed_eas(handle).await
+    {
+        return Err(status);
+    }
+    Ok(info)
+}
+
+/// The open's entry in the share's file table: the one a truncating open
+/// reserved, when it is still for this file, or a fresh one. A registration
+/// that has to wait for a lease break keeps the open and the seats it
+/// took, and the CREATE waits.
+///
+/// The many arguments are the pipeline's edge: the seats the earlier steps
+/// took and the open they produced, each named so the call site reads as
+/// the order the decisions happen in.
+#[allow(clippy::too_many_arguments)]
+async fn file_of(
+    share: &Arc<ShareBindings>,
+    path: &SmbPath,
+    action: OpenAction,
+    info: &FileInfo,
+    reserved: Option<FileRef>,
+    registered: bool,
+    open_request: &(impl Fn(bool, bool) -> OpenRequest + '_),
+    slot: OpenSlot,
+    lease_ref: Option<LeaseRef>,
+) -> Result<FileOrWait, Refused> {
+    match reserved {
+        Some(file) if registered || file.is_for(info, path) => {
+            Ok(FileOrWait::File(file, slot, lease_ref))
+        }
+        // The file was replaced between the two opens, or did not exist.
+        reserved => {
+            drop(reserved);
+            let overwrite = action == OpenAction::Overwritten;
+            match FileRef::register(share, info, path, open_request(overwrite, true)) {
+                Ok((file, None)) => Ok(FileOrWait::File(file, slot, lease_ref)),
+                Ok((file, Some(wait))) => Ok(FileOrWait::Wait(
+                    wait,
+                    Reserved {
+                        file,
+                        slot,
+                        lease_ref,
+                        opened: None,
+                        made_without_eas: false,
+                    },
+                )),
+                Err(r) => Err(r),
+            }
+        }
+    }
+}
+
+/// The file table's answer: the open's entry with the seats it did not
+/// spend, or a wait the CREATE takes with all of them.
+enum FileOrWait {
+    File(FileRef, OpenSlot, Option<LeaseRef>),
+    Wait(BreakWait, Reserved),
+}
+
+/// Whether the open this attempt made still lacks the extended attributes
+/// the CREATE asked for: a CREATE that gives up on the wait removes the
+/// file again, as a delete-on-close open of it would.
+fn made_without_eas(args: &CreateArgs, action: OpenAction, stream: Option<&StreamName>) -> bool {
+    action == OpenAction::Created
+        && stream.is_none()
+        && args.eas.as_ref().is_ok_and(|eas| !eas.is_empty())
+}
+
+/// Gives a file this CREATE made the extended attributes it asked for. A
+/// set that fails takes the file back, as a delete-on-close open of it
+/// would, once no other open is on it.
+async fn set_new_eas(
+    file: &FileRef,
+    handle: &dyn Handle,
+    path: &SmbPath,
+    args: &CreateArgs,
+    action: OpenAction,
+    stream: Option<&StreamName>,
+) -> Result<(), u32> {
+    let new_eas = match &args.eas {
+        Ok(eas) if action == OpenAction::Created && stream.is_none() => Ok(eas.as_slice()),
+        Err(status) if action == OpenAction::Created && stream.is_none() => Err(*status),
+        _ => Ok(&[][..]),
+    };
+    let made_with_eas = new_eas.is_ok_and(|eas| !eas.is_empty());
+    let set = match new_eas {
+        Ok(eas) if !eas.is_empty() => {
+            let _setting = file.lock_eas().await;
+            handle.set_eas(eas).await.map_err(|e| e.to_nt_status())
+        }
+        Ok(_) => Ok(()),
+        Err(status) => Err(status),
+    };
+    if let Err(status) = set {
+        debug!(status, path = %path, "extended attributes of a new file not set");
+        return Err(status);
+    }
+    let _ = made_with_eas;
+    Ok(())
+}
+
+/// What a lease the CREATE asked for was granted, and what holds its
+/// breaks back until the response is queued.
+struct Leases {
+    granted: Option<Granted>,
+    after_send: Option<GrantGuard>,
+}
+
+/// The lease this CREATE asked for, granted on the file it opened: none
+/// for a directory, and `None` when the open did not ask. A grant that
+/// fails takes the open back.
+async fn lease_granted(
+    server: &Arc<ServerState>,
+    file: &mut FileRef,
+    args: &CreateArgs,
+    stream: Option<&StreamName>,
+    info: &FileInfo,
+    lease_ref: Option<LeaseRef>,
+) -> Result<Leases, u32> {
+    if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
+        && (stream.is_some() || !info.is_directory)
+    {
+        match server
+            .leases
+            .grant(lease_ref, file, &lease, GRANTABLE_LEASE)
+        {
+            Ok((granted, guard)) => {
+                return Ok(Leases {
+                    granted: Some(granted),
+                    after_send: Some(guard),
+                });
+            }
+            Err(status) => return Err(status),
+        }
+    }
+    Ok(Leases {
+        granted: None,
+        after_send: None,
+    })
+}
+
+/// The durability of a durable handle the CREATE asked for: the server's
+/// timeout for a version 1 request, and the requested one clamped to it
+/// for version 2 (MS-SMB2 3.3.5.9.10).
+fn durability_of(server: &ServerState, args: &CreateArgs) -> Option<Durability> {
+    match args.queries.durable {
+        DurableAsk::V1 => Some(Durability {
+            create_guid: None,
+            timeout: server.durable.timeout,
+            replay_eligible: false,
+        }),
+        DurableAsk::V2(request) => Some(Durability {
+            create_guid: Some(request.create_guid),
+            timeout: v2_timeout(request.timeout_ms, server.durable.timeout),
+            replay_eligible: args.open_access & REPLAYABLE_ACCESS != 0,
+        }),
+        _ => None,
+    }
+}
+
+/// MS-SMB2 3.3.5.9.6, 3.3.5.9.10: an open asking for a durable handle
+/// gets one when its lease caches handles; any other open gets none and
+/// no durable context in the response. Anonymous sessions get none,
+/// since they all count as one user, and neither does a client without a
+/// ClientGuid. The PERSISTENT flag of a version 2 request is ignored:
+/// no share is continuously available.
+fn durable_of(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    share: &Arc<ShareBindings>,
+    args: &CreateArgs,
+    granted: &Option<Granted>,
+    durability: Option<Durability>,
+) -> Option<(DurableReg, Durability)> {
+    match (granted, &args.owner, durability) {
+        (Some(lease), Some(owner), Some(durability))
+            if lease.state.contains(LeaseState::H)
+                && share.durable_handles
+                && !lease.id.client.is_nil() =>
+        {
+            let lease = (lease.id, lease.version);
+            server
+                .durable
+                .register(owner, share, lease, durability, conn)
+                .map(|reg| (reg, durability))
+        }
+        _ => None,
+    }
+}
+
+/// The Open the CREATE adds to its tree: everything the attempt decided,
+/// in the order it decided it.
+#[allow(clippy::too_many_arguments)]
+fn open_of(
+    file_id: FileId,
+    handle: Box<dyn Handle>,
+    args: &CreateArgs,
+    info: &FileInfo,
+    action: OpenAction,
+    stream: Option<&StreamName>,
+    file: FileRef,
+    slot: OpenSlot,
+    durable: Option<DurableReg>,
+) -> Open {
+    Open {
         file_id,
         handle: Some(handle),
         granted_access: args.open_access,
@@ -1263,14 +1658,32 @@ async fn attempt(
         created: action != OpenAction::Opened,
         marked_deleted: Default::default(),
         ea_cursor: Default::default(),
-        eas_changed: AtomicBool::new(made_with_eas),
+        eas_changed: AtomicBool::new(
+            action == OpenAction::Created
+                && stream.is_none()
+                && args.eas.as_ref().is_ok_and(|eas| !eas.is_empty()),
+        ),
         resized: AtomicBool::new(stream.is_some() && action == OpenAction::Overwritten),
         moved_data: false,
-    };
-    let open_arc = Arc::new(tokio::sync::RwLock::new(open));
-    tree.opens.get_mut().insert(file_id, open_arc);
-    drop(tree);
+    }
+}
 
+/// The CREATE response: what the open did, the contexts it answers with,
+/// and the lease breaks held back until it is queued.
+#[allow(clippy::too_many_arguments)]
+fn create_reply(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    share: &ShareBindings,
+    args: &CreateArgs,
+    action: OpenAction,
+    info: FileInfo,
+    file_id: FileId,
+    volume_serial: u32,
+    granted: Option<Granted>,
+    durability: Option<Durability>,
+    after_send: Option<GrantGuard>,
+) -> Step {
     let create_action = match action {
         OpenAction::Opened => FILE_OPENED,
         OpenAction::Created => FILE_CREATED,
@@ -1279,7 +1692,7 @@ async fn attempt(
     };
     let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
     if let (Some(query), Some(model)) = (&args.aapl, &server.config.apple_model) {
-        answers.insert(0, aapl::reply(conn, &share, query, model));
+        answers.insert(0, aapl::reply(conn, share, query, model));
     }
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));
@@ -1306,7 +1719,7 @@ async fn attempt(
             },
         });
     }
-    let shown = match stream {
+    let shown = match args.stream.as_ref() {
         Some(_) => data_stream_info(info),
         None => info,
     };
