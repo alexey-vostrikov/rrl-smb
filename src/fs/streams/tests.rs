@@ -900,6 +900,109 @@ async fn spilled_streams_rename_and_remove_like_kept_ones() {
     assert_eq!(left, ["owner"]);
 }
 
+/// A spilled stream renamed over another spilled stream sets the replaced one aside first, and
+/// leaves nothing behind when the rename succeeds.
+///
+/// This is the branch a stream in the store takes and one in an attribute does not: the replaced
+/// data cannot be held in memory and put back by copying, so it is renamed to a side name inside the
+/// store and either dropped or restored. The test checks the end state an operator would see — one
+/// stream, the right bytes — and that no `aside` entry survives, because a directory that keeps them
+/// grows by the size of every replaced stream.
+#[tokio::test]
+async fn a_spilled_rename_over_a_spilled_stream_replaces_it_and_clears_the_aside() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let old = pattern(70_000);
+    let new = pattern(90_000);
+    create(&backend, "f.txt", "target", &old).await;
+    create(&backend, "f.txt", "source", &new).await;
+    // Both must be in the store for this to be the branch under test.
+    assert!(
+        spilled(&td, "f.txt", "target").exists(),
+        "the replaced stream is spilled"
+    );
+    assert!(
+        spilled(&td, "f.txt", "source").exists(),
+        "the replacing stream is spilled"
+    );
+
+    backend
+        .rename_stream(
+            &p("f.txt"),
+            id(&td, "f.txt"),
+            Some(&name("source")),
+            Some(&name("target")),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "target")).unwrap(), new);
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("target".to_string(), 90_000)],
+        "the source name is gone and the target holds the source's data"
+    );
+    let left: Vec<_> = std::fs::read_dir(entry(&td, "f.txt"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !left.iter().any(|name| name.contains("aside")),
+        "a replaced stream left in the store: {left:?}"
+    );
+}
+
+/// Renaming a stream onto the default stream of a file that has no default stream in it needs
+/// `replace`, and a refused rename loses nothing.
+///
+/// The refusal is a statement, not a half-step: a stream renamed to the default stream merges into
+/// the file itself, and doing that over data it was not told to replace would destroy the file's
+/// contents. The test pins both halves — the refusal and the survival of both streams.
+#[tokio::test]
+async fn a_refused_rename_to_the_default_stream_keeps_both_streams() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", b"stream data").await;
+    std::fs::write(td.path().join("f.txt"), b"file data").unwrap();
+
+    let refused = backend
+        .rename_stream(&p("f.txt"), id(&td, "f.txt"), Some(&name("s")), None, false)
+        .await;
+    assert!(
+        matches!(refused, Err(SmbError::Exists)),
+        "a rename that would overwrite the file needs `replace`: {refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(td.path().join("f.txt")).unwrap(),
+        b"file data",
+        "the file is untouched"
+    );
+    // The stream is kept as an attribute here, so it is read from there: `spilled` would need the
+    // store's record, and this file has none.
+    assert_eq!(
+        xattr(&td.path().join("f.txt"), "user.DosStream.s:$DATA").as_deref(),
+        Some(&b"stream data\0"[..]),
+        "and so is the stream"
+    );
+
+    // With `replace` it goes through, and the stream becomes the file's content.
+    backend
+        .rename_stream(&p("f.txt"), id(&td, "f.txt"), Some(&name("s")), None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(td.path().join("f.txt")).unwrap(),
+        b"stream data"
+    );
+    assert!(
+        streams(&backend, "f.txt").await.is_empty(),
+        "the stream is consumed"
+    );
+}
+
 /// Gives `to` the record of `from`, as a host copy with extended
 /// attributes does.
 fn copy_record(td: &TempDir, from: &str, to: &str) {
