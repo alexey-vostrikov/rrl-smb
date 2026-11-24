@@ -863,6 +863,81 @@ mod tests {
             .to_string()
     }
 
+    /// Every refusal says which socket failed, and the one an operator will actually meet gets its
+    /// own sentence.
+    ///
+    /// `HandlerError` is what `run` logs at a warning, and it is the only thing an operator sees when
+    /// the server is invisible on the network. The `AddrInUse` case is separated on purpose: port
+    /// 3702 held by another responder is the common cause, and "address already in use" reads as a
+    /// bug in this server rather than as "something else is already answering."
+    #[test]
+    fn a_handler_error_names_the_socket_that_failed() {
+        // A factory rather than a value: `io::Error` is not `Copy`, and the point of the test is to
+        // build the same error twice under two variants.
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "not permitted");
+        let in_use = || io::Error::new(io::ErrorKind::AddrInUse, "held by another responder");
+
+        let group = HandlerError::Group(denied()).to_string();
+        assert!(group.contains("group"), "{group}");
+        assert!(
+            group.contains("not permitted"),
+            "the cause travels: {group}"
+        );
+
+        // The same kind under the other variant is a different sentence: it is the port, not the
+        // group, and a reader has to be able to tell which.
+        let busy = HandlerError::Port(in_use()).to_string();
+        assert!(busy.contains("3702"), "{busy}");
+        assert!(
+            busy.contains("another"),
+            "it names the likely owner: {busy}"
+        );
+        assert_ne!(busy, group);
+
+        let port = HandlerError::Port(denied()).to_string();
+        assert!(port.contains("3702"), "{port}");
+        assert!(
+            !port.contains("another"),
+            "only the busy port guesses at an owner: {port}"
+        );
+        assert_ne!(port, busy);
+
+        let http = HandlerError::Http(denied()).to_string();
+        assert!(http.contains("metadata"), "{http}");
+    }
+
+    /// The host's interfaces are readable here, and loopback is among them.
+    ///
+    /// `interfaces` is the only place the server asks the operating system what exists, and its
+    /// failure path is a `None` that stops discovery from announcing anything at all. Reading it in
+    /// the test environment is worth doing: a `None` there would make every discovery test silently
+    /// vacuous, which is the failure a stand cannot report.
+    #[test]
+    fn the_hosts_interfaces_are_readable_and_include_loopback() {
+        let addrs = interfaces().expect("this host's interfaces are readable");
+        assert!(!addrs.is_empty(), "a host with none cannot run at all");
+        assert!(
+            addrs.iter().any(|a| a.loopback),
+            "loopback is an interface like any other: {:?}",
+            addrs.iter().map(|a| (&a.name, a.ip)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A send that fails is logged, and on every platform but macOS it is only a debug line.
+    ///
+    /// The behaviour under test is small but it has a branch that is easy to get wrong: the macOS
+    /// warning is logged once per process (it flips a flag), so a second failure must not repeat it.
+    /// On this platform the branch is compiled out, and what is left to check is that the call
+    /// records nothing and panics nowhere for either kind of error.
+    #[test]
+    fn a_failed_send_is_recorded_without_panicking() {
+        let shared = Shared::new(crate::discovery::wsd::samples::device(), Instant::now());
+        let to: SocketAddr = "127.0.0.1:3702".parse().expect("an address");
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::PermissionDenied] {
+            shared.send_failed(to, &io::Error::new(kind, "a send that failed"));
+        }
+    }
+
     /// The running handlers follow the links that exist, and an address that cannot be announced on
     /// is reported once rather than on every poll.
     ///

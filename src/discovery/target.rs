@@ -230,6 +230,28 @@ impl Scope {
 mod tests {
     use super::*;
 
+    /// An interface is found by its address, and an address nobody has is `None`.
+    ///
+    /// `if_index_of` is how `Scope::Addr` becomes the interface a packet leaves by. The two answers
+    /// it must give are as different as they look: loopback exists on every host this runs on, and
+    /// an address from TEST-NET-1 exists nowhere — so the pair distinguishes "found the interface"
+    /// from "returned something anyway". A function that answered `Some(0)` for both would pass a
+    /// test that only checked the first.
+    #[test]
+    fn an_interface_is_found_by_its_address() {
+        let loopback: IpAddr = "127.0.0.1".parse().expect("an address");
+        assert!(
+            if_index_of(loopback).is_some(),
+            "loopback is an interface; without it nothing this crate does over 127.0.0.1 works"
+        );
+        let nowhere: IpAddr = "192.0.2.1".parse().expect("an address");
+        assert_eq!(
+            if_index_of(nowhere),
+            None,
+            "TEST-NET-1 is an address no interface has"
+        );
+    }
+
     #[test]
     fn names_are_one_label_without_control_characters() {
         // Decomposed and precomposed forms both pass as given.
