@@ -2014,7 +2014,7 @@ mod tests {
     use tokio::sync::{Notify, RwLock, Semaphore};
 
     use super::*;
-    use crate::backend::{BackendCapabilities, ShareBackend};
+    use crate::backend::{BackendCapabilities, DirEntry, ShareBackend};
     use crate::builder::Access;
     use crate::conn::state::{Session, TreeConnect};
     use crate::error::SmbResult;
@@ -2368,5 +2368,152 @@ mod tests {
         assert!(!created && opened.is_err());
         assert!(exists().await, "left to the other open");
         drop(other);
+    }
+
+    /// A memory backend whose handles fail `stat` for `failing` alone, as a
+    /// filesystem does when the file it opened is gone before the server
+    /// looks at it.
+    struct FailingStat {
+        inner: MemFsBackend,
+        failing: String,
+    }
+
+    #[async_trait]
+    impl ShareBackend for FailingStat {
+        async fn open(
+            &self,
+            path: &SmbPath,
+            opts: OpenOptions,
+        ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+            let (handle, action) = self.inner.open(path, opts).await?;
+            let fail = self.failing == path.display_backslash();
+            Ok((Box::new(FailingStatHandle(handle, fail)), action))
+        }
+
+        async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+            self.inner.unlink(path).await
+        }
+
+        async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+            self.inner.rename(from, to, replace).await
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    struct FailingStatHandle(Box<dyn Handle>, bool);
+
+    #[async_trait]
+    impl Handle for FailingStatHandle {
+        async fn read(&self, offset: u64, len: u32) -> SmbResult<bytes::Bytes> {
+            self.0.read(offset, len).await
+        }
+
+        async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
+            self.0.write(offset, data).await
+        }
+
+        async fn flush(&self) -> SmbResult<()> {
+            self.0.flush().await
+        }
+
+        async fn stat(&self) -> SmbResult<FileInfo> {
+            if self.1 {
+                return Err(SmbError::Io(std::io::Error::other("stat failed")));
+            }
+            self.0.stat().await
+        }
+
+        async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
+            self.0.set_times(times).await
+        }
+
+        async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
+            self.0.set_attributes(attributes).await
+        }
+
+        async fn truncate(&self, len: u64) -> SmbResult<()> {
+            self.0.truncate(len).await
+        }
+
+        async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+            self.0.list_dir(pattern).await
+        }
+
+        async fn close(self: Box<Self>) -> SmbResult<()> {
+            self.0.close().await
+        }
+    }
+
+    fn bindings(backend: MemFsBackend) -> Arc<ShareBindings> {
+        stat_bindings(backend, "")
+    }
+
+    fn stat_bindings(backend: MemFsBackend, failing: &str) -> Arc<ShareBindings> {
+        ShareBindings::new(
+            "s".to_string(),
+            Arc::new(FailingStat {
+                inner: backend,
+                failing: failing.to_string(),
+            }),
+            crate::server::ShareMode::Public,
+            std::collections::HashMap::new(),
+            false,
+            true,
+            true,
+        )
+    }
+
+    /// Every answer an overwrite or supersede of a directory stream
+    /// gives: the share root is refused, an existing directory collides,
+    /// a file is not a directory, one that went missing before the
+    /// answer is reported, and one that was never there is created
+    /// (MS-FSA 2.1.5.1.2, phase 6 and phase 7).
+    #[tokio::test]
+    async fn an_overwritten_directory_reports_what_the_open_found() {
+        let share = bindings(
+            MemFsBackend::new()
+                .with_dir("d")
+                .with_file("f.txt", b"data"),
+        );
+        let dir: SmbPath = "d".parse().unwrap();
+        let file: SmbPath = "f.txt".parse().unwrap();
+        let missing: SmbPath = "missing".parse().unwrap();
+
+        let root = overwritten_directory(&share, &SmbPath::root(), OpenIntent::OverwriteOrCreate)
+            .await
+            .unwrap_err();
+        assert_eq!(root, ntstatus::STATUS_ACCESS_DENIED);
+
+        let collision = overwritten_directory(&share, &dir, OpenIntent::OverwriteOrCreate)
+            .await
+            .unwrap_err();
+        assert_eq!(collision, ntstatus::STATUS_OBJECT_NAME_COLLISION);
+
+        let not_a_directory = overwritten_directory(&share, &file, OpenIntent::OverwriteOrCreate)
+            .await
+            .unwrap_err();
+        assert_eq!(not_a_directory, ntstatus::STATUS_NOT_A_DIRECTORY);
+
+        // A backend that cannot even look at what it opened says so
+        // instead of guessing.
+        let failing = stat_bindings(MemFsBackend::new().with_dir("d"), "d");
+        let failed = overwritten_directory(&failing, &dir, OpenIntent::Truncate)
+            .await
+            .unwrap_err();
+        assert_eq!(failed, ntstatus::STATUS_UNEXPECTED_IO_ERROR);
+
+        // SUPERSEDE and OVERWRITE_IF create the missing directory;
+        // OVERWRITE, which is a truncate, does not (MS-FSA phase 6).
+        let created = overwritten_directory(&share, &missing, OpenIntent::OverwriteOrCreate)
+            .await
+            .unwrap();
+        assert_eq!(created, OpenIntent::Create);
+        let missing_truncated = overwritten_directory(&share, &missing, OpenIntent::Truncate)
+            .await
+            .unwrap_err();
+        assert_eq!(missing_truncated, ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
     }
 }
