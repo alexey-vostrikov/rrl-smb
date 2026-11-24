@@ -1003,6 +1003,68 @@ async fn a_refused_rename_to_the_default_stream_keeps_both_streams() {
     );
 }
 
+/// A stream can be moved aside inside the store, put back, and dropped — the three steps a
+/// rename uses to replace data it cannot hold in memory.
+///
+/// They are exercised here directly, because the paths that call them are rollback paths: a rename
+/// only sets a stream aside when its target is in the store, and only restores it when the rename
+/// afterwards fails. Reaching the restore through a rename means injecting a failure into the
+/// filesystem at exactly the right moment, and a test that did that would be testing the injection.
+/// What is worth pinning is the property each step has: after `set_aside` the stream is no longer at
+/// its own name, after `restore` it is back, and after `drop_aside` it is gone for good — which is
+/// what makes "the replaced data is either restored or discarded, never both and never neither" true.
+#[test]
+fn a_stream_is_set_aside_restored_and_dropped_inside_the_store() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    // A stream large enough to be kept in the store, which is the only case these steps serve.
+    let data = pattern(100_000);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    rt.block_on(create(&backend, "f.txt", "s", &data));
+    assert!(
+        spilled(&td, "f.txt", "s").exists(),
+        "the stream is in the store"
+    );
+
+    // The store's own handle on the entry, which is what `Aside` works through.
+    let dir = Dir::open_ambient_dir(entry(&td, "f.txt"), cap_std::ambient_authority())
+        .expect("the entry directory");
+    let spilled = Spilled {
+        dir,
+        names: vec![name("s")],
+    };
+    let readable = |s: &Spilled| s.open(&name("s"), false);
+
+    assert!(
+        readable(&spilled).is_ok(),
+        "the stream is where the view says it is"
+    );
+
+    spilled.set_aside(&name("s")).unwrap();
+    assert!(
+        readable(&spilled).is_err(),
+        "a stream set aside is not at its own name: that is what makes the name free for the rename"
+    );
+
+    spilled.restore(&name("s")).unwrap();
+    assert!(readable(&spilled).is_ok(), "and it comes back where it was");
+
+    spilled.set_aside(&name("s")).unwrap();
+    spilled.drop_aside(&name("s")).unwrap();
+    assert!(
+        readable(&spilled).is_err(),
+        "a dropped aside is gone: the name is neither readable nor restorable"
+    );
+    assert!(
+        spilled.restore(&name("s")).is_err(),
+        "and restoring it afterwards must fail rather than resurrect nothing"
+    );
+}
+
 /// Gives `to` the record of `from`, as a host copy with extended
 /// attributes does.
 fn copy_record(td: &TempDir, from: &str, to: &str) {
