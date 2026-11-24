@@ -367,9 +367,159 @@ enum Request {
     Open(CreateArgs),
     Reconnect(Reconnect),
 }
+/// The access a CREATE ends up being granted, and what the checks along the way decided about it.
+///
+/// Five separate rules live here, and each one refuses rather than narrowing silently: the tree's own
+/// DELETE for a delete-on-close open, an empty `desired_access`, an access word wider than the tree
+/// grants, `FILE_NO_INTERMEDIATE_BUFFERING` dropping append (the one place a request is narrowed
+/// instead of refused, because MS-SMB2 says so), a creating disposition on a read-only tree, and the
+/// two delete-on-close rules of MS-FSA 2.1.5.1. Kept together because they are one decision — what
+/// this open may do — and split from `parse` because reading six refusals in the middle of a
+/// hundred-line function is how one of them stops being checked.
+struct AccessGrant {
+    maximal: u32,
+    granted: u32,
+    delete_on_close: bool,
+    new_attributes: u32,
+}
 
+fn open_access_of(
+    req: &CreateRequest,
+    options: u32,
+    intent: OpenIntent,
+    tree_access: crate::builder::Access,
+    path: &SmbPath,
+) -> Result<AccessGrant, u32> {
+    let maximal = maximal_access(tree_access);
+    let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
+    // MS-SMB2 3.3.5.9: the tree must allow DELETE.
+    if delete_on_close && maximal & DELETE == 0 {
+        warn!(path = %path, "delete-on-close open on read-only tree");
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    if req.desired_access == 0 {
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    let Some(mut granted) = granted_access(req.desired_access, maximal) else {
+        warn!(path = %path, "requested access exceeds tree access");
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    };
+    if options & FILE_NO_INTERMEDIATE_BUFFERING != 0 {
+        granted &= !FILE_APPEND_DATA;
+    }
+    // Disposition that creates: requires write permission.
+    if !tree_access.allows_write()
+        && matches!(
+            intent,
+            OpenIntent::Create
+                | OpenIntent::OpenOrCreate
+                | OpenIntent::OverwriteOrCreate
+                | OpenIntent::Truncate
+        )
+    {
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+
+    let new_attributes = req.file_attributes & VALID_SET_ATTRIBUTES;
+    if delete_on_close {
+        // MS-FSA 2.1.5.1: the open itself must request DELETE.
+        if granted & DELETE == 0 {
+            return Err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
+        // MS-FSA 2.1.5.1: a file created read-only cannot be deleted.
+        if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            return Err(ntstatus::STATUS_CANNOT_DELETE);
+        }
+    }
+    Ok(AccessGrant {
+        maximal,
+        granted,
+        delete_on_close,
+        new_attributes,
+    })
+}
+
+/// What a reconnect asks for, when the request is one.
+///
+/// A reconnect names an open the client already holds and asks the server to bind it to a new
+/// connection. It is deliberately parsed more leniently than a fresh open: a name that does not parse
+/// gives `None` rather than a refusal, because the client is re-binding an open that exists — the
+/// name is a hint for logging, not the thing being opened.
+struct ReconnectAsk {
+    file_id: FileId,
+    create_guid: Option<[u8; 16]>,
+    name: Option<(SmbPath, Option<StreamName>)>,
+    lease: Option<LeaseRequest>,
+}
+
+fn reconnect_of(
+    queries: &ContextQueries,
+    name: &[u8],
+    dialect: Option<Dialect>,
+    client: Uuid,
+) -> Result<Option<ReconnectAsk>, u32> {
+    let (file_id, create_guid) = match queries.durable {
+        DurableAsk::Reconnect(r) => (r.file_id, None),
+        DurableAsk::ReconnectV2(r) => (r.file_id, Some(r.create_guid)),
+        _ => return Ok(None),
+    };
+    let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
+    let path = utf16le_to_units(name)
+        .and_then(|u| parse_create_name(&u).ok())
+        .and_then(|(path, stream)| match stream {
+            StreamPart::Named(name) => Some((path, Some(name))),
+            StreamPart::NamedDirectory(_) => None,
+            _ => Some((path, None)),
+        });
+    Ok(Some(ReconnectAsk {
+        file_id,
+        create_guid,
+        name: path,
+        lease,
+    }))
+}
+
+/// The open intent a create disposition asks for, or `INVALID_PARAMETER` for one this server does
+/// not know.
+///
+/// The mapping is MS-SMB2 2.2.13.2.2's table, and the two overwriting dispositions collapse into
+/// one intent because the difference between them is decided later, by what the open finds: a
+/// supersede replaces the extended attributes, an overwrite keeps them.
+fn intent_of(disposition: u32) -> Result<OpenIntent, u32> {
+    match disposition {
+        FILE_SUPERSEDE | FILE_OVERWRITE_IF => Ok(OpenIntent::OverwriteOrCreate),
+        FILE_OPEN => Ok(OpenIntent::Open),
+        FILE_CREATE => Ok(OpenIntent::Create),
+        FILE_OPEN_IF => Ok(OpenIntent::OpenOrCreate),
+        FILE_OVERWRITE => Ok(OpenIntent::Truncate),
+        _ => Err(ntstatus::STATUS_INVALID_PARAMETER),
+    }
+}
+
+/// What a name's stream part says about whether the open is for a directory, and refuses the
+/// combinations that name nothing.
+///
+/// MS-FSA 2.1.5.1 phase 7, after the option checks of phase 1, which look at `FILE_DIRECTORY_FILE`
+/// only: `::$DATA` opens the data of a file, `::$INDEX_ALLOCATION` a directory, and a named stream
+/// the stream of a file or a directory. The backend never gets both flags, because a name that
+/// means both has no meaning to give it.
+fn stream_options(
+    stream: &StreamPart,
+    directory: bool,
+    non_directory: bool,
+) -> Result<(bool, bool), u32> {
+    match stream {
+        StreamPart::Data if directory => Err(ntstatus::STATUS_NOT_A_DIRECTORY),
+        StreamPart::Data => Ok((directory, true)),
+        StreamPart::Directory => Ok((true, false)),
+        StreamPart::NamedDirectory(_) => Err(ntstatus::STATUS_INVALID_PARAMETER),
+        StreamPart::Named(_) if directory => Err(ntstatus::STATUS_NOT_A_DIRECTORY),
+        StreamPart::Named(_) | StreamPart::None => Ok((directory, non_directory)),
+    }
+}
+
+/// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
 impl CreateArgs {
-    /// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
     async fn parse(
         server: &ServerState,
         conn: &Arc<Connection>,
@@ -397,28 +547,15 @@ impl CreateArgs {
         let queries = ContextQueries::parse(&req.create_contexts, dialect)
             .ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
         // A reconnect skips the checks of the name and of the open itself
-        // (MS-SMB2 3.3.5.9.7, 3.3.5.9.12).
-        let reconnect = match queries.durable {
-            DurableAsk::Reconnect(r) => Some((r.file_id, None)),
-            DurableAsk::ReconnectV2(r) => Some((r.file_id, Some(r.create_guid))),
-            _ => None,
-        };
-        if let Some((file_id, create_guid)) = reconnect {
-            let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
-            let name = utf16le_to_units(&req.name)
-                .and_then(|u| parse_create_name(&u).ok())
-                .and_then(|(path, stream)| match stream {
-                    StreamPart::Named(name) => Some((path, Some(name))),
-                    StreamPart::NamedDirectory(_) => None,
-                    _ => Some((path, None)),
-                });
+        // (MS-SMB2 3.3.5.9.7, 3.3.5.9.12), so it is answered before any of them run.
+        if let Some(reconnect) = reconnect_of(&queries, &req.name, dialect, client)? {
             return Ok(Request::Reconnect(Reconnect {
-                file_id,
-                create_guid,
-                name,
+                file_id: reconnect.file_id,
+                create_guid: reconnect.create_guid,
+                name: reconnect.name,
                 owner,
                 client,
-                lease,
+                lease: reconnect.lease,
                 queries,
             }));
         }
@@ -443,23 +580,15 @@ impl CreateArgs {
             return Err(ntstatus::STATUS_OBJECT_NAME_INVALID);
         }
 
-        // Translate disposition.
-        let mut intent = match req.create_disposition {
-            FILE_SUPERSEDE | FILE_OVERWRITE_IF => OpenIntent::OverwriteOrCreate,
-            FILE_OPEN => OpenIntent::Open,
-            FILE_CREATE => OpenIntent::Create,
-            FILE_OPEN_IF => OpenIntent::OpenOrCreate,
-            FILE_OVERWRITE => OpenIntent::Truncate,
-            _ => return Err(ntstatus::STATUS_INVALID_PARAMETER),
-        };
+        let mut intent = intent_of(req.create_disposition)?;
 
         let options = req.create_options;
         if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
             let on_stream = matches!(stream, StreamPart::Named(_) | StreamPart::NamedDirectory(_));
             return Err(unsupported(on_stream));
         }
-        let mut directory = options & FILE_DIRECTORY_FILE != 0;
-        let mut non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
+        let directory = options & FILE_DIRECTORY_FILE != 0;
+        let non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
         if directory
             && (options & !DIRECTORY_OPTIONS != 0
                 || !matches!(
@@ -469,22 +598,7 @@ impl CreateArgs {
         {
             return Err(ntstatus::STATUS_INVALID_PARAMETER);
         }
-        // MS-FSA 2.1.5.1 phase 7, after the option checks of phase 1, which
-        // look at FILE_DIRECTORY_FILE only: `::$DATA` opens the data of a
-        // file, `::$INDEX_ALLOCATION` a directory, and a named stream the
-        // stream of a file or directory. The backend never gets both
-        // `directory` and `non_directory`.
-        match &stream {
-            StreamPart::Data if directory => return Err(ntstatus::STATUS_NOT_A_DIRECTORY),
-            StreamPart::Data => non_directory = true,
-            StreamPart::Directory => {
-                directory = true;
-                non_directory = false;
-            }
-            StreamPart::NamedDirectory(_) => return Err(ntstatus::STATUS_INVALID_PARAMETER),
-            StreamPart::Named(_) if directory => return Err(ntstatus::STATUS_NOT_A_DIRECTORY),
-            StreamPart::Named(_) | StreamPart::None => {}
-        }
+        let (directory, non_directory) = stream_options(&stream, directory, non_directory)?;
         let named = match &stream {
             StreamPart::Named(name) => Some(name.clone()),
             _ => None,
@@ -516,47 +630,11 @@ impl CreateArgs {
             None
         };
 
-        let maximal = maximal_access(tree_access);
-        let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
-        // MS-SMB2 3.3.5.9: the tree must allow DELETE.
-        if delete_on_close && maximal & DELETE == 0 {
-            warn!(path = %path, "delete-on-close open on read-only tree");
-            return Err(ntstatus::STATUS_ACCESS_DENIED);
-        }
-        if req.desired_access == 0 {
-            return Err(ntstatus::STATUS_ACCESS_DENIED);
-        }
-        let Some(mut open_access) = granted_access(req.desired_access, maximal) else {
-            warn!(path = %path, "requested access exceeds tree access");
-            return Err(ntstatus::STATUS_ACCESS_DENIED);
-        };
-        if options & FILE_NO_INTERMEDIATE_BUFFERING != 0 {
-            open_access &= !FILE_APPEND_DATA;
-        }
-        // Disposition that creates: requires write permission.
-        if !tree_access.allows_write()
-            && matches!(
-                intent,
-                OpenIntent::Create
-                    | OpenIntent::OpenOrCreate
-                    | OpenIntent::OverwriteOrCreate
-                    | OpenIntent::Truncate
-            )
-        {
-            return Err(ntstatus::STATUS_ACCESS_DENIED);
-        }
-
-        let new_attributes = req.file_attributes & VALID_SET_ATTRIBUTES;
-        if delete_on_close {
-            // MS-FSA 2.1.5.1: the open itself must request DELETE.
-            if open_access & DELETE == 0 {
-                return Err(ntstatus::STATUS_INVALID_PARAMETER);
-            }
-            // MS-FSA 2.1.5.1: a file created read-only cannot be deleted.
-            if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
-                return Err(ntstatus::STATUS_CANNOT_DELETE);
-            }
-        }
+        let access = open_access_of(&req, options, intent, tree_access, &path)?;
+        let maximal = access.maximal;
+        let open_access = access.granted;
+        let delete_on_close = access.delete_on_close;
+        let new_attributes = access.new_attributes;
 
         let (eas, stream_exta) = match &queries.ea_buffer {
             Some(data) => create_eas(&share, data, named.is_some(), options)?,
