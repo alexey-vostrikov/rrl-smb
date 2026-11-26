@@ -3,8 +3,8 @@
 # Cargo.lock is committed. This crate is embedded in a daemon that ships to a stand: the
 # revision CI resolves has to be the revision the daemon gets.
 
-# cargo-mutants writes its report beside the crate
-/mutants.out
-/mutants.out.old
+# cargo-mutants writes its report here; the next run rotates the previous to `mutants.out.old`
+# instead of deleting it, so the pattern covers both.
+/mutants.out*
 .metrics/
 /docs/book/
