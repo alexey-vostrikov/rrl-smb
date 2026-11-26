@@ -257,10 +257,7 @@ async fn accept_kerberos(
 
     // A realm is not a share ACL: the identity is the user, and what it may reach is decided by the
     // share and the session, exactly as for an NTLM logon of the same name.
-    let smb_identity = Identity::User {
-        user: identity.user.clone(),
-        domain: identity.realm.clone(),
-    };
+    let smb_identity = Identity::user(identity.user.clone(), identity.realm.clone());
 
     let new_sid = if sid == 0 {
         if session_limit_reached(server, &*conn.sessions.read().await) {
@@ -389,10 +386,7 @@ async fn finish_kerberos(
 ) -> HandlerResponse {
     // A realm is not a share ACL: the identity is the user, and what it may reach is decided by the
     // share and the session, exactly as for an NTLM logon of the same name.
-    let smb_identity = Identity::User {
-        user: identity.user.clone(),
-        domain: identity.realm.clone(),
-    };
+    let smb_identity = Identity::user(identity.user.clone(), identity.realm.clone());
 
     // Reauthentication keeps the session and its trees, for the same user only (MS-SMB2 3.3.5.5.2).
     let existing = conn.sessions.read().await.get(&sid).cloned();

@@ -687,6 +687,7 @@ impl ShareBackend for S3Backend {
         &self,
         path: &SmbPath,
         opts: OpenOptions,
+        _caller: &crate::backend::Caller,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         self.shared.open(path, opts).await
     }

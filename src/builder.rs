@@ -97,6 +97,22 @@ impl Share {
         self
     }
 
+    /// Any principal that logged on, read and write: `Authenticated Users` with
+    /// `Change`. The share permission a domain gives a folder its members write to.
+    pub fn authenticated(mut self) -> Self {
+        self.mode = ShareMode::Authenticated;
+        self
+    }
+
+    /// Any principal that logged on, read only: `Authenticated Users` with
+    /// `Read`. The share permission AD gives `SYSVOL` - `Everyone: Read` on the
+    /// share, `Authenticated Users: Read` on the files - and the closest this
+    /// server gets to it in one mode, with no file ACL behind it yet.
+    pub fn authenticated_read_only(mut self) -> Self {
+        self.mode = ShareMode::AuthenticatedReadOnly;
+        self
+    }
+
     /// Grant `access` to the given (already-registered) user. Multiple calls
     /// accumulate.
     pub fn user(mut self, name: impl Into<String>, access: Access) -> Self {

@@ -55,15 +55,7 @@ async fn register_session(
 }
 
 async fn register_alice_session(server: &SmbServer) -> Arc<Connection> {
-    register_session(
-        server,
-        Identity::User {
-            user: "alice".to_string(),
-            domain: String::new(),
-        },
-        "home",
-    )
-    .await
+    register_session(server, Identity::user("alice", ""), "home").await
 }
 
 #[tokio::test]

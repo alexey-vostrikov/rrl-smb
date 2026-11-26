@@ -171,10 +171,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn alice() -> Identity {
-        Identity::User {
-            user: "alice".to_string(),
-            domain: String::new(),
-        }
+        Identity::user("alice", "")
     }
 
     async fn connection(

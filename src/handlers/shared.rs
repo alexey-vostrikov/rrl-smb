@@ -39,6 +39,19 @@ pub async fn lookup_tree(
         .ok_or(ntstatus::STATUS_NETWORK_NAME_DELETED)
 }
 
+/// Who the session `sid` acts as, for a backend that has to decide access.
+///
+/// The share ACL has already let the session in; this is the second layer - an NTFS ACL in AD, and
+/// here the identity a backend can check. A session that is gone answers anonymous rather than an
+/// error: the caller is about to fail on the same lookup, and a status invented here would be a
+/// second answer to one question.
+pub async fn caller_of(conn: &Arc<Connection>, sid: u64) -> crate::backend::Caller {
+    match lookup_session(conn, sid).await {
+        Ok(session) => crate::backend::Caller::new(session.read().await.identity.clone()),
+        Err(_) => crate::backend::Caller::anonymous(),
+    }
+}
+
 pub async fn lookup_session(conn: &Arc<Connection>, sid: u64) -> Result<Arc<RwLock<Session>>, u32> {
     if sid == 0 {
         return Err(ntstatus::STATUS_USER_SESSION_DELETED);

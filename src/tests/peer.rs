@@ -70,10 +70,7 @@ impl Peer {
             credits.grant(START_CREDITS, false);
         }
         let identity = if signed {
-            Identity::User {
-                user: "alice".to_string(),
-                domain: String::new(),
-            }
+            Identity::user("alice", "")
         } else {
             Identity::Anonymous
         };

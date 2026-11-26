@@ -861,10 +861,7 @@ mod tests {
 
     fn caller(user: Option<&str>, can_encrypt: bool) -> Caller {
         let identity = match user {
-            Some(name) => Identity::User {
-                user: name.to_string(),
-                domain: String::new(),
-            },
+            Some(name) => Identity::user(name, ""),
             None => Identity::Anonymous,
         };
         Caller {

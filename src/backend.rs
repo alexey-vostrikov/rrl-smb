@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use crate::ea::Ea;
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::proto::auth::ntlm::Identity;
 use crate::stream::{StreamInfo, StreamName};
 
 // ---------------------------------------------------------------------------
@@ -313,6 +314,25 @@ pub trait ShareBackend: Send + Sync + 'static {
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)>;
 
+    /// The same open, told who is asking.
+    ///
+    /// A share ACL is not the last word on access: AD gives `SYSVOL` a share permission of
+    /// `Everyone` and restricts the files with an NTFS ACL, and a backend that cannot see the caller
+    /// cannot be that second layer. The server calls this for every request a client makes.
+    ///
+    /// The default forwards to [`ShareBackend::open`], and that is a decision each backend makes
+    /// rather than an oversight: a store of public files has nothing to compare the caller against,
+    /// and one that serves a policy overrides this. A backend that enforces rights **must** override
+    /// both, or a caller that reached the plain `open` would be let through.
+    async fn open_as(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+        _caller: &Caller,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        self.open(path, opts).await
+    }
+
     /// Delete a file or an empty directory.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
@@ -507,6 +527,70 @@ pub trait ShareBackend: Send + Sync + 'static {
         _len: u64,
     ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
+    }
+}
+
+/// Who is asking, as a backend sees it.
+///
+/// Passed to [`ShareBackend::open`] because the share ACL is not the last word on access: AD gives a
+/// share permission of `Everyone` and restricts the files with an NTFS ACL, and a backend that
+/// cannot see the caller cannot be the second layer. A backend that serves public data ignores it;
+/// one that serves a policy does not.
+///
+/// The session key is deliberately absent: a backend has no business unsealing anything, and a value
+/// that is not there cannot be logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The principal that logged on, when one did.
+    identity: Identity,
+}
+
+impl Caller {
+    /// The caller a session acts as.
+    pub fn new(identity: Identity) -> Self {
+        Self { identity }
+    }
+
+    /// The caller of a request that has no session - a test, or a share served before any logon.
+    ///
+    /// Anonymous, because that is what the request is: a default that said "some user" would grant
+    /// access nobody proved.
+    pub fn anonymous() -> Self {
+        Self {
+            identity: Identity::Anonymous,
+        }
+    }
+
+    /// The identity behind the request.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// Whether a principal logged on: `S-1-5-11`, Authenticated Users.
+    pub fn is_authenticated(&self) -> bool {
+        self.identity.is_authenticated()
+    }
+
+    /// Whether the principal holds `sid`, itself or through a group.
+    pub fn holds(&self, sid: &crate::sid::Sid) -> bool {
+        self.identity.holds(sid)
+    }
+
+    /// The account name, for a log line, when there is one.
+    pub fn user(&self) -> Option<&str> {
+        match &self.identity {
+            Identity::User { user, .. } => Some(user),
+            Identity::Anonymous => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Caller {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Caller")
+            .field("identity", &self.identity)
+            .finish()
     }
 }
 
@@ -852,5 +936,63 @@ impl Default for VolumeInfo {
             label: None,
             max_name_length: 255,
         }
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    use crate::sid::Sid;
+
+    fn domain_group() -> Sid {
+        // `S-1-5-21-1004336348-1177238915-682003330-512`: Domain Admins of an example domain.
+        Sid::parse("S-1-5-21-1004336348-1177238915-682003330-512").expect("a SID")
+    }
+
+    /// A logon that carried no SIDs is still authenticated - and holds nothing by SID.
+    ///
+    /// The two answers are different questions, and conflating them is how a legitimate user is
+    /// denied: a Kerberos logon against a realm without PACs has a name and no SIDs, and the share
+    /// permission it must satisfy is `Authenticated Users`, which is about the logon.
+    #[test]
+    fn a_logon_without_sids_is_authenticated_and_holds_nothing_by_sid() {
+        let caller = Caller::new(Identity::user("alice", "EXAMPLE"));
+        assert!(caller.is_authenticated(), "a user logged on");
+        assert!(
+            caller.holds(&Sid::parse(crate::sid::AUTHENTICATED_USERS).expect("a SID")),
+            "S-1-5-11 is answered from the logon itself"
+        );
+        assert!(
+            caller.holds(&Sid::parse(crate::sid::EVERYONE).expect("a SID")),
+            "S-1-1-0 holds every principal, anonymous included"
+        );
+        assert!(!caller.holds(&domain_group()), "no SID was supplied");
+    }
+
+    /// The account's own SID and its groups both answer, and nobody else's does.
+    #[test]
+    fn a_group_membership_is_answered_and_a_stranger_is_not() {
+        let own = Sid::parse("S-1-5-21-1-2-3-1105").expect("a SID");
+        let caller = Caller::new(
+            Identity::user("alice", "EXAMPLE")
+                .with_principal(Some(own.clone()), vec![domain_group()]),
+        );
+        assert!(caller.holds(&own), "its own SID");
+        assert!(caller.holds(&domain_group()), "a group it holds");
+        assert!(
+            !caller.holds(&Sid::parse("S-1-5-21-1-2-3-1106").expect("a SID")),
+            "another account's SID"
+        );
+    }
+
+    /// Anonymous holds `Everyone` and nothing else: the distinction a file ACL exists to make.
+    #[test]
+    fn an_anonymous_caller_is_not_authenticated() {
+        let caller = Caller::anonymous();
+        assert!(!caller.is_authenticated());
+        assert!(caller.user().is_none(), "no name to log");
+        assert!(caller.holds(&Sid::parse(crate::sid::EVERYONE).expect("a SID")));
+        assert!(!caller.holds(&Sid::parse(crate::sid::AUTHENTICATED_USERS).expect("a SID")));
+        assert!(!caller.holds(&domain_group()));
     }
 }

@@ -37,6 +37,14 @@ pub enum ShareMode {
     PublicReadOnly,
     /// Default: closed share. Only users in the explicit `users` map allowed.
     AuthenticatedOnly,
+    /// Any principal that logged on, read and write.
+    ///
+    /// The mode AD spells as a share permission on `Authenticated Users`, and the reason it exists:
+    /// a domain has thousands of accounts, so a mode that takes a list of names cannot express
+    /// "anyone in the domain". Anonymous sessions are refused.
+    Authenticated,
+    /// Any principal that logged on, read only. The one `SYSVOL` needs.
+    AuthenticatedReadOnly,
 }
 
 #[derive(Clone)]
@@ -56,6 +64,10 @@ impl ShareAcl {
                 Identity::Anonymous => None,
                 Identity::User { user, .. } => self.users.get(user).copied(),
             },
+            // The two below are the same answer for every logged-on principal, and `None` for an
+            // anonymous one: what AD calls `Authenticated Users`, which a list of names cannot say.
+            ShareMode::Authenticated => identity.is_authenticated().then_some(Access::ReadWrite),
+            ShareMode::AuthenticatedReadOnly => identity.is_authenticated().then_some(Access::Read),
         }
     }
 }
@@ -1310,5 +1322,69 @@ impl ShutdownHandle {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn acl(mode: ShareMode) -> ShareAcl {
+        ShareAcl {
+            mode,
+            users: HashMap::new(),
+        }
+    }
+
+    fn alice() -> Identity {
+        Identity::user("alice", "EXAMPLE")
+    }
+
+    /// The mode `SYSVOL` needs: anybody who logged on reads, nobody else does.
+    ///
+    /// Before this existed the only choices were a list of names - which a domain cannot enumerate -
+    /// and `PublicReadOnly`, which hands a policy that says who may log on where to an anonymous
+    /// client. Both directions are checked, because a mode that admitted anonymous would pass a test
+    /// that only asked whether alice got in.
+    #[test]
+    fn authenticated_read_only_admits_a_logon_and_refuses_an_anonymous_session() {
+        let acl = acl(ShareMode::AuthenticatedReadOnly);
+        assert_eq!(
+            acl.authorize(&alice()),
+            Some(Access::Read),
+            "alice logged on"
+        );
+        assert_eq!(
+            acl.authorize(&Identity::Anonymous),
+            None,
+            "an anonymous client gets nothing"
+        );
+    }
+
+    #[test]
+    fn authenticated_admits_a_logon_to_write_and_still_refuses_anonymous() {
+        let acl = acl(ShareMode::Authenticated);
+        assert_eq!(acl.authorize(&alice()), Some(Access::ReadWrite));
+        assert_eq!(acl.authorize(&Identity::Anonymous), None);
+    }
+
+    /// The modes that were there keep their answers: a name list still decides by name, and the
+    /// public modes still admit anonymous.
+    #[test]
+    fn the_existing_modes_are_unchanged() {
+        assert_eq!(
+            acl(ShareMode::PublicReadOnly).authorize(&Identity::Anonymous),
+            Some(Access::Read)
+        );
+        assert_eq!(
+            acl(ShareMode::Public).authorize(&Identity::Anonymous),
+            Some(Access::ReadWrite)
+        );
+        assert_eq!(
+            acl(ShareMode::AuthenticatedOnly).authorize(&alice()),
+            None,
+            "a closed share admits nobody who is not listed"
+        );
     }
 }

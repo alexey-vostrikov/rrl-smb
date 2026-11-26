@@ -410,10 +410,7 @@ fn state_of(
 /// binding proved, and that is what a handler reads when it needs to know who is asking.
 fn caller(exchange: &Exchange) -> crate::server::Caller {
     let identity = match exchange.principal.as_deref() {
-        Some(user) => crate::proto::auth::ntlm::Identity::User {
-            user: user.to_string(),
-            domain: String::new(),
-        },
+        Some(user) => crate::proto::auth::ntlm::Identity::user(user, ""),
         None => crate::proto::auth::ntlm::Identity::Anonymous,
     };
     crate::server::Caller {
@@ -858,7 +855,7 @@ fn ntlm_answer(token: &[u8], endpoint: &Endpoint, exchange: &mut Exchange) -> Op
                         "rpc: NTLM accepted over this endpoint"
                     );
                     exchange.principal = Some(match &outcome.identity {
-                        crate::proto::auth::ntlm::Identity::User { user, domain } => {
+                        crate::proto::auth::ntlm::Identity::User { user, domain, .. } => {
                             format!("{domain}\\{user}")
                         }
                         crate::proto::auth::ntlm::Identity::Anonymous => "anonymous".to_string(),
@@ -2623,7 +2620,7 @@ mod tests {
         exchange.principal = Some("machine$@AD.EXAMPLE.COM".to_string());
         let who = caller(&exchange);
         match who.identity {
-            crate::proto::auth::ntlm::Identity::User { user, domain } => {
+            crate::proto::auth::ntlm::Identity::User { user, domain, .. } => {
                 assert_eq!(user, "machine$@AD.EXAMPLE.COM");
                 assert!(domain.is_empty(), "the principal carries its own realm");
             }

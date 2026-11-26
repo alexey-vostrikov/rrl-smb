@@ -1379,10 +1379,7 @@ mod tests {
             credits.grant(64, false);
         }
 
-        let identity = Identity::User {
-            user: "alice".to_string(),
-            domain: String::new(),
-        };
+        let identity = Identity::user("alice", "");
         let session = Session::new(identity, [0; 16], KEY, true, None);
         let share = state.find_share("home").await.expect("share");
         let tree = TreeConnect::new(1, share, Access::ReadWrite);

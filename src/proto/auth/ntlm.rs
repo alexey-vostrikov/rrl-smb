@@ -606,10 +606,104 @@ impl NtlmMac {
 // --- Public state machine ---------------------------------------------------
 
 /// Identity recovered from a successful (or anonymous) authentication.
+///
+/// # Why a SID and not only a name
+///
+/// A name answers *who logged on*; a share ACL asks *what it is a member of*. `Authenticated
+/// Users` is `S-1-5-11`, a domain group is `S-1-5-21-...`, and neither can be expressed as a set of
+/// user names - which is why `AuthenticatedOnly` used to need a list nobody can maintain.
+///
+/// The SID and the groups are optional because not every logon carries them. A realm that is not a
+/// directory issues no PAC, so a Kerberos logon may have a name and nothing else; an NTLM logon
+/// reads them from whoever owns the password store. `None` is "the server does not know", never
+/// "the principal holds nothing": an access check that treated the two alike would deny a
+/// legitimate user, so the checks that need a SID refuse when it is absent and say why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
     Anonymous,
-    User { user: String, domain: String },
+    User {
+        user: String,
+        domain: String,
+        /// The principal's own SID, `objectSid` of the account.
+        sid: Option<crate::sid::Sid>,
+        /// The SIDs of the groups it holds, in the token's sense: transitive, as a directory
+        /// expands `memberOf` for a token built from `tokenGroups`.
+        groups: Vec<crate::sid::Sid>,
+    },
+}
+
+impl Identity {
+    /// A user identity with no SIDs known yet.
+    pub fn user(user: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self::User {
+            user: user.into(),
+            domain: domain.into(),
+            sid: None,
+            groups: Vec::new(),
+        }
+    }
+
+    /// The same identity with the SIDs a password store or a PAC supplied.
+    pub fn with_principal(
+        self,
+        sid: Option<crate::sid::Sid>,
+        groups: Vec<crate::sid::Sid>,
+    ) -> Self {
+        match self {
+            Self::User { user, domain, .. } => Self::User {
+                user,
+                domain,
+                sid,
+                groups,
+            },
+            Self::Anonymous => Self::Anonymous,
+        }
+    }
+
+    /// The account's own SID, when the logon carried one.
+    pub fn sid(&self) -> Option<&crate::sid::Sid> {
+        match self {
+            Self::User { sid, .. } => sid.as_ref(),
+            Self::Anonymous => None,
+        }
+    }
+
+    /// The groups the account holds, empty when the logon carried none.
+    pub fn groups(&self) -> &[crate::sid::Sid] {
+        match self {
+            Self::User { groups, .. } => groups,
+            Self::Anonymous => &[],
+        }
+    }
+
+    /// Whether this is a principal that logged on - `S-1-5-11`, Authenticated Users.
+    ///
+    /// Not a SID lookup: the membership is the fact that a logon happened at all, and a Kerberos
+    /// logon against a realm without PACs has no SID to compare. Samba and Windows both treat it
+    /// this way, which is what makes a share permission of `Everyone: Read` plus a file ACL of
+    /// `Authenticated Users` mean "logged on" and not "was listed".
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, Self::User { .. })
+    }
+
+    /// Whether the principal holds `sid`, either as itself or as a group.
+    ///
+    /// `Everyone` and `Authenticated Users` are answered from the logon itself, because a token
+    /// does not have to name them: every token holds both.
+    pub fn holds(&self, sid: &crate::sid::Sid) -> bool {
+        if sid.is_everyone() {
+            return true;
+        }
+        if sid.is_authenticated_users() {
+            return self.is_authenticated();
+        }
+        match self {
+            Self::User {
+                sid: own, groups, ..
+            } => own.as_ref() == Some(sid) || groups.iter().any(|held| held == sid),
+            Self::Anonymous => false,
+        }
+    }
 }
 
 /// Successful authentication outcome: identity + 16-byte session key.
@@ -964,10 +1058,7 @@ impl NtlmServer {
         }
 
         Ok(AuthOutcome {
-            identity: Identity::User {
-                user: auth.user.clone(),
-                domain: auth.domain.clone(),
-            },
+            identity: Identity::user(auth.user.clone(), auth.domain.clone()),
             session_key,
             flags: auth.flags,
             mic_present: auth.mic.is_some(),
@@ -1320,13 +1411,7 @@ mod tests {
             })
             .expect("auth should succeed");
 
-        assert_eq!(
-            outcome.identity,
-            Identity::User {
-                user: "User".to_string(),
-                domain: "Domain".to_string()
-            }
-        );
+        assert_eq!(outcome.identity, Identity::user("User", "Domain"));
 
         // Wrong password fails.
         let bad = UserCreds::from_password("WrongPassword");
@@ -1628,13 +1713,7 @@ mod tests {
         let outcome = srv
             .authenticate(&guest(""), empty_password)
             .expect("empty password");
-        assert_eq!(
-            outcome.identity,
-            Identity::User {
-                user: "GUEST".to_string(),
-                domain: String::new()
-            }
-        );
+        assert_eq!(outcome.identity, Identity::user("GUEST", ""));
         assert!(outcome.mic_present);
 
         assert!(srv.authenticate(&guest("secret"), empty_password).is_err());

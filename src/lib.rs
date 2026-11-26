@@ -474,10 +474,10 @@ mod tests {
     pub(crate) mod recorder;
     #[cfg(feature = "s3")]
     mod s3;
-    mod stream_leases;
     mod streams;
     pub(crate) mod util;
 }
+mod sid;
 mod utils;
 mod wildcard;
 
@@ -510,6 +510,7 @@ pub use server::{
     ChannelState, ConfigError, ConfigHandle, LogonUsers, MachineAccount, MachineAccounts,
     MachinePasswords, MachineSecrets, ShareMode, ShutdownHandle, SmbServer,
 };
+pub use sid::Sid;
 pub use stream::{StreamInfo, StreamName};
 
 pub mod wire {

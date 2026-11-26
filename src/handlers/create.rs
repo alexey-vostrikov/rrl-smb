@@ -547,6 +547,10 @@ impl CreateArgs {
         };
         let dialect = *conn.dialect.read().await;
         let client = *conn.client_guid.read().await;
+        // Who asks, for the backend calls this parse makes: a CREATE that overlays a directory
+        // asks whether it is a directory, and a backend that answers differently per principal -
+        // a policy share, an ACL-aware store - needs to know which one.
+        let caller = crate::handlers::shared::caller_of(conn, hdr.session_id).await;
 
         let queries = ContextQueries::parse(&req.create_contexts, dialect)
             .ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
@@ -648,7 +652,7 @@ impl CreateArgs {
         if stream == StreamPart::Directory
             && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate)
         {
-            intent = overwritten_directory(&share, &path, intent).await?;
+            intent = overwritten_directory(&share, &path, intent, &caller).await?;
         }
 
         let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
@@ -1089,6 +1093,9 @@ async fn attempt(
     };
     let share = Arc::clone(&tree_arc.read().await.share);
     let backend = Arc::clone(&share.backend);
+    // Who is asking, from the session the tree belongs to: the share ACL let the session in, and a
+    // backend that serves a policy decides the rest from this.
+    let caller = crate::handlers::shared::caller_of(conn, place.session_id).await;
     let path = &args.path;
     // No rename runs from the first backend call until the open is in the
     // file table under `path`, so the open, and the change it reports,
@@ -1096,7 +1103,8 @@ async fn attempt(
     let names = share.files.names_lock().await;
     if args.stream_exta
         && matches!(stage, Stage::Start)
-        && let Err(status) = refuse_stream_exta(&share, path, args.create_disposition).await
+        && let Err(status) =
+            refuse_stream_exta(&share, path, args.create_disposition, &caller).await
     {
         return fail(status);
     }
@@ -1114,6 +1122,7 @@ async fn attempt(
         stage,
         &open_request,
         break_handles,
+        &caller,
     )
     .await
     {
@@ -1142,6 +1151,7 @@ async fn attempt(
         opened,
         stream,
         &open_failed,
+        &caller,
     )
     .await
     {
@@ -1365,11 +1375,23 @@ async fn seats_of(
     stage: Stage,
     open_request: &(impl Fn(bool, bool) -> OpenRequest + '_),
     break_handles: bool,
+    caller: &crate::backend::Caller,
 ) -> Result<Seats, Step> {
     match stage {
         Stage::Reserved(reserved) => resumed(reserved).await,
         Stage::Start | Stage::AfterHandleBreak => {
-            match started(server, conn, share, path, args, open_request, break_handles).await {
+            match started(
+                server,
+                conn,
+                share,
+                path,
+                args,
+                open_request,
+                break_handles,
+                caller,
+            )
+            .await
+            {
                 Ok(SeatsOrWait::Seats(seats)) => Ok(seats),
                 Ok(SeatsOrWait::Wait(wait, reserved)) => {
                     Err(Step::Wait(wait, Stage::Reserved(Box::new(reserved))))
@@ -1455,6 +1477,10 @@ async fn resumed(reserved: Box<Reserved>) -> Result<Seats, Step> {
 /// no other open slips in while the backend truncates, and clients caching
 /// writes write back before it does. A file that is missing is created
 /// instead; one that appears meanwhile is checked again.
+// Eight arguments, and the eighth - who is asking - is the one that cannot be folded into the
+// others: a `CreateArgs` is what the client sent, a `Place` is where it landed, and the caller is
+// who it is. Grouping them into a struct here would move the same eight fields one level down.
+#[allow(clippy::too_many_arguments)]
 async fn started(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
@@ -1463,6 +1489,7 @@ async fn started(
     args: &CreateArgs,
     open_request: &(impl Fn(bool, bool) -> OpenRequest + '_),
     break_handles: bool,
+    caller: &crate::backend::Caller,
 ) -> Result<SeatsOrWait, Step> {
     let fail = |status| Step::Failed(status);
     let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
@@ -1500,7 +1527,7 @@ async fn started(
             no_ea_knowledge: args.no_ea_knowledge,
             attributes: stream.is_none().then_some(args.new_attributes),
         };
-        match reserve_existing(share, path, stream, args.opts, checks, request).await {
+        match reserve_existing(share, path, stream, args.opts, checks, request, caller).await {
             Ok(Probe::Reserved(file, Some(wait))) => {
                 return Ok(SeatsOrWait::Wait(
                     wait,
@@ -1535,7 +1562,7 @@ async fn started(
                     intent: OpenIntent::Create,
                     ..args.opts
                 };
-                match open_reported(share, path, stream, create, false).await {
+                match open_reported(share, path, stream, create, false, caller).await {
                     Ok(opened) => {
                         return Ok(SeatsOrWait::Seats(Seats {
                             slot,
@@ -1566,6 +1593,8 @@ async fn started(
 /// supersede are replaced, so a set that fails leaves the file as it was,
 /// and a CREATE that would make a file with extended attributes it refuses
 /// fails, unless the file is there and the CREATE opens it.
+// The caller is the eighth for the same reason as in `started`: it is not part of the request.
+#[allow(clippy::too_many_arguments)]
 async fn opened_and_replaced(
     share: &ShareBindings,
     path: &SmbPath,
@@ -1574,6 +1603,7 @@ async fn opened_and_replaced(
     opened: Option<(Box<dyn Handle>, OpenAction)>,
     stream: Option<&StreamName>,
     open_failed: &impl Fn(Failed) -> Step,
+    caller: &crate::backend::Caller,
 ) -> Result<(Box<dyn Handle>, OpenAction), Step> {
     let fail = |status| Step::Failed(status);
     // An overwrite or supersede replaces the file's extended attributes
@@ -1586,7 +1616,7 @@ async fn opened_and_replaced(
         && share.extended_attributes
         && !file.is_directory()
     {
-        match replace_eas_of(share, path, file, args).await {
+        match replace_eas_of(share, path, file, args, caller).await {
             Ok(old) => replaced = old,
             Err(status) => return Err(fail(status)),
         }
@@ -1596,24 +1626,27 @@ async fn opened_and_replaced(
     if let (None, None, Err(status)) = (reserved.as_ref(), opened.as_ref(), &args.eas)
         && stream.is_none()
         && matches!(args.intent, OpenIntent::Create | OpenIntent::OpenOrCreate)
-        && !exists(share, path, args.opts).await
+        && !exists(share, path, args.opts, caller).await
     {
         return Err(fail(*status));
     }
     let opened = match opened {
         Some(opened) => opened,
-        None => match open_reported(share, path, stream, args.opts, replaced.is_some()).await {
-            Ok(opened) => opened,
-            Err(e) => {
-                // The file stays as it was, its extended attributes too.
-                if let (Some(old), Some(file)) = (&replaced, reserved.as_ref())
-                    && let Err(status) = restore_eas(share, path, file, &args.eas, old).await
-                {
-                    return Err(fail(status));
+        None => {
+            match open_reported(share, path, stream, args.opts, replaced.is_some(), caller).await {
+                Ok(opened) => opened,
+                Err(e) => {
+                    // The file stays as it was, its extended attributes too.
+                    if let (Some(old), Some(file)) = (&replaced, reserved.as_ref())
+                        && let Err(status) =
+                            restore_eas(share, path, file, &args.eas, old, caller).await
+                    {
+                        return Err(fail(status));
+                    }
+                    return Err(open_failed(e));
                 }
-                return Err(open_failed(e));
             }
-        },
+        }
     };
     Ok(opened)
 }
@@ -1880,6 +1913,7 @@ async fn open_reported(
     stream: Option<&StreamName>,
     opts: OpenOptions,
     eas_replaced: bool,
+    caller: &crate::backend::Caller,
 ) -> Result<(Box<dyn Handle>, OpenAction), Failed> {
     let names = if opts.directory {
         FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1895,7 +1929,7 @@ async fn open_reported(
     }];
     let may_create = !matches!(opts.intent, OpenIntent::Open | OpenIntent::Truncate);
     let expected = may_create.then(|| share.watches.expect(&added, None));
-    let (created, opened) = backend_open(share, path, stream, opts).await;
+    let (created, opened) = backend_open(share, path, stream, opts, caller).await;
     let action = opened.as_ref().ok().map(|(_, action)| *action);
     let heard = share.named_streams && !share.watches.is_empty();
     // An overwrite of the file reports the removal of each of its named
@@ -2037,10 +2071,11 @@ async fn backend_open(
     path: &SmbPath,
     stream: Option<&StreamName>,
     opts: OpenOptions,
+    caller: &crate::backend::Caller,
 ) -> (bool, Result<(Box<dyn Handle>, OpenAction), Failed>) {
     let backend = share.backend.as_ref();
     let Some(stream) = stream else {
-        let opened = backend.open(path, opts).await;
+        let opened = backend.open_as(path, opts, caller).await;
         let created = matches!(opened, Ok((_, OpenAction::Created)));
         return (created, opened.map_err(Failed::from));
     };
@@ -2056,7 +2091,7 @@ async fn backend_open(
         non_directory: false,
         delete_on_close: false,
     };
-    let (file, action) = match backend.open(path, file_opts).await {
+    let (file, action) = match backend.open_as(path, file_opts, caller).await {
         Ok(opened) => opened,
         Err(e) => return (false, Err(stream_error(e).into())),
     };
@@ -2228,6 +2263,7 @@ async fn reserve_existing(
     opts: OpenOptions,
     checks: Checks,
     req: OpenRequest,
+    caller: &crate::backend::Caller,
 ) -> Result<Probe, Refused> {
     let probe = OpenOptions {
         intent: OpenIntent::Open,
@@ -2240,9 +2276,9 @@ async fn reserve_existing(
         write_attributes: false,
         ..probe
     };
-    let mut opened = backend_open(share, path, stream, read_only).await.1;
+    let mut opened = backend_open(share, path, stream, read_only, caller).await.1;
     if matches!(opened, Err(ref e) if !e.is_missing()) && probe.write {
-        opened = backend_open(share, path, stream, probe).await.1;
+        opened = backend_open(share, path, stream, probe, caller).await.1;
     }
     let handle = match opened {
         Ok((handle, _)) => handle,
@@ -2351,8 +2387,13 @@ async fn refuse_stream_exta(
     share: &ShareBindings,
     path: &SmbPath,
     disposition: u32,
+    caller: &crate::backend::Caller,
 ) -> Result<(), u32> {
-    match share.backend.open(path, OpenOptions::default()).await {
+    match share
+        .backend
+        .open_as(path, OpenOptions::default(), caller)
+        .await
+    {
         Ok((file, _)) => {
             let _ = file.close().await;
         }
@@ -2370,7 +2411,12 @@ async fn refuse_stream_exta(
 
 /// Whether a file is at `path`, for a CREATE that would make one with
 /// extended attributes it refuses: then it fails, and makes nothing.
-async fn exists(share: &ShareBindings, path: &SmbPath, opts: OpenOptions) -> bool {
+async fn exists(
+    share: &ShareBindings,
+    path: &SmbPath,
+    opts: OpenOptions,
+    caller: &crate::backend::Caller,
+) -> bool {
     let probe = OpenOptions {
         read: true,
         write: false,
@@ -2379,7 +2425,7 @@ async fn exists(share: &ShareBindings, path: &SmbPath, opts: OpenOptions) -> boo
         delete_on_close: false,
         ..opts
     };
-    match share.backend.open(path, probe).await {
+    match share.backend.open_as(path, probe, caller).await {
         Ok((file, _)) => {
             let _ = file.close().await;
             true
@@ -2397,6 +2443,7 @@ async fn replace_eas_of(
     path: &SmbPath,
     file: &FileRef,
     args: &CreateArgs,
+    caller: &crate::backend::Caller,
 ) -> Result<Option<Vec<Ea>>, u32> {
     let eas = args.eas.as_deref().map_err(|&status| status)?;
     let opts = OpenOptions {
@@ -2409,7 +2456,7 @@ async fn replace_eas_of(
     };
     let (handle, _) = share
         .backend
-        .open(path, opts)
+        .open_as(path, opts, caller)
         .await
         .map_err(|e| e.to_nt_status())?;
     let setting = file.lock_eas().await;
@@ -2431,10 +2478,14 @@ async fn restore_eas(
     file: &FileRef,
     new: &Result<Vec<Ea>, u32>,
     old: &[Ea],
+    caller: &crate::backend::Caller,
 ) -> Result<(), u32> {
     let new = new.as_deref().unwrap_or_default();
     let restored = async {
-        let (handle, _) = share.backend.open(path, OpenOptions::default()).await?;
+        let (handle, _) = share
+            .backend
+            .open_as(path, OpenOptions::default(), caller)
+            .await?;
         let setting = file.lock_eas().await;
         let kept: HashSet<String> = old.iter().map(|ea| ea::name_key(&ea.name)).collect();
         let mut changes: Vec<Ea> = new
@@ -2497,11 +2548,16 @@ async fn overwritten_directory(
     share: &ShareBindings,
     path: &SmbPath,
     intent: OpenIntent,
+    caller: &crate::backend::Caller,
 ) -> Result<OpenIntent, u32> {
     if path.is_root() {
         return Err(ntstatus::STATUS_ACCESS_DENIED);
     }
-    let (handle, _) = match share.backend.open(path, OpenOptions::default()).await {
+    let (handle, _) = match share
+        .backend
+        .open_as(path, OpenOptions::default(), caller)
+        .await
+    {
         Ok(opened) => opened,
         Err(SmbError::NotFound) if intent == OpenIntent::OverwriteOrCreate => {
             return Ok(OpenIntent::Create);
@@ -2896,7 +2952,14 @@ mod tests {
                 .is_ok()
         };
 
-        let (created, opened) = backend_open(&share, &path, Some(&stream), opts).await;
+        let (created, opened) = backend_open(
+            &share,
+            &path,
+            Some(&stream),
+            opts,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await;
         assert!(!created);
         assert_eq!(
             opened.err().map(|e| e.status()),
@@ -2912,7 +2975,14 @@ mod tests {
         let other = FileRef::register(&share, &FileInfo::new("new"), &path, sharing.into())
             .unwrap()
             .0;
-        let (created, opened) = backend_open(&share, &path, Some(&stream), opts).await;
+        let (created, opened) = backend_open(
+            &share,
+            &path,
+            Some(&stream),
+            opts,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await;
         assert!(!created && opened.is_err());
         assert!(exists().await, "left to the other open");
         drop(other);
@@ -3030,38 +3100,68 @@ mod tests {
         let file: SmbPath = "f.txt".parse().unwrap();
         let missing: SmbPath = "missing".parse().unwrap();
 
-        let root = overwritten_directory(&share, &SmbPath::root(), OpenIntent::OverwriteOrCreate)
-            .await
-            .unwrap_err();
+        let root = overwritten_directory(
+            &share,
+            &SmbPath::root(),
+            OpenIntent::OverwriteOrCreate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(root, ntstatus::STATUS_ACCESS_DENIED);
 
-        let collision = overwritten_directory(&share, &dir, OpenIntent::OverwriteOrCreate)
-            .await
-            .unwrap_err();
+        let collision = overwritten_directory(
+            &share,
+            &dir,
+            OpenIntent::OverwriteOrCreate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(collision, ntstatus::STATUS_OBJECT_NAME_COLLISION);
 
-        let not_a_directory = overwritten_directory(&share, &file, OpenIntent::OverwriteOrCreate)
-            .await
-            .unwrap_err();
+        let not_a_directory = overwritten_directory(
+            &share,
+            &file,
+            OpenIntent::OverwriteOrCreate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(not_a_directory, ntstatus::STATUS_NOT_A_DIRECTORY);
 
         // A backend that cannot even look at what it opened says so
         // instead of guessing.
         let failing = stat_bindings(MemFsBackend::new().with_dir("d"), "d");
-        let failed = overwritten_directory(&failing, &dir, OpenIntent::Truncate)
-            .await
-            .unwrap_err();
+        let failed = overwritten_directory(
+            &failing,
+            &dir,
+            OpenIntent::Truncate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(failed, ntstatus::STATUS_UNEXPECTED_IO_ERROR);
 
         // SUPERSEDE and OVERWRITE_IF create the missing directory;
         // OVERWRITE, which is a truncate, does not (MS-FSA phase 6).
-        let created = overwritten_directory(&share, &missing, OpenIntent::OverwriteOrCreate)
-            .await
-            .unwrap();
+        let created = overwritten_directory(
+            &share,
+            &missing,
+            OpenIntent::OverwriteOrCreate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap();
         assert_eq!(created, OpenIntent::Create);
-        let missing_truncated = overwritten_directory(&share, &missing, OpenIntent::Truncate)
-            .await
-            .unwrap_err();
+        let missing_truncated = overwritten_directory(
+            &share,
+            &missing,
+            OpenIntent::Truncate,
+            &crate::backend::Caller::anonymous(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(missing_truncated, ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
     }
 }
