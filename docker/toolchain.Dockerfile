@@ -13,6 +13,7 @@
 #   ~/DevOps/rrl-kdc/docker/toolchain.Dockerfile              (rrl-kdc)
 #   ~/DevOps/rrl-crypto/docker/toolchain.Dockerfile           (rrl-crypto)
 #   ~/DevOps/rrl-krb-common/docker/toolchain.Dockerfile       (rrl-krb-common)
+#   ~/DevOps/3part/rust-kdc/docker/toolchain.Dockerfile       (rust-kdc)
 #   ~/DevOps/3part/rrl-krb5/docker/toolchain.Dockerfile       (rrl-krb5)
 #   ~/DevOps/3part/rrl-smb/docker/toolchain.Dockerfile        (rrl-smb, the rust-smb-server fork)
 #   ~/DevOps/3part/rust-rest-ldap/docker/toolchain.Dockerfile (rust-rest-ldap)
@@ -63,9 +64,20 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list
 
 # `build-essential` for the link step, `pkg-config` for the TLS crates behind optional features.
+#
+# `smbclient` is a *test* dependency, and it is here for one reason: a test that drives a real client
+# against a share this code serves cannot prove anything with a client written by the same hand. It
+# costs 30 packages - dbus, avahi, cups, python3 - for about 120M, which is the price of testing an
+# SMB server against the client a fleet actually has. Every project that shares this image pays it,
+# and that is the trade the shared file makes; a project that does not care is unaffected by the
+# binary sitting in a layer.
+#
+# This does NOT give CI `smbclient`: the workflows run on `ubuntu-latest` with `dtolnay/rust-toolchain`
+# and never use this image. `.github/workflows/checks.yml` installs it there, and the test that needs
+# it refuses to be skipped when `CI` is set.
 RUN apt-get -o Acquire::Check-Valid-Until=false update \
  && apt-get install -y --no-install-recommends \
-      build-essential pkg-config ca-certificates git \
+      build-essential pkg-config ca-certificates git smbclient \
  && rm -rf /var/lib/apt/lists/*
 
 # `cargo-llvm-cov` is built here, not copied from the bookworm stage: the published binary and one
