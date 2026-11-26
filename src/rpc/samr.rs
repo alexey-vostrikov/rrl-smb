@@ -15,7 +15,7 @@
 //!
 //! `CreateUser2` is refused, with a status and a log line that name what is missing rather than
 //! what was asked. Creating a machine account is a **write to the directory**, and this crate does
-//! not read a directory: the daemon that owns one (`rust-rest-ldap`) would have to do it. Answering
+//! not read a directory: the daemon that owns one (`rrl-directory`) would have to do it. Answering
 //! `success` here and putting nothing anywhere would give the client a RID it could not use, and
 //! the failure would surface later as a machine that cannot authenticate - which is a worse
 //! diagnostic than an honest refusal now.

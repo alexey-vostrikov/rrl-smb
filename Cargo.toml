@@ -90,7 +90,7 @@ tower-service = { version = "0.3", optional = true }
 # Kerberos accept side, in pure Rust: no libgssapi, no Heimdal, no C. The GSS-API framing, the token
 # ids, the AP-REP envelope and the PAC all come from here rather than from this crate.
 #
-# From the fork, so that this crate and rust-rest-ldap share one krb5: two copies of the crate in
+# From the fork, so that this crate and rrl-directory share one krb5: two copies of the crate in
 # one dependency graph is two copies of every Kerberos type, and a `Ticket` from one does not
 # convert to the other without a round trip through the wire. What the fork adds over the 1.0.0
 # release is DER and `KerberosTime` taken from `rrl-krb`, so both sides read one encoding, and a

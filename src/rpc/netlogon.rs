@@ -34,7 +34,7 @@
 //! `ReqChallenge` is answered, because it states nothing but a random number this server made.
 //! `ServerAuthenticate3` is not: it compares a credential computed from the machine account's NT
 //! hash, and this crate holds no directory to read one from - the daemon that owns the account
-//! (`rust-rest-ldap`) does. Answering `success` without checking would tell a client its password
+//! (`rrl-directory`) does. Answering `success` without checking would tell a client its password
 //! was right when nothing was compared, and the next call would fail on a channel that never
 //! existed. The refusal names the missing piece in the log, once per call, so the next measurement
 //! reads as a fact rather than as a mystery.

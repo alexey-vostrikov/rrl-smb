@@ -1,5 +1,5 @@
 [toolchain]
-# The same version the directory server pins, because the two build together: `rust-rest-ldap`
+# The same version the directory server pins, because the two build together: `rrl-directory`
 # consumes this crate as a path dependency, and a build that compiles one with 1.99.1 and the other
 # with whatever stable happened to be installed is a build nobody can reproduce.
 #
