@@ -142,6 +142,15 @@ impl KerberosAcceptor {
         let accepted = match token.first() {
             Some(&TAG_APPLICATION_0) => KerberosContext::accept_token(&self.keytab, token),
             Some(&TAG_AP_REQ) => {
+                // `AcceptOptions::default()` carries no channel bindings, and here that is not an
+                // omission: SMB2 `SESSION_SETUP` has no channel to bind to. Windows sends bindings
+                // over LDAP inside TLS (`tls-server-end-point`, RFC 5929) and over HTTP with
+                // `GSS_C_CHANNEL_BOUND`, and this crate wires those through the acceptor in its own
+                // call sites. A client that sends bindings anyway is accepted unless it set
+                // `GSS_C_CHANNEL_BOUND_FLAG`, which is MIT's rule for an acceptor with none - so the
+                // failure mode of this line is a binding the client asked to be checked going
+                // unchecked, and that flag is what makes it explicit rather than silent. SMB over
+                // QUIC is the case that would need a binding here, and it is not implemented.
                 KerberosContext::accept_ap_req(&self.keytab, token, &Default::default())
             }
             _ => {
